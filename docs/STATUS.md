@@ -1,18 +1,75 @@
 # Status
 
-Updated 2026-10-23, end of Phase 2.
+Updated 2026-10-23, end of Phase 3.
 
 | Phase | What | Status |
 |---|---|---|
 | 1 | Core crate, no Windows APIs | Done |
-| 2 | Pairing, sync and the service shell | **Done** (this commit) |
-| 3 | Scanning and identification (spec 5, 6) | Next |
-| 4 | Enforcement and time (spec 7, 8) | Needs a Windows 11 VM for acceptance tests 3–6 |
+| 2 | Pairing, sync and the service shell | Done |
+| 3 | Scanning and identification (spec 5, 6) | **Done** (this commit), with the catalog gaps below for the owner |
+| 4 | Enforcement and time (spec 7, 8) | Next. Needs a Windows 11 VM for acceptance tests 3–6 |
 | 5 | Web (spec 9) | |
 | 6 | Removal protection and tamper (spec 10, 11) | Needs a VM |
 | 7 | Hardening and release readiness | Needs the code-signing certificate |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## Phase 3: what was built
+
+| Crate / module | What it does |
+|---|---|
+| core `scan` | `Candidate` (what the platform found), `Classifier` (the catalog's four rules, first match wins, spec 5), `merge` (one candidate per app: same folder, inside an installed app's folder, or named like an installed app), `classify_all` (one entry per name), `events` (first scan: `APPS_FOUND` in 200s; later: `APP_INSTALLED` per new app, or one `APPS_FOUND` when more than 3 are new) |
+| core `scan::launchers` | Steam `libraryfolders.vdf` / `appmanifest_*.acf`, Epic `.item` (skips add-ons and half installs), launcher ids from Uninstall entries (Steam App, Riot `--uninstall-product`, Battle.net `--uid`, Uplay Install, GOG `_is1`, EA `EAInstaller`), MSI packed product codes, Store family names, `AppxManifest.xml`, publisher DNs |
+| core `scan::vdf`, `lnk`, `pe` | Valve KeyValues, `.lnk` targets (`LinkInfo`), PE import tables (DirectX/Vulkan/XInput = a game signal). All bounds-checked and fuzzed by truncation in tests |
+| core `engine` | `GET /catalog?since=` after pairing and every 6 h (verified; a forged or older one is refused and the kept one stays; 429 waits an hour). `scan_due`: never without a verified catalog; first scan after pairing, then every 6 h, or on a change (not within 2 min of the last). `apply_scan` queues the events |
+| core `store` | Adds the raw signed catalog (verified again at every start), what was reported, the exe cache, the last scan time |
+| `eguard-win::apps` | The sources of spec 5: Uninstall keys (HKLM both views + each loaded user hive), Steam, Epic, GOG, itch, Store packages per user (manifest + resolved `ms-resource` names), Start Menu shortcuts, exes in Downloads/Desktop (depth 2) and AppData Local/Roaming (depth 3, 3 000 exes max). Leaves out system components, updates, and anything removed by or living under `%SystemRoot%` |
+| `eguard-win::authenticode` | `WinVerifyTrust`, embedded signatures, offline (no revocation, no URL retrieval). Signer = the certificate's O, else CN; both are matched (Microsoft signs .NET as CN ".NET") |
+| `eguard-win::version`, `shell`, `watch` | Product name from the version resource; `SHLoadIndirectString`; change notifications on the Uninstall keys and launcher folders (20 s settle, rebuilt every 30 min) |
+| `eguard-service` | Scans run on their own thread; the watcher asks for scans; `scan` (dry run: prints the payload, sends nothing; `--trust` tries a catalog addition) |
+| `eguard-agent` | `scan` (ask for a scan now); `status` shows apps reported and the last scan |
+
+Evidence for rule 3, in order: the main exe's signature (DisplayIcon exe, else the best exe in InstallLocation), then
+the uninstaller's, then the cached MSI's (`C:\Windows\Installer\*.msi` keeps its signature; found through
+`Installer\UserData\<sid>\Products\<packed code>`). A Store package's publisher counts as its signer (Windows
+verified the package; a Store-signed one's publisher is a GUID, so its verified display name is used).
+
+**Verified (2026-10-23, on this PC):**
+- `cargo test --workspace`: 120 passed (core 89 unit + 12 fixture, win 18, service 1). The Windows tests scan this
+  PC for real (a second scan checks no file again), verify Microsoft's and an unsigned file's signatures, read a
+  product name, and see a folder change.
+- `cargo clippy --workspace --all-targets -- -D warnings` (pedantic): clean. `cargo fmt --all --check`: clean.
+- **Done when (dry run):** `eguard-service scan --catalog fixtures/server/catalog.json` on this PC: 126 candidates,
+  79 left out as trusted (all Microsoft components and runtimes, Visual C++, .NET, Python, Chrome, Edge, Firefox,
+  Android Studio, Realtek, ASUS Armoury Crate / Aura / ROG), 45 reported: 2 from the catalog as games (Microsoft
+  Solitaire Collection and Xbox, from the Store, Microsoft-signed: rule 1 before rule 3) and 43 from publishers
+  the catalog doesn't trust. The payload is one `APPS_FOUND` with all 45; each app carries its `EXE` id
+  (`<signer>|<product>`) and Store apps their `MSSTORE` family name. No launchers are installed here, so rule 2 and
+  the launcher readers are tested with sample files only.
+- **Live, against the dev server:** pair → `/sync` → `GET /catalog` → `/report` → `/events` (`APPS_FOUND`), all 200.
+  The parent's Apps tab lists the 45 (PENDING: App Approval is on by default), with one alert: "eGuard found 2
+  games and 43 other apps on Mia's LocalPro, 43 from a publisher eGuard can't verify." Then a test Uninstall entry
+  (HKCU, an unsigned exe with `UnityPlayer.dll` beside it) was noticed by the watcher, rescanned in 4.3 s (195
+  files from the cache, 1 checked) and sent as one `APP_INSTALLED`: the Apps tab got "Pixel Quest" as GAMES and the
+  alert "Mia asked to install Pixel Quest. Its publisher isn't verified." Test entry, files and family deleted.
+
+**Not verified:** any launcher (none installed here: Steam, Epic, GOG, Riot, Battle.net, EA, Ubisoft, itch); a
+scan as SYSTEM (other users' folders, their Store packages); game signals on a real game. All need the VM.
+
+### What still shows that the "Done when" says shouldn't (for the owner)
+
+The rules are the spec's: anything not signed by a catalog TRUSTED_PUBLISHER is reported. On this PC that leaves:
+
+- **OEM tools whose publisher isn't in the catalog:** Epson ×4 (`seiko epson corporation`), LG Monitor App
+  (`lg electronics inc.`), Intel Graphics Command Center (Store display name `intel corp`; the catalog has `intel
+  corporation`). Adding those three as TRUSTED_PUBLISHER rows takes the list from 45 to 39 (tried with `--trust`).
+  That's a catalog change on the server (`src/lib/desktop-catalog.ts` + the seed script), so it's the owner's call.
+- **A printer driver with an unsigned installer:** "XPrinter Driver version 8.2" (installs to `C:\XINYE POS Printer
+  Driver`). Nothing in the rules can tell it from a game; only a catalog entry or a parent's "block/allow" settles it.
+- **Developer tools** (Git, Node.js, Docker, Postgres, MongoDB, ngrok, Playwright's browsers under AppData…): all
+  unverified publishers by the rules. On a child's PC there would be few of these.
+- **Leftovers:** "Discord" (only its updater is left, which can reinstall it), "Mozilla Maintenance Service" (its
+  uninstaller is unsigned).
 
 ## Owner's decisions in Phase 2
 
@@ -99,6 +156,17 @@ session over the service-mode pipe.
 6. **New (Phase 2): `/sync` now sends `browserLink`** (uncommitted server change, `src/lib/browser-link.ts`, with the
    migration `20261023120000_browser_on_computer`). The core ignores fields it doesn't know, so nothing broke; it's
    Phase 5's input. Re-capture the fixtures once the server commits it.
+7. **New (Phase 3): suggested catalog additions** (TRUSTED_PUBLISHER, SIGNER): `seiko epson corporation`, `lg
+   electronics inc.`, `intel corp` (the Store's name for Intel; the catalog has `intel corporation`). See "What still
+   shows" above. Also worth considering: `zoom communications, inc.` (Zoom's current certificate; the catalog has
+   `zoom video communications, inc.`).
+8. **New (Phase 3): the server's wording for a new app on a computer.** An `APP_INSTALLED` while approval is on
+   reads "Mia asked to install Pixel Quest" (`events/route.ts`, `raiseAppRequest`). On a computer the child didn't
+   ask; the scan found it. Suggest "Pixel Quest was found on Mia's PC and waits for you" for computers.
+9. **New (Phase 3): one app, two catalog names.** The scan dedupes by name before sending, but the catalog's
+   display name can differ from the Uninstall name (Steam "Counter-Strike 2" vs an Uninstall "Steam App 730"
+   both merge to the catalog's name here). If the server ever renames a catalog game, the child's list keeps the
+   old name and the ids merge new reports into it, so nothing doubles; noted only so a rename isn't surprising.
 
 ## Open questions: recommendations
 
@@ -106,29 +174,37 @@ From `~/eguard/docs/desktop-agent-open-questions.md`. None is settled in the spe
 
 | # | Recommendation | State |
 |---|---|---|
-| Q2 Shared PCs | At pairing, the parent ticks which Windows accounts are the child's (default: the signed-in account, if standard). Only those sessions are enforced and counted. A new local account raises an alert (needs a new TAMPER kind or alert: server change) | Pairing UI (Tauri) still to come; server part needs the owner |
+| Q2 Shared PCs | At pairing, the parent ticks which Windows accounts are the child's (default: the signed-in account, if standard). Only those sessions are enforced and counted. A new local account raises an alert (needs a new TAMPER kind or alert: server change) | Pairing UI (Tauri) still to come; server part needs the owner. **Until then the scan covers every account**, so a parent's own apps on a shared PC are reported too |
 | Q3 Anti-cheat | Spike at the start of Phase 4 on the VM: `TerminateProcess` on CS2, Fortnite (EAC) and Valorant (Vanguard) from SYSTEM. Fallbacks in order: IFEO `Debugger` stub for blocked exe names (paired with the id match), end the launcher, overlay + `LockWorkStation` | Phase 4 |
 | Q4 Waking for removal | Short term: the server answers `nextSyncSeconds: 60` to computers always (one-line change in `sync/route.ts`), which makes acceptance test 9 ("within a minute") possible. Later: a long-poll endpoint. Today the agent can't learn of a removal for up to 5 minutes | Needs the owner (server change) |
 | Q5 Guessing the code | **Built:** 5 wrong codes lock input for 15 min, doubling each lockout, capped at 24 h, persisted (`removal::CodeAttempts`, now saved in `state.json`). Telling the parent needs a new TAMPER kind `REMOVAL_CODE_GUESSED` (server change) | Core done; alert needs the owner |
 | Q6 Offline clock | **Built** (`clock`), and now fed by the service: samples from `GetTickCount64` + BootId every tick (≤ 60 s), persisted with the state. Stated limit: a forward jump while offline across a reboot can end bedtime early or start a new day until the PC is back online | Done |
 | Q1, Q7, Q8, Q9 | Not decided here; they need the owner (admin-account test 8, self-update design, end-of-life recovery, exclusive fullscreen) | Open |
 
-## Next: Phase 3 (scanning and identification, spec 5 and 6)
+## Next: Phase 4 (enforcement and time, spec 7 and 8)
 
-Done when: a scan on this PC reports games and unverified exes only (no drivers, Office, runtimes or OEM tools),
-and the exact `APPS_FOUND` payload is shown to the owner.
+Done when: spec acceptance tests 3 to 6 pass, each shown how it was checked. **Needs the Windows 11 VM** (a
+standard child account; Steam with CS2, Roblox): ending processes as SYSTEM, the per-session agent and the overlay
+can't be tested in console mode on this PC.
 
-1. Sources from spec 5: uninstall registry keys (HKLM, HKLM WOW6432Node, each user's HKCU), Steam
-   (`libraryfolders.vdf` + `appmanifest_*.acf`), Epic (`LauncherInstalled.dat` / manifests), Riot, Battle.net, EA,
-   Ubisoft, GOG, MS Store (`PackageManager` for the child's users: needs WinRT; check whether `windows-sys` is enough
-   or the `windows` crate is needed for that one API), and exes under common game folders.
-2. Authenticode (`WinVerifyTrust` + signer name from `CryptQueryObject`/`CertGetNameString`), cached by
-   path + size + mtime in the state file. Product name from the version resource.
-3. The classifier (4 rules, first match wins) and game signals; the signed catalog (`GET /catalog?since=`, verified
-   by `signature::verify_catalog`, last good copy kept in `Persisted` — add the field with `#[serde(default)]`).
-4. `APPS_FOUND` through the queue (`DeviceEvent::apps_found` splits by 200); the first full scan right after
-   pairing (spec 4 step 5), then every 6 hours and on registry/manifest changes.
-5. A way to show the payload: `eguard-agent scan --dry-run` over the pipe, or a service log line.
+1. **Spike first (Q3):** on the VM, `TerminateProcess` from SYSTEM on CS2, Fortnite (EAC) and Valorant (Vanguard).
+   Fallbacks in order: IFEO `Debugger` stub for blocked exe names, end the launcher, overlay + `LockWorkStation`.
+2. Process start detection: ETW Kernel-Process (`Microsoft-Windows-Kernel-Process`, start events with image path)
+   from the service; the 2-second `NtQuerySystemInformation`/Toolhelp sweep as fallback. Resolve a process to an app
+   **by id first** (`/sync` `apps[].ids`: the Steam appid from the exe's library folder, the `EXE` id from the cached
+   `ExeFacts`), then by name. The core's `rules::evaluate` decides; `scan::ExeCache` already holds signer + product.
+3. Never block: Microsoft-signed under `%SystemRoot%`, eGuard itself, accessibility tools, a trusted publisher's
+   non-game app (rule 3 of the classifier, already built).
+4. The per-session agent: the service starts `eguard-agent` in each session (`WTSQueryUserToken` +
+   `CreateProcessAsUser`), per-session pipe with the session's logon SID (replacing today's single pipe), foreground
+   window + idle time → `UsageLedger`, block screen, 5- and 1-minute warnings, time-up/bedtime overlay with
+   `LockWorkStation` as backstop. **Decide first:** the prompt says Tauri for the UI. Tauri's build pulls many crates
+   with build scripts and needs WebView2; that's near the "ask me first" line (crates that run code at build time).
+   Alternative with nothing new: a plain Win32 layered window from `eguard-win`. Recommend Win32 for the overlay and
+   block screen (they must work even when WebView2 is broken or removed), Tauri later for settings screens.
+5. `APP_BLOCKED`, `LIMIT_REACHED`, `TIME_REQUESTED`, `APP_REQUESTED` through the queue; `/usage` with `hourly[24]`
+   from the ledger.
+6. Then add the AVAILABLE keys to `Capabilities::enforced` in `runner.rs` as each is enforced, so `/report` says so.
 
 ## Gotchas
 
@@ -145,6 +221,11 @@ and the exact `APPS_FOUND` payload is shown to the owner.
 - In a real install the pipe is one pipe for SYSTEM + Administrators. Per-session pipes (the logon SID of the session
   the service starts the agent in) come when the service starts agents (Phase 4).
 - `AGENT_RESTARTED` isn't sent yet: that needs the guard (Phase 6) to tell a crash from a stop.
+- A first scan on this PC takes about 35–50 s (it verifies ~160 signatures); later ones take a few seconds from the
+  cache. Signature checks never use the network (no revocation, no URL retrieval).
+- The scan reads only what the account running it can read. In console mode that's this user; as SYSTEM it will see
+  every profile's folders, but other users' registry only while their hive is loaded (signed in).
+- `python` is the Store alias here, but `python3` works (3.14); scripts that edit files should be run with `-I`.
 - Fixtures hold a device token and removal secret of a test device that was deleted at the end of the capture.
   They're useless, but don't copy the pattern with real devices.
 - The dev server on :3000 belongs to the owner's session. Dev servers always send mail to Mailpit
@@ -152,5 +233,4 @@ and the exact `APPS_FOUND` payload is shown to the owner.
 - `keys.rs` uses the dev key unless `EGUARD_POLICY_PUBLIC_KEYS` is set at compile time; the service's server URL is
   `http://localhost:3000` unless `EGUARD_SERVER_URL` is. Phase 7 must refuse to build a release with
   `keys::is_dev_build()`.
-- `python` on this PC is the Microsoft Store alias: it waits for input. Don't use it in scripts.
 - Line endings: this repo is LF (rustfmt). `~/eguard` mixes CRLF/LF.

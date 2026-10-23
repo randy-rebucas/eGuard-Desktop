@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 eguard-core = { path = "../eguard-core" }
+serde_json.workspace = true
 windows-sys.workspace = true
 
 [lints]

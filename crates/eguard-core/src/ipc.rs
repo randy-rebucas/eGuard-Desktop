@@ -24,6 +24,8 @@ pub enum Request {
         name: Option<String>,
     },
     Status,
+    /// Scan for apps now rather than at the next 6-hourly scan.
+    Scan,
 }
 
 /// What the agent may know about the service. No token, no removal secret.
@@ -40,6 +42,12 @@ pub struct StatusInfo {
     pub authorized: bool,
     /// Items waiting to be sent.
     pub queued: usize,
+    /// Apps the last scan reported; `None` before the first scan.
+    #[serde(default)]
+    pub apps_reported: Option<usize>,
+    /// eGuard's time of the last scan, ISO 8601.
+    #[serde(default)]
+    pub last_scan_at: Option<String>,
 }
 
 /// From the service.

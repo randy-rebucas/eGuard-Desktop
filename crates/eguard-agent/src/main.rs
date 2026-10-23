@@ -4,6 +4,7 @@
 //! ```text
 //! eguard-agent pair [CODE] [--name NAME]   pair with a code from the parent dashboard (asks for it if left out)
 //! eguard-agent status
+//! eguard-agent scan                        look for installed apps now (at most every 2 minutes)
 //! ```
 
 use eguard_core::ipc::{self, Request, Response};
@@ -62,9 +63,26 @@ fn status() -> Result<(), String> {
             } else {
                 println!("Not paired. Run: eguard-agent pair");
             }
+            match (s.apps_reported, s.last_scan_at.as_deref()) {
+                (Some(n), Some(at)) => println!("Apps reported: {n} (last scan {at})"),
+                _ if s.paired => println!("Apps: not scanned yet"),
+                _ => {}
+            }
             println!("Server: {}  ·  waiting to send: {}", s.server, s.queued);
             Ok(())
         }
+        Response::Error { message } => Err(message),
+        Response::Paired { .. } => Err("unexpected answer from the service".into()),
+    }
+}
+
+fn scan() -> Result<(), String> {
+    match ask(&Request::Scan)? {
+        Response::Status(s) if s.paired => {
+            println!("eGuard will look for installed apps within a couple of minutes. Run `eguard-agent status` to see when it has.");
+            Ok(())
+        }
+        Response::Status(_) => Err("This computer isn't paired yet. Run: eguard-agent pair".into()),
         Response::Error { message } => Err(message),
         Response::Paired { .. } => Err("unexpected answer from the service".into()),
     }
@@ -75,7 +93,8 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("pair") => pair(&args[1..]),
         Some("status") | None => status(),
-        Some(_) => Err("usage: eguard-agent pair [CODE] [--name NAME] | status".into()),
+        Some("scan") => scan(),
+        Some(_) => Err("usage: eguard-agent pair [CODE] [--name NAME] | status | scan".into()),
     };
     if let Err(e) = result {
         eprintln!("{e}");

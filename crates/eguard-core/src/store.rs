@@ -10,10 +10,12 @@
 
 use crate::queue::OutboundQueue;
 use crate::removal::CodeAttempts;
+use crate::scan::ExeCache;
 use crate::state::AgentState;
 use crate::usage::UsageLedger;
-use crate::wire::ReportedProtection;
+use crate::wire::{FoundApp, ReportedProtection};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Bumped when the format changes in a way older builds can't read.
 pub const STATE_VERSION: u32 = 1;
@@ -33,6 +35,18 @@ pub struct Persisted {
     /// The protections last queued for `/report`, so an unchanged report isn't sent every sync.
     #[serde(default)]
     pub last_reported: Option<Vec<ReportedProtection>>,
+    /// The last good `GET /catalog` answer, exactly as received (signature and all): verified again when loaded.
+    #[serde(default)]
+    pub catalog: Option<serde_json::Value>,
+    /// What the last scan reported, by name. `None` until the first scan, which sends everything as `APPS_FOUND`.
+    #[serde(default)]
+    pub apps_reported: Option<BTreeMap<String, FoundApp>>,
+    /// eGuard's time of the last scan.
+    #[serde(default)]
+    pub last_scan_ms: Option<i64>,
+    /// Signatures and product names already checked (`scan::ExeCache`).
+    #[serde(default)]
+    pub exe_cache: ExeCache,
 }
 
 impl Default for Persisted {
@@ -44,6 +58,10 @@ impl Default for Persisted {
             queue: OutboundQueue::default(),
             code_attempts: CodeAttempts::default(),
             last_reported: None,
+            catalog: None,
+            apps_reported: None,
+            last_scan_ms: None,
+            exe_cache: ExeCache::new(),
         }
     }
 }

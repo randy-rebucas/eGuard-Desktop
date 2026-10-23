@@ -14,6 +14,7 @@
 
 mod log;
 mod runner;
+mod scan;
 mod store;
 mod svc;
 
@@ -79,6 +80,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("run") => console(&args[1..]),
+        Some("scan") => scan::run(&args[1..]),
         Some("install") => svc::install().map(|()| println!("eGuard service installed and started")),
         Some("uninstall") => svc::uninstall().map(|()| println!("eGuard service removed")),
         Some(_) => Err(usage()),

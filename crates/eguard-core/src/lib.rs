@@ -17,6 +17,7 @@ pub mod queue;
 pub mod removal;
 pub mod report;
 pub mod rules;
+pub mod scan;
 pub mod signature;
 pub mod state;
 pub mod store;

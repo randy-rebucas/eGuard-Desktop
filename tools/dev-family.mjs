@@ -3,6 +3,7 @@
 //   node tools/dev-family.mjs create    register a test parent and child; prints a pairing code
 //   node tools/dev-family.mjs code      a fresh pairing code for the same child
 //   node tools/dev-family.mjs show      the paired computer as the parent's app sees it (device page data)
+//   node tools/dev-family.mjs apps      the child's Apps tab; alerts: the family's alerts
 //   node tools/dev-family.mjs delete    delete the test family and everything in it
 //
 // Like capture-fixtures.mjs it needs ~/eguard's dev database and a dev server (mail goes to Mailpit). The family's
@@ -74,6 +75,16 @@ const commands = {
     if (!devices.length) return console.log("no Windows computer paired yet");
     for (const d of devices) console.log(JSON.stringify(expect(await call("GET", `/devices/${d.id}`, { token }), 200, "device"), null, 2));
   },
+  async apps() {
+    const { token, childId } = load();
+    const r = expect(await call("GET", `/children/${childId}/apps`, { token }), 200, "apps");
+    for (const a of r.apps ?? r) console.log([a.approval, a.category, a.source ?? "", a.name, a.sourceLabel ?? a.label ?? ""].join(" | "));
+  },
+  async alerts() {
+    const { token } = load();
+    const r = expect(await call("GET", "/alerts", { token }), 200, "alerts");
+    for (const a of r.alerts ?? r.items ?? r) console.log(`${a.severity} | ${a.title} | ${a.body}`);
+  },
   async delete(db) {
     const { email } = load();
     await db.family.deleteMany({ where: { users: { some: { email } } } });
@@ -85,7 +96,7 @@ const commands = {
 
 const run = commands[process.argv[2]];
 if (!run) {
-  console.error("usage: node tools/dev-family.mjs create | code | show | delete");
+  console.error("usage: node tools/dev-family.mjs create | code | show | apps | alerts | delete");
   process.exit(1);
 }
 const db = new PrismaClient();

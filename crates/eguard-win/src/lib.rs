@@ -3,6 +3,8 @@
 //! `unsafe` is allowed only in the modules that call Win32, each call wrapped in a small safe function with a
 //! `SAFETY` comment. Everything above them is safe Rust.
 
+pub mod apps;
+pub mod authenticode;
 pub mod clock;
 pub mod dpapi;
 pub mod files;
@@ -10,7 +12,10 @@ pub mod http;
 pub mod pipe;
 pub mod registry;
 pub mod security;
+pub mod shell;
 pub mod sysinfo;
+pub mod version;
+pub mod watch;
 mod wide;
 
 /// The last Win32 error as an `io::Error` (it carries the code and the system's message).

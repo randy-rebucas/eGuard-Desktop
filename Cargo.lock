@@ -192,6 +192,7 @@ dependencies = [
  "eguard-core",
  "eguard-win",
  "jiff",
+ "serde_json",
  "windows-service",
 ]
 
@@ -200,6 +201,7 @@ name = "eguard-win"
 version = "0.1.0"
 dependencies = [
  "eguard-core",
+ "serde_json",
  "windows-sys",
 ]
 

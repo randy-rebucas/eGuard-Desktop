@@ -23,7 +23,8 @@ on the owner, gotchas).
   accounting, trusted clock, signatures, removal codes, offline queue, sync state, `/report` contents, pipe messages,
   the service's sync loop (`engine`). `#![forbid(unsafe_code)]` in its lib.rs.
 - `crates/eguard-win`: `windows-sys` 0.61 (the same version `windows-service` uses). `WinHTTP`, DPAPI, atomic files,
-  named pipe + DACL, clocks, device details. The workspace denies `unsafe`; only this crate's FFI modules allow it.
+  named pipe + DACL, clocks, device details, app scan sources (`apps`), Authenticode, change notifications. The
+  workspace denies `unsafe`; only this crate's FFI modules allow it.
 - `crates/eguard-service`, `eguard-agent`, `eguard-guard`: the three binaries (spec section 3). On the owner's PC the
   service runs in console mode (`eguard-service run`); `install` is for a VM.
 - `fixtures/server/`: real server responses, captured by `node tools/capture-fixtures.mjs` (needs ~/eguard's dev DB
@@ -37,7 +38,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 node tools/capture-fixtures.mjs        # refresh fixtures (EGUARD_URL defaults to http://localhost:3000)
-node tools/dev-family.mjs create|code|show|delete   # a test family for pairing this PC by hand
+node tools/dev-family.mjs create|code|show|apps|alerts|delete   # a test family for pairing this PC by hand
+target\debug\eguard-service scan --catalog fixtures/server/catalog.json --verbose   # dry-run scan of this PC
 ```
 
 ## Conventions

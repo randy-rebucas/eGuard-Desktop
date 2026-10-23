@@ -1,6 +1,7 @@
-//! The service's work between pairing and removal, without the platform: pairing, the `/sync` loop, `/report`, and
-//! sending the offline queue. The platform gives it a `Transport`, clock samples and the computer's details, and
-//! saves `Persisted` (and, at pairing, the secrets) when told something changed.
+//! The service's work between pairing and removal, without the platform: pairing, the `/sync` loop, `/report`, the
+//! catalog, when to scan and what a scan sends, and the offline queue. The platform gives it a `Transport`, clock
+//! samples and the computer's details, runs the scans it asks for, and saves `Persisted` (and, at pairing, the
+//! secrets) when told something changed.
 //!
 //! Fail closed throughout: a failed, refused or unreadable `/sync` changes nothing but when the next one is tried.
 
@@ -9,15 +10,21 @@ use crate::clock::{ClockChange, ClockSample};
 use crate::queue::{self, Settled};
 use crate::removal::RemovalSecret;
 use crate::report::{self, Capabilities};
-use crate::signature::TrustedKeys;
+use crate::scan::{self, Classifier, ExeCache, ScanResult};
+use crate::signature::{CatalogUpdate, TrustedKeys, verify_catalog};
 use crate::state::{AgentState, AuthState, UNAUTHORIZED_SYNC_SECS};
 use crate::store::{DeviceSecrets, Persisted};
-use crate::wire::{DeviceEvent, EventEnvelope, PairRequest, Platform, SyncRequest, TamperKind};
+use crate::wire::{Catalog, DeviceEvent, EventEnvelope, PairRequest, Platform, SyncRequest, TamperKind};
 
 /// The longest the service sleeps: the wall clock is checked for changes about this often.
 pub const MAX_SLEEP_MS: u64 = 60_000;
 /// Rounds of sending per tick: each round sends the oldest due item of every lane.
 const SEND_ROUNDS: usize = 20;
+/// A full scan this often (spec section 5), and the catalog checked for changes as often.
+pub const SCAN_EVERY_MS: i64 = 6 * 60 * 60_000;
+const CATALOG_EVERY_MS: u64 = 6 * 60 * 60_000;
+/// Scans asked for by a change (an install writes many keys) wait at least this long after the last.
+pub const SCAN_MIN_GAP_MS: i64 = 2 * 60_000;
 
 /// The computer as `/pair`, `/sync` and `/report` describe it. Cut to the server's limits by `DeviceInfo::new`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +113,12 @@ pub struct Engine {
     /// The monotonic time of the next `/sync`.
     next_sync_mono_ms: u64,
     sync_failures: u32,
+    /// The catalog in force: the last good copy, verified.
+    catalog: Option<Catalog>,
+    next_catalog_mono_ms: u64,
+    catalog_failures: u32,
+    /// Something changed (an Uninstall key, a launcher's folder): scan again soon.
+    scan_requested: bool,
     notes: Vec<Note>,
     jitter: fn() -> f64,
 }
@@ -127,7 +140,32 @@ impl Engine {
             }
             _ => data,
         };
-        Self { data, secrets, api, keys, caps, next_sync_mono_ms: 0, sync_failures: 0, notes, jitter: random_unit }
+        let mut data = data;
+        // The kept copy is checked again: a catalog decides what's never reported, so only eGuard's signed one counts
+        let catalog = match data.catalog.as_ref().map(|raw| verify_catalog(&keys, raw, None)) {
+            Some(Ok(CatalogUpdate::Changed(c))) => Some(c),
+            Some(_) => {
+                notes.push(Note::Warn("the kept catalog didn't verify; fetching it again".into()));
+                data.catalog = None;
+                None
+            }
+            None => None,
+        };
+        Self {
+            data,
+            secrets,
+            api,
+            keys,
+            caps,
+            next_sync_mono_ms: 0,
+            sync_failures: 0,
+            catalog,
+            next_catalog_mono_ms: 0,
+            catalog_failures: 0,
+            scan_requested: false,
+            notes,
+            jitter: random_unit,
+        }
     }
 
     pub fn is_paired(&self) -> bool {
@@ -182,7 +220,11 @@ impl Engine {
             Some(Err(_)) => self.notes.push(Note::Warn("the removal secret from eGuard isn't 32 bytes; removal codes won't work".into())),
             None => self.notes.push(Note::Warn("eGuard sent no removal secret; removal codes won't work".into())),
         }
-        self.data = Persisted { agent: Some(AgentState::paired(&paired.secrets.device_id, &paired.child_name)), ..Persisted::default() };
+        // The catalog is eGuard's, not the device's: it stays. Everything else starts over (the first scan after
+        // pairing reports everything)
+        let catalog = self.data.catalog.take();
+        self.data =
+            Persisted { agent: Some(AgentState::paired(&paired.secrets.device_id, &paired.child_name)), catalog, ..Persisted::default() };
         self.notes.push(Note::Info(format!("paired as {} for {}", paired.secrets.device_id, paired.child_name)));
         self.secrets = Some(paired.secrets);
         self.next_sync_mono_ms = 0;
@@ -227,9 +269,12 @@ impl Engine {
             self.sync(&token, s, info, now_ms);
             now_ms = self.data.agent.as_mut().and_then(|a| a.clock.now(s)).map_or(now_ms, |n| n.ms);
         }
+        if s.mono_ms >= self.next_catalog_mono_ms {
+            self.refresh_catalog(&token, s);
+        }
         self.send_due(&token, now_ms);
 
-        let until_sync = self.next_sync_mono_ms.saturating_sub(s.mono_ms);
+        let until_sync = self.next_sync_mono_ms.min(self.next_catalog_mono_ms).saturating_sub(s.mono_ms);
         let until_send = self.data.queue.next_due_ms().map_or(u64::MAX, |t| t.saturating_sub(now_ms).max(0) as u64);
         Tick { sleep_ms: until_sync.min(until_send).clamp(1_000, MAX_SLEEP_MS), changed }
     }
@@ -301,6 +346,86 @@ impl Engine {
         u64::from(outcome.next_sync_secs) * 1000
     }
 
+    /// `GET /catalog?since=` the kept version. A catalog that doesn't verify, or is older than the kept one, is
+    /// ignored and the kept one stays.
+    fn refresh_catalog(&mut self, token: &str, s: ClockSample) {
+        let kept = self.catalog.as_ref().map(|c| c.version);
+        let wait_ms = match self.api.catalog(token, kept) {
+            Ok(raw) => match verify_catalog(&self.keys, &raw, kept) {
+                Ok(CatalogUpdate::Changed(c)) => {
+                    self.notes.push(Note::Info(format!("catalog version {} ({} entries)", c.version, c.entries.len())));
+                    // A newer catalog may change what's reported: the next scan uses it
+                    self.scan_requested = self.catalog.is_some();
+                    self.catalog = Some(c);
+                    self.data.catalog = Some(raw);
+                    self.catalog_failures = 0;
+                    CATALOG_EVERY_MS
+                }
+                Ok(CatalogUpdate::Unchanged { .. }) => {
+                    self.catalog_failures = 0;
+                    CATALOG_EVERY_MS
+                }
+                Err(e) => {
+                    self.catalog_failures += 1;
+                    self.notes.push(Note::Warn(format!("the catalog from eGuard was refused: {e}; the kept one stays")));
+                    queue::backoff_ms(self.catalog_failures, (self.jitter)()) as u64
+                }
+            },
+            // Its limit is 30 an hour: wait out the hour
+            Err(ApiError::Status { status: 429, .. }) => 60 * 60_000,
+            Err(e) => {
+                self.catalog_failures += 1;
+                if self.catalog.is_none() {
+                    self.notes.push(Note::Warn(format!("couldn't fetch the catalog ({e}); scanning waits for it")));
+                }
+                queue::backoff_ms(self.catalog_failures, (self.jitter)()) as u64
+            }
+        };
+        self.next_catalog_mono_ms = s.mono_ms + wait_ms;
+    }
+
+    /// eGuard's time now (the wall clock before the first sync ever).
+    pub fn now_ms(&mut self, s: ClockSample) -> i64 {
+        self.data.agent.as_mut().and_then(|a| a.clock.now(s)).map_or(s.wall_ms, |n| n.ms)
+    }
+
+    /// Something changed that may mean new apps: scan again soon (not before `SCAN_MIN_GAP_MS` after the last).
+    pub fn request_scan(&mut self) {
+        self.scan_requested = true;
+    }
+
+    /// When a scan is due, what it needs: the catalog's rules and the cache of checked files. A scan waits for a
+    /// verified catalog: without one, every trusted publisher's app would be reported.
+    pub fn scan_due(&self, now_ms: i64) -> Option<(Classifier, ExeCache)> {
+        let catalog = self.catalog.as_ref().filter(|_| self.is_paired())?;
+        let since = self.data.last_scan_ms.map(|t| now_ms - t);
+        let due = match since {
+            None => true,
+            Some(gap) => !(0..SCAN_EVERY_MS).contains(&gap) || (self.scan_requested && gap >= SCAN_MIN_GAP_MS),
+        };
+        due.then(|| (Classifier::new(catalog), self.data.exe_cache.clone()))
+    }
+
+    /// A scan finished: queue what's new (the first scan: everything, as `APPS_FOUND`), and keep the cache.
+    pub fn apply_scan(&mut self, result: &ScanResult, cache: ExeCache, now_ms: i64) {
+        let events = scan::events(self.data.apps_reported.as_ref(), &result.found);
+        let first = self.data.apps_reported.is_none();
+        for e in &events {
+            self.data.queue.push_event(EventEnvelope::new(e.clone()), now_ms);
+        }
+        self.notes.push(Note::Info(format!(
+            "scan: {} apps to report, {} left out as trusted; {} {}",
+            result.found.len(),
+            result.skipped.len(),
+            events.len(),
+            if first { "APPS_FOUND events (first scan)" } else { "events for new apps" }
+        )));
+        self.data.apps_reported = Some(result.found.iter().map(|a| (a.app.clone(), a.clone())).collect());
+        self.data.exe_cache = cache;
+        self.data.last_scan_ms = Some(now_ms);
+        self.scan_requested = false;
+    }
+
     fn send_due(&mut self, token: &str, now_ms: i64) {
         for _ in 0..SEND_ROUNDS {
             let due: Vec<_> = self.data.queue.due(now_ms).into_iter().map(|q| (q.seq, q.item.clone())).collect();
@@ -338,6 +463,8 @@ impl Engine {
                 .map(|t| t.to_string()),
             authorized: agent.is_none_or(|a| a.auth == AuthState::Ok),
             queued: self.data.queue.len(),
+            apps_reported: self.data.apps_reported.as_ref().map(std::collections::BTreeMap::len),
+            last_scan_at: self.data.last_scan_ms.and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok()).map(|t| t.to_string()),
         }
     }
 
@@ -432,13 +559,15 @@ mod tests {
         let mut first = fixture("sync-first.json");
         first["deviceId"] = j!(e.secrets.as_ref().unwrap().device_id);
         t.answers.lock().unwrap().extend([json(200, &first), json(200, &j!({ "ok": true }))]);
+        *t.catalog.lock().unwrap() = Some(fixture("catalog.json"));
 
         let tick = e.tick(at(1_000, &now), &info());
         assert!(tick.changed);
         let seen = t.seen.lock().unwrap();
-        assert!(seen[1].url.ends_with("/sync") && seen[1].bearer.is_some());
-        assert!(seen[2].url.ends_with("/report"));
-        let report: Value = serde_json::from_slice(seen[2].body.as_ref().unwrap()).unwrap();
+        let urls: Vec<_> = seen.iter().map(|r| r.url.rsplit('/').next().unwrap().to_owned()).collect();
+        assert_eq!(urls, ["pair", "sync", "catalog", "report"]);
+        assert!(seen[1].bearer.is_some());
+        let report: Value = serde_json::from_slice(seen[3].body.as_ref().unwrap()).unwrap();
         assert_eq!(report["full"], true);
         let keys: Vec<_> = report["protections"].as_array().unwrap().iter().map(|p| p["key"].as_str().unwrap()).collect();
         // Nothing enforced yet: only the guided ones, as off, with why
@@ -527,6 +656,56 @@ mod tests {
         // Before any sync, new apps wait for the parent
         assert!(e.data.agent.as_ref().unwrap().rules().policy.approval_required);
         assert!(!report::AVAILABLE.contains(&ProtectionKey::Web));
+    }
+
+    #[test]
+    fn scans_wait_for_a_verified_catalog_then_run_every_six_hours() {
+        let t = Scripted::new(vec![]);
+        let (mut e, now) = paired(&t);
+        let t0 = crate::clock::parse_iso_ms(&now).unwrap();
+        // No catalog yet: no scan, even though none ever ran
+        assert!(e.scan_due(t0).is_none());
+
+        // A catalog someone changed doesn't verify: still none
+        let mut forged = fixture("catalog.json");
+        forged["catalog"]["entries"][0]["match"] = j!("steam:1");
+        *t.catalog.lock().unwrap() = Some(forged);
+        e.tick(at(1_000, &now), &info());
+        assert!(e.scan_due(t0).is_none());
+        assert!(e.take_notes().iter().any(|n| matches!(n, Note::Warn(m) if m.contains("refused"))));
+
+        *t.catalog.lock().unwrap() = Some(fixture("catalog.json"));
+        e.next_catalog_mono_ms = 0;
+        e.tick(at(2_000, &now), &info());
+        let (classifier, cache) = e.scan_due(t0).expect("first scan due");
+        assert!(cache.is_empty());
+
+        let mut cs2 = scan::Candidate::new("Counter-Strike 2", scan::Origin::Launcher);
+        cs2.ids = vec![crate::wire::AppId::new(crate::wire::AppIdKind::Steam, "730")];
+        let result = scan::classify_all(&classifier, &[cs2]);
+        e.apply_scan(&result, cache, t0);
+        let found =
+            e.data.queue.items().iter().filter(|q| matches!(&q.item, Outbound::Event(ev) if ev.event.type_name() == "APPS_FOUND")).count();
+        assert_eq!(found, 1);
+        assert_eq!(e.status().apps_reported, Some(1));
+
+        // Not again until six hours have passed, or a change asks (and then not within two minutes)
+        assert!(e.scan_due(t0 + 60_000).is_none());
+        e.request_scan();
+        assert!(e.scan_due(t0 + 60_000).is_none());
+        assert!(e.scan_due(t0 + SCAN_MIN_GAP_MS).is_some());
+        e.scan_requested = false;
+        assert!(e.scan_due(t0 + SCAN_EVERY_MS).is_some());
+
+        // The same apps again: nothing new to send
+        e.apply_scan(&result, ExeCache::new(), t0 + SCAN_EVERY_MS);
+        assert_eq!(e.data.queue.items().iter().filter(|q| matches!(q.item, Outbound::Event(_))).count(), found);
+
+        // The kept catalog survives a restart, verified again
+        let data = e.data.clone();
+        let api = Api::new(ServerUrl::parse("http://localhost:3000", true).unwrap(), Box::new(t.clone()));
+        let restarted = Engine::new(data, e.secrets.clone(), api, TrustedKeys::builtin().unwrap(), caps());
+        assert!(restarted.catalog.is_some());
     }
 
     #[test]

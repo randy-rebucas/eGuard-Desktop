@@ -1,5 +1,5 @@
 //! The service's work, the same in console mode and as a Windows service: the sync loop on one thread, the pipe on
-//! another, sharing the engine behind a lock.
+//! another, scans on a third (so syncing never waits for one), all sharing the engine behind a lock.
 
 use crate::log;
 use crate::store::Store;
@@ -7,12 +7,15 @@ use eguard_core::api::{Api, ServerUrl};
 use eguard_core::engine::{DeviceInfo, Engine, Note};
 use eguard_core::ipc::{self, Request, Response};
 use eguard_core::report::Capabilities;
+use eguard_core::scan::{self, Classifier, ExeCache};
 use eguard_core::signature::TrustedKeys;
+use eguard_win::apps;
 use eguard_win::{clock, http::WinHttp, pipe::PipeServer, sysinfo};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -49,6 +52,10 @@ pub struct Runner {
     store: Store,
     info: DeviceInfo,
     pipe_sddl: String,
+    /// A scan is running; the loop doesn't start another.
+    scanning: AtomicBool,
+    /// Launcher folders the last scan found, for the watcher.
+    watch_dirs: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 fn log_notes(engine: &mut Engine) {
@@ -82,6 +89,8 @@ impl Runner {
             store: opts.store,
             info,
             pipe_sddl: opts.pipe_sddl,
+            scanning: AtomicBool::new(false),
+            watch_dirs: Arc::new(Mutex::new(Vec::new())),
         }))
     }
 
@@ -109,6 +118,20 @@ impl Runner {
         let first = server.create().map_err(|e| format!("couldn't create {} ({e}); is another eGuard running?", ipc::PIPE_NAME))?;
         let me = Arc::clone(self);
         std::thread::Builder::new().name("pipe".into()).spawn(move || me.serve_pipe(server, first)).map_err(|e| e.to_string())?;
+        let me = Arc::clone(self);
+        let dirs = Arc::clone(&self.watch_dirs);
+        let watching = eguard_win::watch::spawn(
+            move || dirs.lock().map(|d| d.clone()).unwrap_or_default(),
+            move || {
+                let mut inner = me.lock();
+                inner.engine.request_scan();
+                inner.woken = true;
+                me.wake.notify_all();
+            },
+        );
+        if let Err(e) = watching {
+            log::warn(&format!("couldn't watch for installs ({e}); scans run every 6 hours only"));
+        }
 
         {
             let mut inner = self.lock();
@@ -136,6 +159,7 @@ impl Runner {
             if tick.changed {
                 self.save(&inner);
             }
+            self.start_scan_if_due(&mut inner);
             inner.woken = false;
             let (_inner, _) = self
                 .wake
@@ -146,6 +170,48 @@ impl Runner {
         self.save(&inner);
         log::info("stopped");
         Ok(())
+    }
+
+    fn start_scan_if_due(self: &Arc<Self>, inner: &mut Inner) {
+        if self.scanning.load(Ordering::SeqCst) {
+            return;
+        }
+        let now = inner.engine.now_ms(clock::sample());
+        let Some((classifier, cache)) = inner.engine.scan_due(now) else { return };
+        self.scanning.store(true, Ordering::SeqCst);
+        let me = Arc::clone(self);
+        let started = std::thread::Builder::new().name("scan".into()).spawn(move || me.scan(&classifier, cache));
+        if let Err(e) = started {
+            self.scanning.store(false, Ordering::SeqCst);
+            log::warn(&format!("couldn't start a scan: {e}"));
+        }
+    }
+
+    /// One full scan, without the lock (it reads the disk and checks signatures for a while), then its results.
+    fn scan(&self, classifier: &Classifier, mut cache: ExeCache) {
+        let started = Instant::now();
+        let collected = apps::collect(&mut cache);
+        if let Ok(mut d) = self.watch_dirs.lock() {
+            d.clone_from(&collected.watch_dirs);
+        }
+        let candidates = scan::merge(collected.candidates);
+        let result = scan::classify_all(classifier, &candidates);
+        log::info(&format!(
+            "scanned {} candidates in {:.1} s ({} files checked, {} from the cache)",
+            candidates.len(),
+            started.elapsed().as_secs_f64(),
+            collected.exes_checked,
+            collected.cache_hits
+        ));
+        let mut inner = self.lock();
+        let now = inner.engine.now_ms(clock::sample());
+        inner.engine.apply_scan(&result, cache, now);
+        log_notes(&mut inner.engine);
+        self.save(&inner);
+        self.scanning.store(false, Ordering::SeqCst);
+        // Send what the scan found now, not at the next tick
+        inner.woken = true;
+        self.wake.notify_all();
     }
 
     fn serve_pipe(self: Arc<Self>, mut server: PipeServer, first: eguard_win::pipe::Pending) {
@@ -182,6 +248,13 @@ impl Runner {
     fn handle(&self, req: Request) -> Response {
         match req {
             Request::Status => Response::Status(self.lock().engine.status()),
+            Request::Scan => {
+                let mut inner = self.lock();
+                inner.engine.request_scan();
+                inner.woken = true;
+                self.wake.notify_all();
+                Response::Status(inner.engine.status())
+            }
             Request::Pair { code, name } => {
                 let mut inner = self.lock();
                 let mut info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
