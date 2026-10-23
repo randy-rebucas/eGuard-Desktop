@@ -1,0 +1,17 @@
+[package]
+name = "eguard-service"
+description = "eGuard's Windows service: holds the device token, pairs, syncs and reports (console mode for development)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+eguard-core = { path = "../eguard-core" }
+eguard-win = { path = "../eguard-win" }
+jiff.workspace = true
+windows-service.workspace = true
+
+[lints]
+workspace = true

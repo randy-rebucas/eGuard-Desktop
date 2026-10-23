@@ -1,0 +1,15 @@
+[package]
+name = "eguard-win"
+description = "Windows side of the eGuard desktop agent: WinHTTP, DPAPI, atomic files, the named pipe, clocks and device details"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+eguard-core = { path = "../eguard-core" }
+windows-sys.workspace = true
+
+[lints]
+workspace = true

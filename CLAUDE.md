@@ -19,8 +19,13 @@ on the owner, gotchas).
 
 ## Layout
 
-- `crates/eguard-core`: platform-neutral (no `windows` crate). Wire types, rules, time accounting, trusted clock,
-  signatures, removal codes, offline queue, sync state. `#![forbid(unsafe_code)]` via workspace lints.
+- `crates/eguard-core`: platform-neutral (no Windows crate). Wire types, API client (`Transport` trait), rules, time
+  accounting, trusted clock, signatures, removal codes, offline queue, sync state, `/report` contents, pipe messages,
+  the service's sync loop (`engine`). `#![forbid(unsafe_code)]` in its lib.rs.
+- `crates/eguard-win`: `windows-sys` 0.61 (the same version `windows-service` uses). `WinHTTP`, DPAPI, atomic files,
+  named pipe + DACL, clocks, device details. The workspace denies `unsafe`; only this crate's FFI modules allow it.
+- `crates/eguard-service`, `eguard-agent`, `eguard-guard`: the three binaries (spec section 3). On the owner's PC the
+  service runs in console mode (`eguard-service run`); `install` is for a VM.
 - `fixtures/server/`: real server responses, captured by `node tools/capture-fixtures.mjs` (needs ~/eguard's dev DB
   and a dev server; it deletes its test family afterwards). `fixtures/canonical-vectors.json`: made by
   `node tools/canonical-vectors.mjs`. Never hand-edit either.
@@ -28,10 +33,11 @@ on the owner, gotchas).
 ## Commands
 
 ```sh
-cargo test -p eguard-core
+cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 node tools/capture-fixtures.mjs        # refresh fixtures (EGUARD_URL defaults to http://localhost:3000)
+node tools/dev-family.mjs create|code|show|delete   # a test family for pairing this PC by hand
 ```
 
 ## Conventions

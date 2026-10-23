@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/eguard-core"]
+members = ["crates/eguard-core", "crates/eguard-win", "crates/eguard-service", "crates/eguard-agent", "crates/eguard-guard"]
 
 [workspace.package]
 version = "0.1.0"
@@ -22,9 +22,25 @@ sha2 = "0.10"
 subtle = "2"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Denied everywhere; allowed only in eguard-win's FFI modules. eguard-core forbids it outright (lib.rs)
+unsafe_code = "deny"
 missing_debug_implementations = "warn"
 
 [workspace.lints.clippy]

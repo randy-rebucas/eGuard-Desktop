@@ -1,0 +1,15 @@
+[package]
+name = "eguard-agent"
+description = "eGuard in the signed-in session. For now a console: pair this computer and show its status"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+eguard-core = { path = "../eguard-core" }
+eguard-win = { path = "../eguard-win" }
+
+[lints]
+workspace = true
