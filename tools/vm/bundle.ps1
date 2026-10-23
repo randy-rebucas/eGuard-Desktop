@@ -9,14 +9,22 @@
 #
 #   bundle.ps1                                   no extension ids: nothing is forced in browsers (Phase 5 waits)
 #   bundle.ps1 -ChromeId ID -EdgeId ID -FirefoxUrl URL   the extension's real store ids, once they exist
+#   bundle.ps1 -ServerUrl https://… -PublicKeys KEY      a build for a real eGuard server instead of this PC's dev
+#                                                server: its https address and its policy-signing public key (base64
+#                                                SPKI, as the extension's VITE_POLICY_PUBLIC_KEY; never the private key).
+#                                                Both or neither: the dev key can't check a real server's signatures
 #
 # Its own target folder (target\vm), so the static C runtime doesn't rebuild everyday builds.
-param([string]$ChromeId, [string]$EdgeId, [string]$FirefoxUrl)
+param([string]$ChromeId, [string]$EdgeId, [string]$FirefoxUrl, [string]$ServerUrl, [string]$PublicKeys)
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $out = Join-Path $root "target\vm-bundle"
 $ids = @{ EGUARD_CHROME_EXTENSION_ID = $ChromeId; EGUARD_EDGE_EXTENSION_ID = $EdgeId; EGUARD_FIREFOX_EXTENSION_URL = $FirefoxUrl }
-if (($ids.Values | Where-Object { $_ }).Count -notin 0, 3) { throw "give all three extension ids, or none" }
+if (($ids.GetEnumerator() | Where-Object { $_.Value }).Count -notin 0, 3) { throw "give all three extension ids, or none" }
+if ([bool]$ServerUrl -ne [bool]$PublicKeys) { throw "give -ServerUrl and -PublicKeys together, or neither" }
+if ($ServerUrl -and -not $ServerUrl.StartsWith("https://")) { throw "-ServerUrl must be https://" }
+$ids["EGUARD_SERVER_URL"] = $ServerUrl
+$ids["EGUARD_POLICY_PUBLIC_KEYS"] = $PublicKeys
 
 $saved = @{ RUSTFLAGS = $env:RUSTFLAGS }
 foreach ($k in $ids.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
@@ -52,5 +60,6 @@ Copy-Item (Join-Path $root "docs\VM-TESTS.md") $out
 
 $zip = Join-Path $root "target\eguard-vm.zip"
 if (Test-Path $zip) { Remove-Item $zip }
+if ($ServerUrl) { $ServerUrl | Set-Content -Encoding ascii (Join-Path $out "bin\server.txt") }
 Compress-Archive -Path (Join-Path $out "*") -DestinationPath $zip
 "bundle: $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB). Copy it to the VM and follow VM-TESTS.md."
