@@ -215,18 +215,59 @@ fn is_loose(c: &Candidate) -> bool {
     matches!(c.origin, Origin::Shortcut | Origin::UserFolder)
 }
 
+/// True when `dir` is under `C:\Program Files` or `C:\Program Files (x86)`, where a standard account can't write.
+/// `merge`'s guess when the platform doesn't say (`merge_with`); a Windows on another drive only means more loose
+/// exes are reported.
+pub fn in_default_program_files(dir: &str) -> bool {
+    let d = norm(dir);
+    [r"c:\program files", r"c:\program files (x86)"].iter().any(|pf| d == *pf || d.starts_with(&format!(r"{pf}\")))
+}
+
+/// True when `loose`'s exe was signed by a signer of `installed`'s, so it may be taken for part of that app. An app
+/// whose signer isn't known only takes an unsigned exe, or one it lends its exe to (it then reports that exe's
+/// signer, so nothing is hidden).
+fn signers_agree(loose: &Candidate, installed: &Candidate) -> bool {
+    let theirs: Vec<&str> = installed.signers().collect();
+    let mut mine = loose.signers().peekable();
+    if theirs.is_empty() {
+        return mine.peek().is_none() || installed.exe.is_none();
+    }
+    mine.any(|s| theirs.contains(&s))
+}
+
+/// True when the loose `l`, inside `installed`'s folder, is part of that app and so not reported on its own: the
+/// folder is out of the child's reach (`admin_only`), or `l` carries the app's own signature. Anywhere else the child
+/// can drop a game into an installed app's folder.
+fn covered_by(l: &Candidate, installed: &Candidate, admin_only: &impl Fn(&str) -> bool) -> bool {
+    let (Some(d), Some(od)) = (l.dir.as_deref(), installed.dir.as_deref()) else { return false };
+    if is_loose(installed) || !inside(d, od) {
+        return false;
+    }
+    admin_only(od) || (installed.signers().next().is_some() && signers_agree(l, installed))
+}
+
 /// One candidate per app:
 /// - the same install folder found twice is one app (the earlier origin's name, every id);
-/// - a shortcut or loose exe inside an installed app's folder is that app;
-/// - a shortcut or loose exe named like an installed app is that app (its installer left in Downloads, a Start Menu
-///   entry for an app whose folder wasn't known), and lends it its exe.
+/// - a shortcut or loose exe inside an installed app's folder is that app, when the folder is under Program Files
+///   or the exe carries the app's signature (elsewhere the child could hide a game there);
+/// - a shortcut or loose exe named like an installed app, signed by the same signer, is that app (its installer left
+///   in Downloads, a Start Menu entry for an app whose folder wasn't known), and lends it its exe.
+///
+/// Program Files is guessed (`in_default_program_files`); `merge_with` takes the platform's answer.
 pub fn merge(cands: Vec<Candidate>) -> Vec<Candidate> {
-    let mut out = merge_by_dir(cands);
+    merge_with(cands, in_default_program_files)
+}
+
+/// `merge`, with `admin_only` saying which folders a standard account can't write to.
+pub fn merge_with(cands: Vec<Candidate>, admin_only: impl Fn(&str) -> bool) -> Vec<Candidate> {
+    let mut out = merge_by_dir(cands, &admin_only);
     let (loose, mut installed): (Vec<_>, Vec<_>) = out.drain(..).partition(is_loose);
     let mut rest = Vec::new();
     for l in loose {
         let product = l.exe.as_ref().and_then(|e| e.product.clone()).unwrap_or_default();
-        match installed.iter_mut().find(|i| names_match(&l.name, &i.name) || names_match(&product, &i.name)) {
+        // A signed game renamed "Microsoft.exe" isn't Microsoft Edge
+        let named_like = |i: &Candidate| (names_match(&l.name, &i.name) || names_match(&product, &i.name)) && signers_agree(&l, i);
+        match installed.iter_mut().find(|i| named_like(i)) {
             Some(i) => {
                 if i.exe.is_none() {
                     i.exe = l.exe;
@@ -243,20 +284,18 @@ pub fn merge(cands: Vec<Candidate>) -> Vec<Candidate> {
     installed
 }
 
-fn merge_by_dir(mut cands: Vec<Candidate>) -> Vec<Candidate> {
+fn merge_by_dir(mut cands: Vec<Candidate>, admin_only: &impl Fn(&str) -> bool) -> Vec<Candidate> {
     cands.sort_by_key(|c| c.origin);
     let mut out: Vec<Candidate> = Vec::new();
     let mut by_dir: HashMap<String, usize> = HashMap::new();
     for c in cands {
         let loose = is_loose(&c);
-        if loose {
-            let covered =
-                c.dir.as_deref().is_some_and(|d| out.iter().any(|o| !is_loose(o) && o.dir.as_deref().is_some_and(|od| inside(d, od))));
-            if covered {
-                continue;
-            }
+        if loose && out.iter().any(|o| covered_by(&c, o, admin_only)) {
+            continue;
         }
-        if let Some(i) = c.dir.as_deref().map(norm).and_then(|d| by_dir.get(&d).copied()) {
+        // A loose exe that isn't covered stays its own app even in an installed app's very folder
+        let same_dir = c.dir.as_deref().map(norm).and_then(|d| by_dir.get(&d).copied()).filter(|&i| !loose || is_loose(&out[i]));
+        if let Some(i) = same_dir {
             let o = &mut out[i];
             o.ids.extend(c.ids);
             o.launcher = o.launcher.or(c.launcher);
@@ -466,8 +505,26 @@ mod tests {
         loose.dir = Some(r"C:\Users\mia\AppData\Roaming\Telegram Desktop\tupdates".into());
         let mut other = Candidate::new("Pixel Quest", Origin::UserFolder);
         other.dir = Some(r"C:\Users\mia\Downloads\pixel-quest".into());
-        let m = merge(vec![lnk, loose, other, un]);
-        assert_eq!(m.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Telegram Desktop", "Pixel Quest"]);
+        let names = |m: &[Candidate]| m.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        // The folder is the child's to write to and the app's signer isn't known: the loose exe in it is still
+        // reported (it may be a game put there); the shortcut, named like the app, lends it its exe
+        let m = merge(vec![lnk.clone(), loose.clone(), other.clone(), un.clone()]);
+        assert_eq!(names(&m), ["Telegram Desktop", "Updater", "Pixel Quest"]);
+        assert_eq!(m[0].exe.as_ref().unwrap().file_name, "telegram.exe");
+        // Signed by the app's signer, it's part of the app
+        un.exe = exe("telegram.exe", Some("telegram fz-llc"), None);
+        let mut signed = loose.clone();
+        signed.exe = exe("updater.exe", Some("telegram fz-llc"), None);
+        let mut game = Candidate::new("Shooter", Origin::UserFolder);
+        game.dir = loose.dir.clone();
+        game.exe = exe("shooter.exe", Some("shooter studio"), None);
+        assert_eq!(names(&merge(vec![signed, game, un.clone()])), ["Telegram Desktop", "Shooter"]);
+        // Under Program Files the child can't put anything there
+        let mut pf = un.clone();
+        pf.dir = Some(r"C:\Program Files\Telegram Desktop".into());
+        loose.dir = Some(r"C:\Program Files\Telegram Desktop\tupdates".into());
+        assert_eq!(names(&merge(vec![loose, other, pf])), ["Telegram Desktop", "Pixel Quest"]);
+        assert!(in_default_program_files(r"C:\Program Files (x86)\Steam") && !in_default_program_files(r"D:\Program Files\x"));
 
         // Same folder from two places: one app, the launcher's name, both ids
         let mut a = Candidate::new("Steam App 730", Origin::Uninstall);
@@ -499,6 +556,20 @@ mod tests {
         // The installed app takes the shortcut's exe, so it gets a signer and an EXE id
         assert_eq!(m[1].exe.as_ref().unwrap().file_name, "viber.exe");
         assert!(!names_match("Go", "Go Language") && names_match("Telegram", "Telegram Desktop"));
+    }
+
+    #[test]
+    fn a_loose_exe_named_like_an_app_with_another_signer_stays_its_own() {
+        let mut edge = Candidate::new("Microsoft Edge", Origin::Uninstall);
+        edge.exe = exe("msedge.exe", Some("microsoft corporation"), Some("Microsoft Edge"));
+        let mut signed = Candidate::new("Microsoft", Origin::UserFolder);
+        signed.exe = exe("microsoft.exe", Some("shooter studio"), None);
+        let mut unsigned = Candidate::new("Microsoft Edge Setup", Origin::UserFolder);
+        unsigned.exe = exe("setup.exe", None, Some("Microsoft Edge"));
+        let mut real = Candidate::new("MicrosoftEdgeSetup", Origin::UserFolder);
+        real.exe = exe("microsoftedgesetup.exe", Some("microsoft corporation"), Some("Microsoft Edge"));
+        let m = merge(vec![signed, unsigned, real, edge]);
+        assert_eq!(m.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Microsoft Edge", "Microsoft", "Microsoft Edge Setup"]);
     }
 
     #[test]

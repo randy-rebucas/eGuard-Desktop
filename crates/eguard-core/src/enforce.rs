@@ -9,10 +9,26 @@
 //! **Which program is which app** (spec section 6): by the install folder the scan recorded (so a renamed `cs2.exe`
 //! is still Steam appid 730), then by id against the child's list, then by name.
 //!
+//! **Evidence the child can forge only ever makes things stricter.** A child can write to any folder outside Program
+//! Files (and so to any install folder a per-user Uninstall entry names), can rename a file, and can give an unsigned
+//! exe any product name. So a program is looked at twice: by its own facts (its signer, the catalog, the parent's
+//! rules) and by the folder it's in. A folder under Program Files, or one whose app was signed by the same signer as
+//! the program, says what the program is; any other folder, and any rule found only by name, may only make the
+//! answer stricter (`strictness`). A name loosens only when the signer backs it: the rule carries an `EXE` id with the
+//! program's signer, or the catalog names the app from the program's signer.
+//!
 //! **Never ended** (spec section 7): Microsoft-signed programs under `%SystemRoot%`, eGuard itself, accessibility
-//! tools, and a trusted publisher's apps that aren't catalog games. App Approval applies to apps the scan found and
-//! to unsigned programs outside Program Files, never to every program, so drivers and updaters keep working.
-//! Anything else is "untracked": never ended, its time counts toward the day but not toward an app.
+//! tools, and a trusted publisher's apps that aren't catalog games (by the program's own signer, or by a trusted
+//! publisher's folder under Program Files), unless the parent's rules say otherwise. Programs that run other code
+//! (`RUNTIME_HOSTS`) are never exempt by their signer. App Approval applies to apps the scan found and to every
+//! program outside Program Files whose signer the catalog doesn't trust, never to every program, so drivers and
+//! updaters keep working. Anything else is "untracked": never ended, its time counts toward the day but not toward an
+//! app.
+//!
+//! Limits: an unsigned app the parent allowed, in a folder the child can write to, can't be told from another
+//! unsigned exe put in its place (nothing about either can't be forged), so such a folder vouches for unsigned exes.
+//! A runtime host under Program Files that isn't in a scanned app's folder is untracked, not ended (a Java or Python
+//! game started with an installed runtime is only caught when the parent's rules name the runtime).
 
 use crate::clock::{ClockSample, TrustedClock};
 use crate::ipc::{Screen, SessionView, Warning};
@@ -21,7 +37,7 @@ use crate::rules::{self, Block, Rules, Subject, Verdict};
 use crate::scan::launchers::Launcher;
 use crate::scan::{self, Candidate, Classifier, ExeFacts, Origin, Place, Skip};
 use crate::usage::{DayUsage, UsageApp, UsageLedger};
-use crate::wire::{AppId, AppIdKind, AppRule, AppSource, Category, DeviceEvent, FoundApp, UsageReport};
+use crate::wire::{self, AppId, AppIdKind, AppRule, AppSource, Approval, Category, DeviceEvent, FoundApp, UsageReport};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -42,19 +58,32 @@ pub const USAGE_EVERY_MS: i64 = 5 * 60_000;
 /// The server keeps 30 days of usage; older days are dropped.
 const USAGE_KEEP_DAYS: i64 = 31;
 
-/// Accessibility tools that live outside the Windows folder, by file name and the signer that must have signed them
-/// (so a renamed game can't pass for one). Windows' own (Narrator, Magnifier, the on-screen keyboard, Voice Access)
-/// are under `%SystemRoot%` and Microsoft-signed already.
-const ACCESSIBILITY: &[(&str, &str)] = &[
-    ("nvda.exe", "nv access"),
-    ("nvda_slave.exe", "nv access"),
-    ("nvda_ui.exe", "nv access"),
-    ("jfw.exe", "freedom scientific"),
-    ("zoomtext.exe", "freedom scientific"),
-    ("fusion.exe", "freedom scientific"),
-    ("natspeak.exe", "nuance communications"),
-    ("dragonbar.exe", "nuance communications"),
+/// The organisations that sign NV Access's tools, exactly as their certificates spell them (lower case).
+const NV_ACCESS: &[&str] = &["nv access limited"];
+/// Freedom Scientific's (JAWS, `ZoomText`, Fusion); the certificates have spelled the name these ways.
+const FREEDOM_SCIENTIFIC: &[&str] = &["freedom scientific inc.", "freedom scientific inc", "freedom scientific, inc."];
+/// Nuance's (Dragon).
+const NUANCE: &[&str] = &["nuance communications, inc.", "nuance communications inc."];
+
+/// Accessibility tools that live outside the Windows folder, by file name and the organisations whose signature they
+/// must carry (so a renamed game can't pass for one). The whole name must match: anyone can buy a certificate for
+/// "NV Access Fan Club". Windows' own (Narrator, Magnifier, the on-screen keyboard, Voice Access) are under
+/// `%SystemRoot%` and Microsoft-signed already.
+const ACCESSIBILITY: &[(&str, &[&str])] = &[
+    ("nvda.exe", NV_ACCESS),
+    ("nvda_slave.exe", NV_ACCESS),
+    ("nvda_ui.exe", NV_ACCESS),
+    ("jfw.exe", FREEDOM_SCIENTIFIC),
+    ("zoomtext.exe", FREEDOM_SCIENTIFIC),
+    ("fusion.exe", FREEDOM_SCIENTIFIC),
+    ("natspeak.exe", NUANCE),
+    ("dragonbar.exe", NUANCE),
 ];
+
+/// Programs that run other code: a game written in Java or Python runs as `javaw.exe` or `python.exe`, signed by
+/// whoever built the runtime (Microsoft builds the Java Minecraft ships with). Their signer says nothing about what
+/// they run, so it never exempts them, and neither does a trusted publisher's folder.
+const RUNTIME_HOSTS: &[&str] = &["java.exe", "javaw.exe", "python.exe", "pythonw.exe", "py.exe", "pyw.exe"];
 
 /// What the platform knows about a running program.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,59 +220,217 @@ pub fn resolve(p: &Program, inputs: &Inputs) -> Resolved {
     if p.windows {
         return Resolved::Exempt(Exempt::Windows);
     }
-    let signed_by =
-        |prefix: &str| [p.exe.signer.as_deref(), p.exe.signer_alt.as_deref()].into_iter().flatten().any(|s| s.starts_with(prefix));
-    if ACCESSIBILITY.iter().any(|(file, signer)| p.exe.file_name == *file && signed_by(signer)) {
+    // The organisation the certificate names, in full (`signer`); the common name can be anything its owner chose
+    if ACCESSIBILITY.iter().any(|(file, signers)| p.exe.file_name == *file && p.exe.signer.as_deref().is_some_and(|s| signers.contains(&s)))
+    {
         return Resolved::Exempt(Exempt::Accessibility);
     }
 
-    let place = inputs.inventory.place_of(&p.path);
-    let listed_as = place.and_then(|pl| pl.app.as_deref()).and_then(|name| inputs.inventory.apps.get(name));
-    let product = p.exe.product.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let name = place
-        .and_then(|pl| pl.app.clone())
-        .or_else(|| product.map(str::to_owned))
-        .unwrap_or_else(|| file_stem(&p.exe.file_name).to_owned());
-    let mut c = Candidate::new(&name, Origin::Uninstall);
-    c.ids = listed_as.map(|a| a.ids.clone()).unwrap_or_default();
-    c.launcher = launcher_of(&c.ids).or_else(|| (listed_as.and_then(|a| a.source) == Some(AppSource::Launcher)).then_some(Launcher::Steam));
-    c.dir = place.map(|pl| pl.dir.clone());
-    c.exe = Some(p.exe.clone());
-
-    let found = if let Some(classifier) = &inputs.classifier {
-        match classifier.classify(&c) {
-            // Inside a trusted publisher's app, only a catalog game is still a game
-            Ok(f) if place.is_some_and(|pl| pl.app.is_none()) && f.source != Some(AppSource::Catalog) => {
-                return Resolved::Exempt(Exempt::Trusted);
-            }
-            Ok(f) => f,
-            Err(Skip::TrustedPublisher(_)) => return Resolved::Exempt(Exempt::Trusted),
-            Err(Skip::BlankName) => return Resolved::Untracked,
+    let host = RUNTIME_HOSTS.contains(&p.exe.file_name.as_str());
+    let (own, specific) = own_outcome(p, inputs, host);
+    // A trusted publisher's folder says nothing about what a runtime in it runs
+    let Some(place) = inputs.inventory.place_of(&p.path).filter(|pl| !(host && pl.app.is_none())) else { return own };
+    let (folder, vouches) = match place.app.as_deref() {
+        // Only Program Files is out of the child's reach; a per-user trusted app's folder isn't
+        None => (Resolved::Exempt(Exempt::Trusted), p.program_files),
+        Some(name) => {
+            let vouches = p.program_files || signer_agrees(p, inputs.inventory.apps.get(name));
+            (folder_outcome(p, inputs, place, name, host), vouches)
         }
-    } else {
-        // No catalog yet: nothing is trusted, and nothing is known to be a game
-        let mut ids = c.ids.clone();
-        ids.push(AppId::exe(p.exe.signer.as_deref(), product.unwrap_or(&name)));
-        FoundApp { app: name.clone(), ids, source: None, category: listed_as.and_then(|a| a.category) }
     };
-
-    let rule = inputs.rules.apps.iter().find(|r| r.ids.iter().any(|i| found.ids.iter().any(|j| i.same_as(j)))).or_else(|| {
-        [Some(found.app.as_str()), place.and_then(|pl| pl.app.as_deref()), product]
-            .into_iter()
-            .flatten()
-            .find_map(|n| inputs.rules.apps.iter().find(|r| r.name.eq_ignore_ascii_case(n)))
-    });
-    if let Some(r) = rule {
-        return Resolved::App(AppMatch { name: r.name.clone(), ids: found.ids, category: r.category.effective(), rule: Some(r.clone()) });
+    if !vouches {
+        stricter(own, folder, &inputs.rules)
+    } else if specific {
+        // The folder is the app, but a rule or the catalog naming the program itself still holds where it's stricter
+        stricter(folder, own, &inputs.rules)
+    } else {
+        folder
     }
-    let known = place.is_some_and(|pl| pl.app.is_some()) || inputs.inventory.app_with(&found.app, &found.ids).is_some();
-    let loose_unsigned = p.exe.signer.is_none() && !p.program_files;
-    if known || loose_unsigned {
-        let category = found.category.unwrap_or(Category::Other).effective();
-        Resolved::App(AppMatch { name: found.app, ids: found.ids, category, rule: None })
+}
+
+/// How strict an outcome is for the child: the higher, the less they can do with the program. Evidence the child can
+/// forge (a folder they can write to, a file name, an unsigned exe's product name) may only move a program up this
+/// scale, never down.
+///
+/// From the strictest:
+/// 8. blocked: `BLOCKED`, `FILTERED`, or an approval this build doesn't know;
+/// 7. waiting: `PENDING`, or not on the list while App Approval is on;
+/// 6. allowed with its own daily limit;
+/// 5. not on the list while App Approval is off: allowed, but its category's limit applies, and it's the scan's or
+///    the catalog's category rather than one a name lent it;
+/// 4. allowed;
+/// 3. always allowed with a daily limit;
+/// 2. always allowed: bedtime and the day's limit don't pause it;
+/// 1. untracked: never ended, its time counts toward the day only;
+/// 0. never ended (`Exempt`).
+fn strictness(r: &Resolved, rules: &Rules) -> u8 {
+    let Resolved::App(a) = r else {
+        return u8::from(matches!(r, Resolved::Untracked));
+    };
+    match &a.rule {
+        None if rules.policy.approval_required => 7,
+        None => 5,
+        Some(rule) => match (rule.approval, rule.daily_limit_minutes.is_some()) {
+            (Approval::Blocked | Approval::Filtered | Approval::Unknown, _) => 8,
+            (Approval::Pending, _) => 7,
+            (Approval::Allowed, true) => 6,
+            (Approval::Allowed, false) => 4,
+            (Approval::AlwaysAllowed, true) => 3,
+            (Approval::AlwaysAllowed, false) => 2,
+        },
+    }
+}
+
+/// The stricter of `a` and `b` (`strictness`); `a` when they're as strict.
+fn stricter(a: Resolved, b: Resolved, rules: &Rules) -> Resolved {
+    if strictness(&b, rules) > strictness(&a, rules) { b } else { a }
+}
+
+/// The signers in a list's `EXE` ids (`<signer>|<product>`), empty for an unsigned exe's.
+fn exe_signers(ids: &[AppId]) -> impl Iterator<Item = &str> {
+    ids.iter().filter(|i| i.kind == AppIdKind::Exe).map(|i| i.value.split_once('|').map_or(i.value.as_str(), |(s, _)| s))
+}
+
+/// The program's verified signer names (the organisation, and the common name when it differs).
+fn signers_of(p: &Program) -> impl Iterator<Item = &str> {
+    [p.exe.signer.as_deref(), p.exe.signer_alt.as_deref()].into_iter().flatten()
+}
+
+/// Whether the app the scan found in a folder outside Program Files was signed by the program's signer, so the
+/// folder may say which app the program is even where that's less strict. An unsigned program agrees only with an
+/// app whose every exe was unsigned (module docs: nothing better exists for those); an app with no `EXE` id at all
+/// (an Uninstall entry naming a folder and nothing else) vouches for nothing.
+fn signer_agrees(p: &Program, app: Option<&FoundApp>) -> bool {
+    let Some(app) = app else { return false };
+    let theirs: Vec<&str> = exe_signers(&app.ids).collect();
+    if theirs.is_empty() {
+        return false;
+    }
+    if p.exe.signer.is_none() { theirs.iter().all(|s| s.is_empty()) } else { signers_of(p).any(|s| theirs.contains(&s)) }
+}
+
+/// Whether `rule` carries an `EXE` id signed by one of the program's signers (so a name match may loosen).
+fn rule_signed_by(rule: &AppRule, p: &Program) -> bool {
+    exe_signers(&rule.ids).any(|s| !s.is_empty() && signers_of(p).any(|mine| mine == s))
+}
+
+/// The app `c` is when the catalog's trust doesn't apply (no catalog yet, or a runtime host): its name and ids,
+/// nothing known about its publisher.
+fn untrusted(c: &Candidate, category: Option<Category>) -> Option<FoundApp> {
+    // The server takes names up to its limit; a longer one would get every event it's in refused
+    let app = wire::app_name(&c.name)?;
+    let mut ids = c.ids.clone();
+    if let Some(e) = &c.exe {
+        let product = e.product.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&c.name);
+        ids.push(AppId::exe(e.signer.as_deref(), product));
+    }
+    let mut seen = BTreeSet::new();
+    ids.retain(|i| !i.value.is_empty() && i.value != "|" && seen.insert((i.kind, i.value.clone())));
+    ids.truncate(wire::IDS_PER_APP_MAX);
+    Some(FoundApp { app, ids, source: None, category })
+}
+
+/// `found` as the app on the list `rule` is, or as an app not on the list yet.
+fn app_match(found: &FoundApp, rule: Option<&AppRule>) -> Resolved {
+    Resolved::App(match rule {
+        Some(r) => AppMatch { name: r.name.clone(), ids: found.ids.clone(), category: r.category.effective(), rule: Some(r.clone()) },
+        None => AppMatch {
+            name: found.app.clone(),
+            ids: found.ids.clone(),
+            category: found.category.unwrap_or(Category::Other).effective(),
+            rule: None,
+        },
+    })
+}
+
+fn rule_by_id<'a>(rules: &'a Rules, ids: &[AppId]) -> Option<&'a AppRule> {
+    rules.apps.iter().find(|r| r.ids.iter().any(|i| ids.iter().any(|j| i.same_as(j))))
+}
+
+fn rule_by_name<'a>(rules: &'a Rules, names: &[Option<&str>]) -> Option<&'a AppRule> {
+    names.iter().flatten().find_map(|n| rules.apps.iter().find(|r| r.name.eq_ignore_ascii_case(n)))
+}
+
+/// The catalog's name for a program from its signer alone (not its file name or product name, which may be
+/// anyone's).
+fn catalog_name_by_signer(classifier: &Classifier, p: &Program) -> Option<String> {
+    let mut c = Candidate::new("", Origin::Uninstall);
+    c.exe = Some(ExeFacts { file_name: String::new(), product: None, ..p.exe.clone() });
+    classifier.classify(&c).ok().filter(|f| f.source == Some(AppSource::Catalog)).map(|f| f.app)
+}
+
+/// What a program is by its own facts alone: its signer, product and file name, the catalog and the parent's rules.
+/// Also whether that's more than App Approval's catch-all (a rule on the list, or a catalog or launcher game).
+fn own_outcome(p: &Program, inputs: &Inputs, host: bool) -> (Resolved, bool) {
+    let rules = &inputs.rules;
+    let product = p.exe.product.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let mut c = Candidate::new(product.unwrap_or_else(|| file_stem(&p.exe.file_name)), Origin::Uninstall);
+    c.exe = Some(p.exe.clone());
+    let (found, trusted) = match &inputs.classifier {
+        Some(classifier) => match classifier.classify(&c) {
+            Ok(f) => (Some(f), false),
+            Err(Skip::TrustedPublisher(_)) => (untrusted(&c, None), !host),
+            Err(Skip::BlankName) => (None, false),
+        },
+        // No catalog yet: nothing is trusted, and nothing is known to be a game
+        None => (untrusted(&c, None), false),
+    };
+    let Some(found) = found else { return (Resolved::Untracked, false) };
+
+    let game = matches!(found.source, Some(AppSource::Catalog | AppSource::Launcher));
+    let baseline = if trusted {
+        Resolved::Exempt(Exempt::Trusted)
+    } else if game || !p.program_files || inputs.inventory.app_with(&found.app, &found.ids).is_some() {
+        // Outside Program Files, any signer the catalog doesn't trust: a game on a USB stick is signed by someone
+        app_match(&found, None)
     } else {
         Resolved::Untracked
+    };
+
+    // A signed exe's product name, and so its EXE id, are part of what was signed; its file name and anything about
+    // an unsigned exe are not
+    let signed = p.exe.signer.is_some();
+    let rule = match rule_by_id(rules, &found.ids) {
+        Some(r) => Some((r, signed)),
+        None => rule_by_name(rules, &[Some(found.app.as_str()), product]).map(|r| {
+            let named_by_signer =
+                || inputs.classifier.as_ref().and_then(|cl| catalog_name_by_signer(cl, p)).is_some_and(|n| n.eq_ignore_ascii_case(&r.name));
+            (r, signed && (rule_signed_by(r, p) || named_by_signer()))
+        }),
+    };
+    match rule {
+        Some((r, strong)) => {
+            let listed = app_match(&found, Some(r));
+            if strong || strictness(&listed, rules) > strictness(&baseline, rules) { (listed, true) } else { (baseline, game) }
+        }
+        None => (baseline, game),
     }
+}
+
+/// What a program is by the app the scan found in its folder (`name`): that app's ids, the launcher it came through,
+/// the parent's rules for it.
+fn folder_outcome(p: &Program, inputs: &Inputs, place: &Place, name: &str, host: bool) -> Resolved {
+    let listed_as = inputs.inventory.apps.get(name);
+    let product = p.exe.product.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let mut c = Candidate::new(name, Origin::Uninstall);
+    c.ids = listed_as.map(|a| a.ids.clone()).unwrap_or_default();
+    c.launcher = launcher_of(&c.ids).or_else(|| (listed_as.and_then(|a| a.source) == Some(AppSource::Launcher)).then_some(Launcher::Steam));
+    c.dir = Some(place.dir.clone());
+    c.exe = Some(p.exe.clone());
+    let category = listed_as.and_then(|a| a.category);
+    let found = match &inputs.classifier {
+        Some(classifier) => match classifier.classify(&c) {
+            Ok(f) => Some(f),
+            Err(Skip::TrustedPublisher(_)) if host => untrusted(&c, category),
+            Err(Skip::TrustedPublisher(_)) => return Resolved::Exempt(Exempt::Trusted),
+            Err(Skip::BlankName) => None,
+        },
+        None => untrusted(&c, category),
+    };
+    let Some(found) = found else { return Resolved::Untracked };
+    let rules = &inputs.rules;
+    let rule = rule_by_id(rules, &found.ids).or_else(|| rule_by_name(rules, &[Some(found.app.as_str()), Some(name), product]));
+    app_match(&found, rule)
 }
 
 /// What to do with a running program.
@@ -472,6 +659,13 @@ impl Enforcer {
     /// What to do with `p`, which is running. `End` queues `APP_BLOCKED` for a blocked app (once per app per
     /// `BLOCKED_EVENT_EVERY_MS`); call `ended` once it's gone, for the block screen.
     pub fn check(&mut self, p: &Program, s: ClockSample) -> Decision {
+        self.check_with(p, s, true)
+    }
+
+    /// `check`, for a caller that may not end `p` after all (`will_end` false: it only wants to know). Then the
+    /// decision is the same, but nothing is reported: no `APP_BLOCKED`, and the once-per-10-minutes allowance isn't
+    /// used up, so the next real `check` still reports it.
+    pub fn check_with(&mut self, p: &Program, s: ClockSample, will_end: bool) -> Decision {
         let resolved = match self.resolved.get(&p.path) {
             Some((was, r)) if was == p => r.clone(),
             _ => {
@@ -487,7 +681,8 @@ impl Enforcer {
         match rules::evaluate(&self.inputs.rules, app.subject(), today, &at, now) {
             Verdict::Allow { .. } => Decision::Allow,
             Verdict::Block(block) => {
-                if block == Block::Blocked && self.blocked_sent.get(&app.name).is_none_or(|t| now - t >= BLOCKED_EVENT_EVERY_MS) {
+                if will_end && block == Block::Blocked && self.blocked_sent.get(&app.name).is_none_or(|t| now - t >= BLOCKED_EVENT_EVERY_MS)
+                {
                     self.blocked_sent.insert(app.name.clone(), now);
                     self.events.push(DeviceEvent::AppBlocked { app: app.name.clone() });
                 }
@@ -789,9 +984,10 @@ mod tests {
     const PIXEL: &str = r"c:\users\mia\downloads\pixel quest";
 
     fn inventory() -> Inventory {
+        // The scan finds a Steam game's main exe, so its EXE id carries Valve's signature
         let cs2 = FoundApp {
             app: "Counter-Strike 2".into(),
-            ids: vec![AppId::new(AppIdKind::Steam, "730")],
+            ids: vec![AppId::new(AppIdKind::Steam, "730"), AppId::exe(Some("valve corp."), "Counter-Strike 2")],
             source: Some(AppSource::Catalog),
             category: Some(Category::Games),
         };
@@ -831,6 +1027,13 @@ mod tests {
     fn at(secs: u64) -> ClockSample {
         let wall = parse_iso_ms("2026-10-22T07:00:00Z").unwrap() + (secs * 1000) as i64;
         ClockSample { mono_ms: 1_000_000 + secs * 1000, boot_id: 1, wall_ms: wall }
+    }
+
+    /// Khan Academy's app, signed by its maker, and the parent's always-allowed rule for it as the scan reported it.
+    fn khan() -> (Program, AppRule) {
+        let p = program(r"C:\Users\Mia\AppData\Local\Khan\khan.exe", Some("khan academy, inc."), Some("Khan Academy"));
+        let ids = [AppId::exe(Some("khan academy, inc."), "Khan Academy")];
+        (p, rule("Khan Academy", Approval::AlwaysAllowed, None, Category::Education, &ids))
     }
 
     fn cs2_exe(file: &str) -> Program {
@@ -874,7 +1077,8 @@ mod tests {
         assert!(matches!(resolve(&fake, &i), Resolved::App(_)));
         let chrome = program(r"C:\Program Files\Google\Chrome\Application\chrome.exe", Some("google llc"), Some("Google Chrome"));
         assert_eq!(resolve(&chrome, &i), Resolved::Exempt(Exempt::Trusted));
-        // An unsigned helper inside a trusted app's folder is part of that app
+        // An unsigned helper inside a trusted app's folder under Program Files (out of the child's reach) is part of
+        // that app
         let helper = program(r"C:\Program Files\Google\Chrome\Application\helper.exe", None, None);
         assert_eq!(resolve(&helper, &i), Resolved::Exempt(Exempt::Trusted));
         // A Steam game made by a trusted publisher is still a game (launcher before trust)
@@ -887,6 +1091,174 @@ mod tests {
         // Unsigned outside Program Files: App Approval applies
         let loose = program(r"C:\Users\Mia\Desktop\coolgame.exe", None, None);
         assert!(matches!(resolve(&loose, &i), Resolved::App(AppMatch { ref name, rule: None, .. }) if name == "coolgame"));
+    }
+
+    fn is_unlisted_app(r: &Resolved) -> bool {
+        matches!(r, Resolved::App(AppMatch { rule: None, .. }))
+    }
+
+    #[test]
+    fn a_folder_the_child_can_write_to_never_exempts() {
+        let mut i = inputs(rules_with(vec![]));
+        let places = [
+            // A trusted publisher's per-user install (VS Code, Chrome for one account)
+            Place { dir: r"c:\users\mia\appdata\local\programs\microsoft vs code".into(), app: None },
+            // A per-user Uninstall entry the child wrote, naming their own folder and a Google-signed exe in it
+            Place { dir: r"c:\users\mia\games".into(), app: None },
+        ];
+        i.inventory = Inventory::new(&places, None);
+        for path in [r"C:\Users\Mia\AppData\Local\Programs\Microsoft VS Code\pixelquest.exe", r"C:\Users\Mia\Games\pixelquest.exe"] {
+            let unsigned = program(path, None, None);
+            assert!(is_unlisted_app(&resolve(&unsigned, &i)), "{path}");
+            let signed = program(path, Some("indie games llc"), Some("Pixel Quest"));
+            assert!(is_unlisted_app(&resolve(&signed, &i)), "{path}");
+        }
+        // The trusted app's own exe is still trusted, by its signer
+        let code = program(r"C:\Users\Mia\AppData\Local\Programs\Microsoft VS Code\code.exe", Some("microsoft corporation"), None);
+        assert_eq!(resolve(&code, &i), Resolved::Exempt(Exempt::Trusted));
+    }
+
+    #[test]
+    fn the_parents_rules_come_before_trust() {
+        // A rule matched by a signed EXE id applies to a trusted publisher's app, and inside its folder
+        let ids = [AppId::exe(Some("google llc"), "Google Chrome")];
+        let i = inputs(rules_with(vec![rule("Google Chrome", Approval::Blocked, None, Category::Browsers, &ids)]));
+        let chrome = program(r"C:\Program Files\Google\Chrome\Application\chrome.exe", Some("google llc"), Some("Google Chrome"));
+        assert!(matches!(resolve(&chrome, &i), Resolved::App(AppMatch { rule: Some(ref r), .. }) if r.approval == Approval::Blocked));
+    }
+
+    #[test]
+    fn a_folder_only_makes_things_stricter() {
+        let (_, khan_rule) = khan();
+        let mut r = rules_with(vec![khan_rule]);
+        r.policy.approval_required = true;
+        let mut i = inputs(r);
+        // The child's own Uninstall entry named "Khan Academy", pointing at a folder of games
+        let khan_app = FoundApp {
+            app: "Khan Academy".into(),
+            ids: vec![AppId::exe(Some("khan academy, inc."), "Khan Academy")],
+            source: Some(AppSource::UnknownPublisher),
+            category: Some(Category::Education),
+        };
+        let apps: BTreeMap<String, FoundApp> = [("Khan Academy".to_owned(), khan_app)].into();
+        i.inventory = Inventory::new(&[Place { dir: r"c:\users\mia\khan".into(), app: Some("Khan Academy".into()) }], Some(&apps));
+        let game = program(r"C:\Users\Mia\Khan\pixelquest.exe", None, None);
+        assert!(is_unlisted_app(&resolve(&game, &i)));
+        let signed_game = program(r"C:\Users\Mia\Khan\shooter.exe", Some("shooter studio"), Some("Shooter"));
+        assert!(is_unlisted_app(&resolve(&signed_game, &i)));
+        // Khan's own exe there is Khan, by its signer
+        let real = program(r"C:\Users\Mia\Khan\khan.exe", Some("khan academy, inc."), Some("Khan Academy"));
+        assert!(matches!(resolve(&real, &i), Resolved::App(AppMatch { rule: Some(_), .. })));
+        // Signed like the folder's app: the folder vouches for it (a helper with another product name)
+        let helper = program(r"C:\Users\Mia\Khan\updater.exe", Some("khan academy, inc."), Some("Khan Updater"));
+        assert!(matches!(resolve(&helper, &i), Resolved::App(AppMatch { ref name, .. }) if name == "Khan Academy"));
+
+        // A blocked app's folder still blocks whatever runs in it (acceptance test 4's renamed cs2.exe, but unsigned)
+        let cs2 = rule("Counter-Strike 2", Approval::Blocked, None, Category::Games, &[AppId::new(AppIdKind::Steam, "730")]);
+        let i = inputs(rules_with(vec![cs2]));
+        let mut renamed = cs2_exe("notcs2.exe");
+        (renamed.exe.signer, renamed.exe.product) = (None, None);
+        assert!(matches!(resolve(&renamed, &i), Resolved::App(AppMatch { rule: Some(ref r), .. }) if r.approval == Approval::Blocked));
+    }
+
+    #[test]
+    fn a_name_alone_never_loosens() {
+        let (_, khan_rule) = khan();
+        let roblox = rule("Roblox", Approval::Allowed, Some(30), Category::Games, &[]);
+        let blocked = rule("Shady Shooter", Approval::Blocked, None, Category::Games, &[]);
+        let mut r = rules_with(vec![khan_rule, roblox, blocked]);
+        r.policy.approval_required = true;
+        let i = inputs(r);
+        // An unsigned game named after an always-allowed app, by file name or product name
+        let by_file = program(r"C:\Users\Mia\Downloads\Khan Academy.exe", None, None);
+        let by_product = program(r"C:\Users\Mia\Downloads\game.exe", None, Some("Khan Academy"));
+        let signed_other = program(r"C:\Users\Mia\Downloads\game.exe", Some("shooter studio"), Some("Khan Academy"));
+        for p in [by_file, by_product, signed_other] {
+            assert!(is_unlisted_app(&resolve(&p, &i)), "{}", p.path);
+        }
+        // A name may make things stricter
+        let shady = program(r"C:\Users\Mia\Downloads\Shady Shooter.exe", None, None);
+        assert!(matches!(resolve(&shady, &i), Resolved::App(AppMatch { rule: Some(ref r), .. }) if r.approval == Approval::Blocked));
+        // Named by the catalog from its signer: the name is as good as the signature
+        let real = program(r"C:\Users\Mia\AppData\Local\Roblox\RobloxPlayerBeta.exe", Some("roblox corporation"), Some("Roblox"));
+        assert!(matches!(resolve(&real, &i), Resolved::App(AppMatch { rule: Some(ref r), .. }) if r.name == "Roblox"));
+        // An unsigned exe called Roblox is limited like Roblox, not let through
+        let fake = program(r"C:\Users\Mia\Downloads\RobloxPlayerBeta.exe", None, Some("Roblox"));
+        assert!(is_unlisted_app(&resolve(&fake, &i)));
+    }
+
+    #[test]
+    fn approval_covers_any_untrusted_signer_outside_program_files() {
+        let i = inputs(rules_with(vec![]));
+        let usb = program(r"E:\Games\Shooter\shooter.exe", Some("shooter studio"), Some("Shooter"));
+        assert!(is_unlisted_app(&resolve(&usb, &i)));
+        let installed = program(r"C:\Program Files\Shooter\shooter.exe", Some("shooter studio"), Some("Shooter"));
+        assert_eq!(resolve(&installed, &i), Resolved::Untracked);
+    }
+
+    #[test]
+    fn runtimes_are_never_exempt_by_their_signer() {
+        let mut i = inputs(rules_with(vec![]));
+        let mc = FoundApp {
+            app: "Minecraft Launcher".into(),
+            ids: vec![AppId::exe(Some("microsoft corporation"), "Minecraft Launcher")],
+            source: Some(AppSource::Catalog),
+            category: Some(Category::Games),
+        };
+        let apps: BTreeMap<String, FoundApp> = [("Minecraft Launcher".to_owned(), mc)].into();
+        let places = [
+            Place { dir: r"c:\program files (x86)\minecraft launcher".into(), app: Some("Minecraft Launcher".into()) },
+            Place { dir: r"c:\program files\microsoft\jdk".into(), app: None },
+        ];
+        i.inventory = Inventory::new(&places, Some(&apps));
+        let java = |path: &str| program(path, Some("microsoft corporation"), Some("OpenJDK Platform binary"));
+        // Minecraft Java from the child's own folder: approval applies
+        assert!(is_unlisted_app(&resolve(&java(r"C:\Users\Mia\AppData\Roaming\.minecraft\runtime\bin\javaw.exe"), &i)));
+        // Inside a known app's folder: that app
+        let launcher = resolve(&java(r"C:\Program Files (x86)\Minecraft Launcher\runtime\bin\javaw.exe"), &i);
+        assert!(matches!(launcher, Resolved::App(AppMatch { ref name, .. }) if name == "Minecraft Launcher"));
+        // In a trusted publisher's folder under Program Files: not exempt, but untracked (module docs: a limit)
+        assert_eq!(resolve(&java(r"C:\Program Files\Microsoft\jdk\bin\javaw.exe"), &i), Resolved::Untracked);
+        // The same signer on anything else is trusted as before
+        let other = program(r"C:\Program Files\Microsoft\jdk\bin\jar.exe", Some("microsoft corporation"), None);
+        assert_eq!(resolve(&other, &i), Resolved::Exempt(Exempt::Trusted));
+    }
+
+    #[test]
+    fn accessibility_tools_need_the_whole_signer() {
+        let i = inputs(rules_with(vec![]));
+        for signer in ["nv access", "nv access limited fan club"] {
+            let p = program(r"C:\Users\Mia\Downloads\nvda.exe", Some(signer), None);
+            assert!(matches!(resolve(&p, &i), Resolved::App(_)), "{signer}");
+        }
+        // The common name doesn't count, only the organisation
+        let mut p = program(r"C:\Users\Mia\Downloads\nvda.exe", Some("shooter studio"), None);
+        p.exe.signer_alt = Some("nv access limited".into());
+        assert!(matches!(resolve(&p, &i), Resolved::App(_)));
+        let jaws = program(r"C:\Program Files\Freedom Scientific\JAWS\2025\jfw.exe", Some("freedom scientific inc."), None);
+        assert_eq!(resolve(&jaws, &i), Resolved::Exempt(Exempt::Accessibility));
+    }
+
+    #[test]
+    fn before_a_catalog_names_still_fit_the_server() {
+        let mut i = inputs(rules_with(vec![]));
+        i.classifier = None;
+        let long = "x".repeat(200);
+        let p = program(&format!(r"C:\Users\Mia\Downloads\{long}.exe"), None, None);
+        let Resolved::App(a) = resolve(&p, &i) else { panic!() };
+        assert_eq!(a.name.chars().count(), wire::APP_NAME_MAX);
+    }
+
+    #[test]
+    fn checking_without_ending_reports_nothing() {
+        let cs2 = rule("Counter-Strike 2", Approval::Blocked, None, Category::Games, &[AppId::new(AppIdKind::Steam, "730")]);
+        let mut e = enforcer(rules_with(vec![cs2]));
+        let d = e.check_with(&cs2_exe("cs2.exe"), at(0), false);
+        assert_eq!(d, Decision::End { app: "Counter-Strike 2".into(), block: Block::Blocked });
+        assert_eq!(e.take_events(), Vec::<DeviceEvent>::new());
+        // The next real check still reports it
+        assert_eq!(e.check(&cs2_exe("cs2.exe"), at(1)), d);
+        assert_eq!(e.take_events(), vec![DeviceEvent::AppBlocked { app: "Counter-Strike 2".into() }]);
     }
 
     #[test]
@@ -1049,10 +1421,8 @@ mod tests {
 
     #[test]
     fn the_overlay_leaves_always_allowed_apps_usable() {
-        let mut r = rules_with(vec![
-            rule("Khan Academy", Approval::AlwaysAllowed, None, Category::Education, &[]),
-            rule("Pixel Quest", Approval::Allowed, None, Category::Games, &[]),
-        ]);
+        let (khan, khan_rule) = khan();
+        let mut r = rules_with(vec![khan_rule, rule("Pixel Quest", Approval::Allowed, None, Category::Games, &[])]);
         r.policy.screen_time = Some((1, 1));
         let mut e = enforcer(r);
         let pixel = program(r"C:\Users\Mia\Downloads\Pixel Quest\PixelQuest.exe", None, None);
@@ -1061,7 +1431,6 @@ mod tests {
         assert_eq!(last.title, "Screen time is up for today");
         assert_eq!(last.body, "You've used today's 1 minute. You can still use Khan Academy.");
         assert_eq!(e.check(&pixel, at(62)), Decision::End { app: "Pixel Quest".into(), block: Block::DailyLimit { minutes: 1 } });
-        let khan = program(r"C:\Users\Mia\AppData\Local\Khan\khan.exe", None, Some("Khan Academy"));
         assert_eq!(e.check(&khan, at(62)), Decision::Allow);
         assert!(e.heartbeat(1, Seen::Program(&khan), 0, at(63)).overlay.is_none());
         assert!(e.heartbeat(1, Seen::Nothing, 0, at(64)).overlay.is_some());
@@ -1076,11 +1445,11 @@ mod tests {
 
     #[test]
     fn bedtime_pauses_everything_and_extra_time_lifts_it() {
-        let mut r = rules_with(vec![rule("Khan Academy", Approval::AlwaysAllowed, None, Category::Education, &[])]);
+        let (khan, khan_rule) = khan();
+        let mut r = rules_with(vec![khan_rule]);
         // 15:00 to 16:00 every day, in Manila
         r.policy.bedtime = Some(Bedtime { start_min: 15 * 60, end_min: 16 * 60, school_nights_only: false });
         let mut e = enforcer(r.clone());
-        let khan = program(r"C:\Users\Mia\AppData\Local\Khan\khan.exe", None, Some("Khan Academy"));
         assert_eq!(e.check(&khan, at(0)), Decision::End { app: "Khan Academy".into(), block: Block::Bedtime });
         assert_eq!(e.heartbeat(1, Seen::Program(&khan), 0, at(1)).overlay.unwrap().title, "It's bedtime");
         r.extra_time_until_ms = Some(at(0).wall_ms + 10 * 60_000);
