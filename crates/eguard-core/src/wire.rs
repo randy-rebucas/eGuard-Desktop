@@ -791,6 +791,10 @@ pub struct Catalog {
     /// newer, so it's compared as a string. Read from a number too (`catalog_version`).
     #[serde(deserialize_with = "de_catalog_version")]
     pub version: String,
+    /// When the server issued it (ms), under the signature, if the server sends it: the version can't say which
+    /// catalog is newer, this can (`signature::older_catalog`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_at: Option<u64>,
     pub entries: Vec<CatalogEntry>,
 }
 
@@ -816,6 +820,7 @@ mod tests {
     #[test]
     fn a_catalog_version_is_the_servers_hash_or_an_older_number() {
         let read = |version: Value| serde_json::from_value::<Catalog>(json!({ "type": "t", "version": version, "entries": [] }));
+        assert_eq!(read(json!("a")).unwrap().issued_at, None);
         assert_eq!(read(json!("3f9a0c1d2e4b5a6c")).unwrap().version, "3f9a0c1d2e4b5a6c");
         assert_eq!(read(json!(1_792_758_987_201_u64)).unwrap().version, "1792758987201");
         assert!(read(json!("")).is_err() && read(json!(null)).is_err() && read(json!(-1)).is_err());

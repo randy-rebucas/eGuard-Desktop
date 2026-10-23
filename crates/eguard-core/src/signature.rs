@@ -154,6 +154,17 @@ pub enum CatalogUpdate {
     Changed(Catalog),
 }
 
+/// Whether a verified catalog `new` was issued before `kept` (a replayed older one): `kept` carries `issuedAt` and
+/// `new` an earlier one, or none at all (the server sends it on every catalog once it sends it on one). A kept copy
+/// without it (from a server that didn't send it) can't tell, and anything is taken.
+pub fn older_catalog(new: &Catalog, kept: Option<&Catalog>) -> bool {
+    match (new.issued_at, kept.and_then(|k| k.issued_at)) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(n), Some(k)) => n < k,
+    }
+}
+
 /// Checks a `GET /catalog` answer (as received). A catalog must carry eGuard's signature and the catalog type.
 /// "Unchanged" counts only for the version kept (`kept_version`, the last good copy).
 ///
@@ -179,4 +190,21 @@ pub fn verify_catalog(keys: &TrustedKeys, response: &Value, kept_version: Option
         return Err(VerifyError::WrongType(parsed.kind));
     }
     Ok(CatalogUpdate::Changed(parsed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_catalog_issued_before_the_kept_one_is_older() {
+        let at = |issued_at: Option<u64>| Catalog { kind: CATALOG_TYPE.into(), version: "v".into(), issued_at, entries: vec![] };
+        assert!(!older_catalog(&at(Some(5)), None));
+        assert!(!older_catalog(&at(None), Some(&at(None))));
+        assert!(!older_catalog(&at(Some(1)), Some(&at(None))));
+        assert!(!older_catalog(&at(Some(5)), Some(&at(Some(5)))));
+        assert!(!older_catalog(&at(Some(6)), Some(&at(Some(5)))));
+        assert!(older_catalog(&at(Some(4)), Some(&at(Some(5)))));
+        assert!(older_catalog(&at(None), Some(&at(Some(5)))));
+    }
 }

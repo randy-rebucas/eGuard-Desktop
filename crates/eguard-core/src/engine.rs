@@ -380,6 +380,11 @@ impl Engine {
         let kept = self.catalog.as_ref().map(|c| c.version.clone());
         let wait_ms = match self.api.catalog(token, kept.as_deref()) {
             Ok(raw) => match verify_catalog(&self.keys, &raw, kept.as_deref()) {
+                Ok(CatalogUpdate::Changed(c)) if crate::signature::older_catalog(&c, self.catalog.as_ref()) => {
+                    self.catalog_failures += 1;
+                    self.notes.push(Note::Warn("a catalog older than the kept one was refused; the kept one stays".into()));
+                    queue::backoff_ms(self.catalog_failures, (self.jitter)()) as u64
+                }
                 Ok(CatalogUpdate::Changed(c)) => {
                     self.notes.push(Note::Info(format!("catalog version {} ({} entries)", c.version, c.entries.len())));
                     // Another catalog may change what's reported: the next scan uses it

@@ -413,6 +413,7 @@ mod tests {
         Classifier::new(&Catalog {
             kind: "eguard.desktop.catalog".into(),
             version: "1".into(),
+            issued_at: None,
             entries: vec![
                 entry(CatalogKind::Game, MatchType::LauncherId, "steam:730", Some("Counter-Strike 2")),
                 entry(CatalogKind::Game, MatchType::ExeName, "robloxplayerbeta.exe", Some("Roblox")),
