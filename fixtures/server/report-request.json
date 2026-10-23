@@ -1,0 +1,49 @@
+{
+  "full": true,
+  "appVersion": "0.1.0",
+  "protections": [
+    {
+      "key": "SCREEN_TIME",
+      "config": {
+        "dailyMinutes": 120,
+        "weekendMinutes": 180
+      }
+    },
+    {
+      "key": "BEDTIME",
+      "config": {
+        "enabled": true,
+        "start": "21:00",
+        "end": "07:00",
+        "days": "SCHOOL_NIGHTS"
+      }
+    },
+    {
+      "key": "APP_APPROVAL",
+      "config": {
+        "enabled": true
+      }
+    },
+    {
+      "key": "DOWNLOADS",
+      "config": {
+        "requireApproval": true
+      }
+    },
+    {
+      "key": "UNINSTALL_PROTECTION",
+      "config": {
+        "enabled": false
+      },
+      "error": "Your child's account is an administrator."
+    },
+    {
+      "key": "WEB",
+      "config": {
+        "mode": "OFF",
+        "blockedSites": 0
+      },
+      "error": "eGuard's extension isn't connected in every browser yet."
+    }
+  ]
+}

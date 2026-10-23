@@ -1,0 +1,146 @@
+{
+  "deviceId": "cmvkn92z0000tncboofyrvun2",
+  "childName": "Mia",
+  "policy": [
+    {
+      "key": "SCREEN_TIME",
+      "config": {
+        "key": "SCREEN_TIME",
+        "dailyMinutes": 180,
+        "weekendMinutes": 240
+      }
+    },
+    {
+      "key": "BEDTIME",
+      "config": {
+        "end": "06:00",
+        "key": "BEDTIME",
+        "days": "EVERY_DAY",
+        "start": "21:30",
+        "enabled": true
+      }
+    },
+    {
+      "key": "APP_RESTRICTIONS",
+      "config": {
+        "key": "APP_RESTRICTIONS",
+        "maxAgeRating": 9
+      }
+    },
+    {
+      "key": "APP_APPROVAL",
+      "config": {
+        "key": "APP_APPROVAL",
+        "enabled": true
+      }
+    },
+    {
+      "key": "CONTENT",
+      "config": {
+        "key": "CONTENT",
+        "maxAgeRating": 9
+      }
+    },
+    {
+      "key": "WEB",
+      "config": {
+        "key": "WEB",
+        "mode": "FILTER",
+        "blockedSites": 42
+      }
+    },
+    {
+      "key": "DOWNLOADS",
+      "config": {
+        "key": "DOWNLOADS",
+        "requireApproval": true
+      }
+    },
+    {
+      "key": "LOCATION",
+      "config": {
+        "key": "LOCATION",
+        "sharing": true
+      }
+    },
+    {
+      "key": "NOTIFICATIONS",
+      "config": {
+        "key": "NOTIFICATIONS",
+        "quietDuringBedtime": true
+      }
+    },
+    {
+      "key": "UNINSTALL_PROTECTION",
+      "config": {
+        "key": "UNINSTALL_PROTECTION",
+        "enabled": true
+      }
+    }
+  ],
+  "requests": [],
+  "apps": [
+    {
+      "name": "Counter-Strike 2",
+      "approval": "PENDING",
+      "dailyLimitMinutes": null,
+      "category": "GAMES",
+      "ids": [
+        {
+          "kind": "STEAM",
+          "value": "730"
+        }
+      ]
+    },
+    {
+      "name": "Roblox",
+      "approval": "PENDING",
+      "dailyLimitMinutes": null,
+      "category": "GAMES",
+      "ids": [
+        {
+          "kind": "EXE",
+          "value": "roblox corporation|roblox"
+        }
+      ]
+    },
+    {
+      "name": "Pixel Quest",
+      "approval": "PENDING",
+      "dailyLimitMinutes": null,
+      "category": "GAMES",
+      "ids": [
+        {
+          "kind": "EXE",
+          "value": "|pixel quest"
+        }
+      ]
+    }
+  ],
+  "categoryLimits": [
+    {
+      "category": "GAMES",
+      "dailyLimitMinutes": 60
+    }
+  ],
+  "extraTimeUntil": null,
+  "fullReportRequested": false,
+  "nextSyncSeconds": 60,
+  "timezone": "Asia/Manila",
+  "features": {
+    "locationSharing": true,
+    "categoryLimits": true
+  },
+  "minAppVersion": null,
+  "serverTime": "2026-10-23T07:24:02.978Z",
+  "uninstall": {
+    "command": {
+      "type": "eguard.device.uninstall",
+      "deviceId": "cmvkn92z0000tncboofyrvun2",
+      "requestedAt": "2026-10-23T07:24:02.906Z",
+      "at": "2026-10-23T07:24:02.978Z"
+    },
+    "signature": "8zJjA7fsPG7Fg/x0oQpESAEfSv7KvqImpnk6272p7e5ijLaAwp6nTyUtQrN44NnAGYxDvqRULACtf3hVWUR4sA==",
+    "keyId": "60da38f4c654f71a"
+  }
+}

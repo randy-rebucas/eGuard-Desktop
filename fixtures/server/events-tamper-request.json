@@ -1,0 +1,5 @@
+{
+  "type": "TAMPER",
+  "kind": "CLOCK_CHANGED",
+  "eventId": "fixture-tamper-clock-0001"
+}

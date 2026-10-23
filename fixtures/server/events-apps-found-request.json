@@ -1,0 +1,39 @@
+{
+  "type": "APPS_FOUND",
+  "eventId": "fixture-apps-found-0001",
+  "apps": [
+    {
+      "app": "Counter-Strike 2",
+      "ids": [
+        {
+          "kind": "STEAM",
+          "value": "730"
+        }
+      ],
+      "source": "CATALOG",
+      "category": "GAMES"
+    },
+    {
+      "app": "Roblox",
+      "ids": [
+        {
+          "kind": "EXE",
+          "value": "roblox corporation|roblox"
+        }
+      ],
+      "source": "CATALOG",
+      "category": "GAMES"
+    },
+    {
+      "app": "Pixel Quest",
+      "ids": [
+        {
+          "kind": "EXE",
+          "value": "|pixel quest"
+        }
+      ],
+      "source": "UNKNOWN_PUBLISHER",
+      "category": "GAMES"
+    }
+  ]
+}

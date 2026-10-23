@@ -1,0 +1,954 @@
+{
+  "catalog": {
+    "type": "eguard.desktop.catalog",
+    "version": 1792733730702,
+    "entries": [
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "epic:fortnite",
+        "displayName": "Fortnite",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "epic:sugar",
+        "displayName": "Rocket League",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "msstore:microsoft.gamingapp_8wekyb3d8bbwe",
+        "displayName": "Xbox",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "msstore:microsoft.microsoftsolitairecollection_8wekyb3d8bbwe",
+        "displayName": "Microsoft Solitaire Collection",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "msstore:microsoft.minecraftuwp_8wekyb3d8bbwe",
+        "displayName": "Minecraft",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:105600",
+        "displayName": "Terraria",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:1086940",
+        "displayName": "Baldur's Gate 3",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:1172470",
+        "displayName": "Apex Legends",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:1222670",
+        "displayName": "The Sims 4",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:1245620",
+        "displayName": "Elden Ring",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:1623730",
+        "displayName": "Palworld",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:1677740",
+        "displayName": "Stumble Guys",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:1938090",
+        "displayName": "Call of Duty",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:1966720",
+        "displayName": "Lethal Company",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:230410",
+        "displayName": "Warframe",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:2357570",
+        "displayName": "Overwatch 2",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:2507950",
+        "displayName": "Delta Force",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:252490",
+        "displayName": "Rust",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:252950",
+        "displayName": "Rocket League",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:271590",
+        "displayName": "Grand Theft Auto V",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:2767030",
+        "displayName": "Marvel Rivals",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:322170",
+        "displayName": "Geometry Dash",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:359550",
+        "displayName": "Rainbow Six Siege",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:381210",
+        "displayName": "Dead by Daylight",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:440",
+        "displayName": "Team Fortress 2",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:553850",
+        "displayName": "Helldivers 2",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:570",
+        "displayName": "Dota 2",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:578080",
+        "displayName": "PUBG: Battlegrounds",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:730",
+        "displayName": "Counter-Strike 2",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "LAUNCHER_ID",
+        "match": "steam:945360",
+        "displayName": "Among Us",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "among us.exe",
+        "displayName": "Among Us",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "battle.net.exe",
+        "displayName": "Battle.net",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "bg3.exe",
+        "displayName": "Baldur's Gate 3",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "bg3_dx11.exe",
+        "displayName": "Baldur's Gate 3",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "cod.exe",
+        "displayName": "Call of Duty",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "cod24-cod.exe",
+        "displayName": "Call of Duty",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "cs2.exe",
+        "displayName": "Counter-Strike 2",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "deadbydaylight-win64-shipping.exe",
+        "displayName": "Dead by Daylight",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "deltaforceclient-win64-shipping.exe",
+        "displayName": "Delta Force",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "dota2.exe",
+        "displayName": "Dota 2",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "eadesktop.exe",
+        "displayName": "EA app",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "eldenring.exe",
+        "displayName": "Elden Ring",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "epicgameslauncher.exe",
+        "displayName": "Epic Games Launcher",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "fallguys_client_game.exe",
+        "displayName": "Fall Guys",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "fortniteclient-win64-shipping.exe",
+        "displayName": "Fortnite",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "fortnitelauncher.exe",
+        "displayName": "Fortnite",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "galaxyclient.exe",
+        "displayName": "GOG Galaxy",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "genshinimpact.exe",
+        "displayName": "Genshin Impact",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "geometrydash.exe",
+        "displayName": "Geometry Dash",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "gta5.exe",
+        "displayName": "Grand Theft Auto V",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "gta5_enhanced.exe",
+        "displayName": "Grand Theft Auto V",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "hearthstone.exe",
+        "displayName": "Hearthstone",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "helldivers2.exe",
+        "displayName": "Helldivers 2",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "itch.exe",
+        "displayName": "itch",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "league of legends.exe",
+        "displayName": "League of Legends",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "leagueclient.exe",
+        "displayName": "League of Legends",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "lethal company.exe",
+        "displayName": "Lethal Company",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "marvel-win64-shipping.exe",
+        "displayName": "Marvel Rivals",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "minecraft.exe",
+        "displayName": "Minecraft",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "minecraft.windows.exe",
+        "displayName": "Minecraft",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "minecraftlauncher.exe",
+        "displayName": "Minecraft",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "osu!.exe",
+        "displayName": "osu!",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "overwatch.exe",
+        "displayName": "Overwatch 2",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "palworld-win64-shipping.exe",
+        "displayName": "Palworld",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "r5apex.exe",
+        "displayName": "Apex Legends",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "r5apex_dx12.exe",
+        "displayName": "Apex Legends",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "rainbowsix.exe",
+        "displayName": "Rainbow Six Siege",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "rainbowsix_vulkan.exe",
+        "displayName": "Rainbow Six Siege",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "riotclientservices.exe",
+        "displayName": "Riot Client",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "riotclientux.exe",
+        "displayName": "Riot Client",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "robloxplayerbeta.exe",
+        "displayName": "Roblox",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "robloxplayerlauncher.exe",
+        "displayName": "Roblox",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "rocketleague.exe",
+        "displayName": "Rocket League",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "rustclient.exe",
+        "displayName": "Rust",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "starrail.exe",
+        "displayName": "Honkai: Star Rail",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "steam.exe",
+        "displayName": "Steam",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "stumble guys.exe",
+        "displayName": "Stumble Guys",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "terraria.exe",
+        "displayName": "Terraria",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "tf.exe",
+        "displayName": "Team Fortress 2",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "tf_win64.exe",
+        "displayName": "Team Fortress 2",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "ts4_x64.exe",
+        "displayName": "The Sims 4",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "tslgame.exe",
+        "displayName": "PUBG: Battlegrounds",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "ubisoftconnect.exe",
+        "displayName": "Ubisoft Connect",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "upc.exe",
+        "displayName": "Ubisoft Connect",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "valorant-win64-shipping.exe",
+        "displayName": "Valorant",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "valorant.exe",
+        "displayName": "Valorant",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "warframe.x64.exe",
+        "displayName": "Warframe",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "wow.exe",
+        "displayName": "World of Warcraft",
+        "category": "GAMES",
+        "trending": false
+      },
+      {
+        "kind": "GAME",
+        "matchType": "EXE_NAME",
+        "match": "yuanshen.exe",
+        "displayName": "Genshin Impact",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "GAME",
+        "matchType": "SIGNER",
+        "match": "roblox corporation",
+        "displayName": "Roblox",
+        "category": "GAMES",
+        "trending": true
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "acer incorporated",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "adobe inc.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "advanced micro devices, inc.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "apple inc.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "asustek computer inc.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "cisco webex llc",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "dell inc",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "dolby laboratories, inc.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "dropbox, inc",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "elan microelectronics corp.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "google llc",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "hp inc.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "intel corporation",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "lenovo",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "logitech inc",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "microsoft corporation",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "microsoft windows",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "microsoft windows publisher",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "mozilla corporation",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "nvidia corporation",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "oracle america, inc.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "python software foundation",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "qualcomm technologies, inc.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "realtek semiconductor corp.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "synaptics incorporated",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "the document foundation",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "waves inc",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "zoom video communications, inc.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      }
+    ]
+  },
+  "signature": "N53tkjynCr8dG++Re7s3Ctu/c2P3z3wA/FDUrEcN3mLeen7vTnoE8M5jd/IQzFAMQ0fDTCHeSsQb4kmz5Sn+nw==",
+  "keyId": "60da38f4c654f71a"
+}

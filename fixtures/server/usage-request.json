@@ -1,0 +1,52 @@
+{
+  "date": "2026-10-23",
+  "totalMinutes": 50,
+  "apps": [
+    {
+      "name": "cs2.exe",
+      "minutes": 30,
+      "ids": [
+        {
+          "kind": "STEAM",
+          "value": "730"
+        }
+      ]
+    },
+    {
+      "name": "Counter-Strike 2",
+      "minutes": 15,
+      "ids": [
+        {
+          "kind": "STEAM",
+          "value": "730"
+        }
+      ]
+    }
+  ],
+  "hourly": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    20,
+    30,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ]
+}
