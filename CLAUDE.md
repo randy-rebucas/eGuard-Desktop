@@ -37,6 +37,9 @@ on the owner, gotchas).
   `Software\eGuard\Dev\Policies`, which no browser reads; never write HKLM policies here.
 - `tools/enforce/`: stand-ins and scripts for checking enforcement by hand (`setup.ps1` makes a fake Steam CS2, an
   unsigned "Pixel Quest" and an unsigned "Pixel Browser"; `launch.ps1`, `play.ps1`, `press.ps1`, `waitoverlay.ps1`).
+- `tools/vm/`: the VM test kit ([docs/VM-TESTS.md](docs/VM-TESTS.md)). `bundle.ps1` here builds
+  `target\eguard-vm.zip`; `install.ps1`, `collect.ps1`, `reset.ps1` run on the VM only (never on this PC: they
+  install a service).
 - `fixtures/server/`: real server responses, captured by `node tools/capture-fixtures.mjs` (needs ~/eguard's dev DB
   and a dev server; it deletes its test family afterwards). `fixtures/canonical-vectors.json`: made by
   `node tools/canonical-vectors.mjs`. Never hand-edit either.

@@ -545,6 +545,21 @@ From `~/eguard/docs/desktop-agent-open-questions.md`. Q2, Q4 and Q5 are settled 
 | Q6 Offline clock | **Built** (`clock`), and now fed by the service: samples from `GetTickCount64` + BootId every tick (≤ 60 s), persisted with the state. Stated limit: a forward jump while offline across a reboot can end bedtime early or start a new day until the PC is back online | Done |
 | Q1, Q7, Q8, Q9 | Not decided here; they need the owner (admin-account test 8, self-update design, end-of-life recovery, exclusive fullscreen) | Open |
 
+## The VM test kit (2026-10-24)
+
+**[VM-TESTS.md](VM-TESTS.md)** lists everything above marked "needs the VM" as steps with expected results and a
+results table: the service and pairing as SYSTEM, scanning as SYSTEM, acceptance tests 2–7, Q3 (anti-cheat), the
+overlay's backstops, accounts and fast user switching, an administrator child, web with and without store ids, and
+removal (tests 9 and 10). `tools/vm/bundle.ps1` builds `target\eguard-vm.zip` (a dev build with the C runtime
+linked in, the stand-ins prebuilt, the scripts); on the VM `install.ps1` forwards `localhost:3000` to this PC's dev
+server (VirtualBox NAT: `10.0.2.2`, no firewall change here) and installs the service; `collect.ps1` zips the
+results (never `secrets.bin`); `reset.ps1` takes eGuard off. `tools/enforce/setup.ps1 -Prebuilt DIR` sets up the
+stand-ins without rustc.
+
+Checked here: the bundle builds, no exe imports `vcruntime140.dll` or the CRT DLLs, `setup.ps1 -Prebuilt` sets up and
+removes the stand-ins, and the four scripts parse. `install.ps1`, `collect.ps1` and `reset.ps1` need an administrator
+and install a service, so they haven't been run anywhere yet: the first VM session will shake them out.
+
 ## Next: Phase 6, part 2 (on the VM)
 
 The WiX MSI (per machine, `NoModify`, the abort-unless-authorized custom action that asks the running service, the

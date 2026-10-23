@@ -14,8 +14,10 @@
 # `eguard-service run --sandbox <Dir>` so only these are ended.
 #
 #   setup.ps1 [-Dir DIR]          set up (default %TEMP%\eguard-sandbox)
+#   setup.ps1 -Prebuilt DIR       the same with standin.exe, pixel_elf.dll and PixelBrowser.exe from DIR instead of
+#                                 building them (a VM has no rustc; tools/vm/bundle.ps1 builds them)
 #   setup.ps1 -Remove [-Dir DIR]  remove the registry entries and the folder
-param([string]$Dir = (Join-Path $env:TEMP "eguard-sandbox"), [switch]$Remove)
+param([string]$Dir = (Join-Path $env:TEMP "eguard-sandbox"), [string]$Prebuilt, [switch]$Remove)
 $steamKey = "HKCU:\Software\Valve\Steam"
 $pqKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\eGuardTestPixelQuest"
 $pbKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\eGuardTestPixelBrowser"
@@ -33,8 +35,12 @@ if ($Remove) {
 if (Test-Path $steamKey) { throw "HKCU\Software\Valve\Steam already exists; not touching a real Steam" }
 New-Item -ItemType Directory -Force $Dir | Out-Null
 $standin = Join-Path $Dir "standin.exe"
-rustc -O --edition 2024 -o $standin (Join-Path $PSScriptRoot "standin.rs")
-if (-not $?) { throw "building standin.exe failed" }
+if ($Prebuilt) {
+    Copy-Item (Join-Path $Prebuilt "standin.exe") $standin
+} else {
+    rustc -O --edition 2024 -o $standin (Join-Path $PSScriptRoot "standin.rs")
+    if (-not $?) { throw "building standin.exe failed" }
+}
 $cs2dir = Join-Path $Dir "Steam\steamapps\common\Counter-Strike Global Offensive\game\bin\win64"
 New-Item -ItemType Directory -Force $cs2dir | Out-Null
 Copy-Item $standin (Join-Path $cs2dir "cs2.exe")
@@ -60,10 +66,14 @@ Set-ItemProperty $pqKey -Name DisplayIcon -Value (Join-Path $pq "PixelQuest.exe"
 Set-ItemProperty $pqKey -Name UninstallString -Value "`"$(Join-Path $pq 'PixelQuest.exe')`" /uninstall"
 $pb = Join-Path $Dir "Pixel Browser"
 New-Item -ItemType Directory -Force $pb | Out-Null
-rustc -O --edition 2024 --crate-type cdylib -o (Join-Path $pb "pixel_elf.dll") (Join-Path $PSScriptRoot "browser_elf.rs")
-if (-not $?) { throw "building pixel_elf.dll failed" }
-rustc -O --edition 2024 -o (Join-Path $pb "PixelBrowser.exe") (Join-Path $PSScriptRoot "browser.rs")
-if (-not $?) { throw "building PixelBrowser.exe failed" }
+if ($Prebuilt) {
+    Copy-Item (Join-Path $Prebuilt "pixel_elf.dll"), (Join-Path $Prebuilt "PixelBrowser.exe") $pb
+} else {
+    rustc -O --edition 2024 --crate-type cdylib -o (Join-Path $pb "pixel_elf.dll") (Join-Path $PSScriptRoot "browser_elf.rs")
+    if (-not $?) { throw "building pixel_elf.dll failed" }
+    rustc -O --edition 2024 -o (Join-Path $pb "PixelBrowser.exe") (Join-Path $PSScriptRoot "browser.rs")
+    if (-not $?) { throw "building PixelBrowser.exe failed" }
+}
 New-Item -Force $pbKey | Out-Null
 Set-ItemProperty $pbKey -Name DisplayName -Value "Pixel Browser"
 Set-ItemProperty $pbKey -Name InstallLocation -Value $pb
