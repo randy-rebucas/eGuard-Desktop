@@ -12,14 +12,21 @@ use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Security::{DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenLogonSid, TokenPrimary};
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::RemoteDesktop::{
-    WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTS_SESSIONSTATE_LOCK, WTSActive, WTSDisconnectSession, WTSEnumerateSessionsW,
-    WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW, WTSQueryUserToken, WTSSessionInfoEx,
+    WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTS_SESSIONSTATE_LOCK, WTSActive, WTSDisconnectSession, WTSDisconnected,
+    WTSEnumerateSessionsW, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW, WTSQueryUserToken, WTSSessionInfoEx,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
-/// A session someone is signed in to and using (not disconnected).
+/// The exit code the agent ends with when Windows ends its session (sign-out, shutdown: `WM_ENDSESSION`). The
+/// service takes any other exit of an agent whose session goes on (0 included) as the agent having been ended.
+/// Anyone who can end the agent can also choose this code, so it only spares the parent a false alert; the service
+/// still starts the agent again if the session is still there.
+pub const AGENT_EXIT_SESSION_ENDING: u32 = 0x6547_5345; // "eGSE"
+
+/// A session someone is signed in to: in use, or switched away from (fast user switching, a closed Remote Desktop
+/// window) and still signed in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     pub id: u32,
@@ -28,10 +35,20 @@ pub struct Session {
     pub sid: Option<String>,
     /// The lock screen is up: nobody is using it now.
     pub locked: bool,
+    /// Connected (at the console or over Remote Desktop). A disconnected session's user is still signed in, but
+    /// nobody can be using it: no screens, no time counted.
+    pub connected: bool,
 }
 
 /// Sessions in use: signed in and connected (at the console or over Remote Desktop). Session 0 (services) never.
 pub fn active() -> Vec<Session> {
+    signed_in().into_iter().filter(|s| s.connected).collect()
+}
+
+/// Every session someone is signed in to, connected or not. Session 0 (services) never. A disconnected session is
+/// listed so that whose it is stays known (a parent's session switched away from isn't the child's) and its agent
+/// isn't started a second time when it comes back.
+pub fn signed_in() -> Vec<Session> {
     let mut list: *mut WTS_SESSION_INFOW = null_mut();
     let mut count = 0u32;
     // SAFETY: out-parameters are live; the list is freed below with WTSFreeMemory.
@@ -39,14 +56,15 @@ pub fn active() -> Vec<Session> {
         return Vec::new();
     }
     // SAFETY: on success `list` holds `count` entries.
-    let ids: Vec<u32> = unsafe { std::slice::from_raw_parts(list, count as usize) }
+    let ids: Vec<(u32, bool)> = unsafe { std::slice::from_raw_parts(list, count as usize) }
         .iter()
-        .filter(|s| s.State == WTSActive && s.SessionId != 0)
-        .map(|s| s.SessionId)
+        .filter(|s| (s.State == WTSActive || s.State == WTSDisconnected) && s.SessionId != 0)
+        .map(|s| (s.SessionId, s.State == WTSActive))
         .collect();
     // SAFETY: allocated by WTSEnumerateSessionsW, freed once.
     unsafe { WTSFreeMemory(list.cast()) };
-    ids.into_iter().filter_map(info).filter(|s| !s.user.is_empty()).collect()
+    // A disconnected session nobody is signed in to (left over after a sign-out) has no user, and is left out
+    ids.into_iter().filter_map(|(id, connected)| info(id).map(|s| Session { connected, ..s })).filter(|s| !s.user.is_empty()).collect()
 }
 
 fn info(id: u32) -> Option<Session> {
@@ -68,6 +86,7 @@ fn info(id: u32) -> Option<Session> {
             sid,
             // Windows 7 had these two the other way round; Windows 10 and 11 report them as documented
             locked: level1.SessionFlags as u32 == WTS_SESSIONSTATE_LOCK,
+            connected: true,
         }
     });
     // SAFETY: allocated by WTSQuerySessionInformationW, freed once.
@@ -172,6 +191,8 @@ mod tests {
         // Tests run in a signed-in session (or in session 0 on a build machine, which has none to show)
         if me != 0 {
             let s = active().into_iter().find(|s| s.id == me).expect("this session is listed");
+            assert!(s.connected);
+            assert!(signed_in().iter().any(|t| t.id == me));
             assert_ne!(s.user, "");
             assert_eq!(s.sid, Some(crate::security::current_user_sid().unwrap()));
         }

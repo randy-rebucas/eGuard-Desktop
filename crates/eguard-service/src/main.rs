@@ -44,11 +44,20 @@ fn server_url(arg: Option<&str>) -> Result<ServerUrl, String> {
     ServerUrl::parse(url, keys::is_dev_build()).map_err(|e| e.to_string())
 }
 
-/// The runner as the Windows service: `%ProgramData%\eGuard`, locked down, pipe for SYSTEM and administrators.
+/// The runner as the Windows service: `%ProgramData%\eGuard`, locked down, pipe for SYSTEM and administrators. The
+/// log starts as soon as the folder is locked down, so whatever fails after it (`WinHTTP`, the server URL) is logged.
 pub(crate) fn service_runner() -> Result<Arc<Runner>, String> {
     let dir = eguard_win::files::program_data_dir();
-    let store = Store::open(&dir, Some(eguard_win::security::DATA_DIR_SDDL)).map_err(|e| format!("{}: {e}", dir.display()))?;
-    log::init(Some(&dir.join("logs")), false);
+    let logs = dir.join("logs");
+    let store = match Store::open(&dir, Some(eguard_win::security::DATA_DIR_SDDL)) {
+        Ok(s) => s,
+        Err(e) => {
+            // The log is still wanted for this one line, if the folder can be written at all (the caller logs it)
+            log::init(Some(&logs), false);
+            return Err(format!("{}: {e}", dir.display()));
+        }
+    };
+    log::init(Some(&logs), false);
     Runner::new(Options { store, server: server_url(None)?, pipe_sddl: eguard_win::pipe::SERVICE_PIPE_SDDL.into(), mode: Mode::Service })
 }
 

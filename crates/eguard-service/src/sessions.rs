@@ -2,7 +2,10 @@
 //!
 //! - One `eguard-agent session` per session, started by the service as the session's user (console mode: in its
 //!   own session, as itself). One that ends while its session goes on was killed or crashed: it's started again and
-//!   the parent hears `TAMPER` `AGENT_RESTARTED` (unless it exited cleanly).
+//!   the parent hears `TAMPER` `AGENT_RESTARTED`, at most once per session every 10 minutes. The only exit that
+//!   isn't news is the one the agent makes when Windows ends its session (`AGENT_EXIT_SESSION_ENDING`).
+//! - A disconnected session (fast user switching) is still signed in: its account stays known and its agent and
+//!   record stay, but nothing is counted or shown there until it's connected again.
 //! - One pipe per session, `\\.\pipe\eguard-session-<id>`, open to SYSTEM and that session's logon SID. Requests are
 //!   taken only from eGuard's agent executable running in that session; the session is the pipe's, never the
 //!   message's.
@@ -21,7 +24,7 @@ use eguard_core::wire::{DeviceEvent, TamperKind};
 use eguard_win::pipe::{self, PipeServer};
 use eguard_win::process::{self, Child};
 use eguard_win::{clock, security, session};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -34,6 +37,12 @@ const SILENT_AFTER: Duration = Duration::from_secs(10);
 const RESTARTS_TO_DISCONNECT: usize = 3;
 const RESTARTS_WINDOW: Duration = Duration::from_secs(60);
 const SILENT_TO_DISCONNECT: Duration = Duration::from_secs(20);
+/// At most one `AGENT_RESTARTED` per session this often: an agent that fails at every start would otherwise send
+/// one every few seconds. The rest are logged.
+const ALERT_EVERY: Duration = Duration::from_secs(10 * 60);
+/// After an agent exits because its session is ending, it isn't started again this long: a new one would only be
+/// ended by the sign-out too, and that would read as tamper. If the session is still there after, it's started.
+const SIGNOUT_GRACE: Duration = Duration::from_secs(20);
 
 /// What the supervisor and the session pipes share.
 pub struct Shared {
@@ -43,8 +52,12 @@ pub struct Shared {
     pub agent_exe: PathBuf,
     /// Console mode: agents start in this session as this user, with the development build's overlay.
     pub console: bool,
-    /// When each session's agent last reported.
+    /// When each session's agent last reported. Cleared when the session goes (its id comes back with another
+    /// sign-in).
     heartbeats: Mutex<HashMap<u32, Instant>>,
+    /// Signed-in sessions nobody is connected to (fast user switching): their agents get no screens and their time
+    /// isn't counted.
+    disconnected: Mutex<HashSet<u32>>,
     /// Each signed-in session's account SID (`None`: couldn't be read), for deciding whose rules apply.
     pub session_sids: SessionSids,
     /// Called after the child asks for something, so the sync loop sends it now.
@@ -66,7 +79,20 @@ impl Shared {
         wake: Box<dyn Fn() + Send + Sync>,
     ) -> Self {
         let agent_exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("eguard-agent.exe"))).unwrap_or_default();
-        Self { enforcer, facts, agent_exe, console, heartbeats: Mutex::new(HashMap::new()), session_sids, wake }
+        Self {
+            enforcer,
+            facts,
+            agent_exe,
+            console,
+            heartbeats: Mutex::new(HashMap::new()),
+            disconnected: Mutex::new(HashSet::new()),
+            session_sids,
+            wake,
+        }
+    }
+
+    fn is_disconnected(&self, id: u32) -> bool {
+        self.disconnected.lock().unwrap_or_else(PoisonError::into_inner).contains(&id)
     }
 
     /// Whether the child's rules apply in session `id` (its account is one of the child's).
@@ -83,11 +109,36 @@ impl Shared {
 /// Each signed-in session's account SID, shared with the monitor.
 pub type SessionSids = Arc<Mutex<HashMap<u32, Option<String>>>>;
 
-#[derive(Debug, Default)]
+/// What the supervisor keeps per signed-in session, until it's signed out (not while it's only disconnected, so
+/// its agent isn't started a second time when it comes back).
+#[derive(Debug)]
 struct Tracked {
+    /// The logon SID its pipe admits.
     sid: String,
     agent: Option<Child>,
     starts: VecDeque<Instant>,
+    /// When the session was first seen, and when its agent was last started: silence is measured from the latest
+    /// of these and its last heartbeat, so an agent that never reports still trips the backstop.
+    seen_at: Instant,
+    started_at: Option<Instant>,
+    /// The last `AGENT_RESTARTED` sent for this session.
+    alerted_at: Option<Instant>,
+    /// The agent exited because Windows was ending the session.
+    ending_since: Option<Instant>,
+}
+
+impl Tracked {
+    fn new(now: Instant) -> Self {
+        Self {
+            sid: String::new(),
+            agent: None,
+            starts: VecDeque::new(),
+            seen_at: now,
+            started_at: None,
+            alerted_at: None,
+            ending_since: None,
+        }
+    }
 }
 
 /// Runs forever on its own thread.
@@ -99,63 +150,63 @@ pub fn supervise(shared: &Arc<Shared>) {
     loop {
         let sessions: Vec<session::Session> = if shared.console {
             let s = session::active().into_iter().find(|s| s.id == mine);
-            vec![s.unwrap_or(session::Session { id: mine, user: String::new(), sid: security::current_user_sid().ok(), locked: false })]
+            vec![s.unwrap_or(session::Session {
+                id: mine,
+                user: String::new(),
+                sid: security::current_user_sid().ok(),
+                locked: false,
+                connected: true,
+            })]
         } else {
-            session::active()
+            session::signed_in()
         };
         let now = Instant::now();
         let sample = clock::sample();
         for s in &sessions {
-            let sid = if shared.console { security::current_logon_sid() } else { session::logon_sid(s.id) };
-            let sid = match sid {
-                Ok(sid) => sid,
-                Err(e) => {
-                    log::warn(&format!("session {}: couldn't read its logon ({e})", s.id));
-                    continue;
-                }
-            };
-            let t = tracked.entry(s.id).or_default();
-            let new_sddl = pipe::session_pipe_sddl(&sid);
-            let slot = pipes.entry(s.id).or_insert_with(|| {
-                let slot = Arc::new(Mutex::new(None));
-                let (sh, sl, id) = (Arc::clone(shared), Arc::clone(&slot), s.id);
-                let _ = std::thread::Builder::new().name(format!("session-{id}")).spawn(move || serve(&sh, id, &sl));
-                slot
-            });
-            if t.sid != sid {
-                t.sid.clone_from(&sid);
-                *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(new_sddl);
-                // Wakes the pipe's waiting instance (made for the last sign-in) so the next one admits this one
-                let _ = pipe::connect(&ipc::session_pipe_name(s.id));
-            }
+            // Whose session it is, connected or not: a parent's session switched away from stays the parent's, so
+            // the monitor keeps leaving its programs alone
             shared.session_sids.lock().unwrap_or_else(PoisonError::into_inner).insert(s.id, s.sid.clone());
+            {
+                let mut d = shared.disconnected.lock().unwrap_or_else(PoisonError::into_inner);
+                if s.connected {
+                    d.remove(&s.id)
+                } else {
+                    d.insert(s.id)
+                };
+            }
+            let t = tracked.entry(s.id).or_insert_with(|| Tracked::new(now));
+            // Nobody can be using a disconnected session: no agent checks, no time counted. Its record (and agent)
+            // stay for when it comes back
+            if !s.connected {
+                continue;
+            }
+            let logon = if shared.console { security::current_logon_sid() } else { session::logon_sid(s.id) };
+            match logon {
+                Ok(sid) if t.sid != sid => {
+                    let slot = pipes.entry(s.id).or_insert_with(|| {
+                        let slot = Arc::new(Mutex::new(None));
+                        let (sh, sl, id) = (Arc::clone(shared), Arc::clone(&slot), s.id);
+                        let _ = std::thread::Builder::new().name(format!("session-{id}")).spawn(move || serve(&sh, id, &sl));
+                        slot
+                    });
+                    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(pipe::session_pipe_sddl(&sid));
+                    t.sid = sid;
+                    // A new sign-in in this session: it gets its agent now
+                    t.ending_since = None;
+                    // Wakes the pipe's waiting instance (made for the last sign-in) so the next one admits this one
+                    let _ = pipe::connect(&ipc::session_pipe_name(s.id));
+                }
+                Ok(_) => {}
+                // Without its logon there's no pipe for its agent; the agent is still started and the session's
+                // time counted (silent agent), which is the stricter way to be wrong
+                Err(e) => log::warn(&format!("session {}: couldn't read its logon ({e})", s.id)),
+            }
             // Not one of the child's accounts (a parent's own on a family PC): no agent, nothing counted or ended
             if !shared.applies(s.id) {
                 continue;
             }
 
-            // The agent: still there?
-            if let Some(code) = t.agent.as_ref().and_then(Child::exit_code) {
-                if code == 0 {
-                    log::info(&format!("session {}: the agent exited", s.id));
-                } else {
-                    log::warn(&format!("session {}: the agent was ended (exit code {code:#x}); starting it again", s.id));
-                    shared.enforcer().report(DeviceEvent::Tamper { kind: TamperKind::AgentRestarted });
-                    (shared.wake)();
-                }
-                t.agent = None;
-            }
-            if t.agent.is_none() {
-                match start_agent(shared, s.id) {
-                    Ok(child) => {
-                        log::info(&format!("session {}: agent started (pid {})", s.id, child.pid));
-                        t.agent = Some(child);
-                        t.starts.push_back(now);
-                    }
-                    Err(e) => log::warn(&format!("session {}: couldn't start the agent ({e})", s.id)),
-                }
-            }
-            t.starts.retain(|at| now - *at < RESTARTS_WINDOW);
+            keep_agent(shared, s.id, t, now);
 
             // Nobody reporting from a session in use: its time counts
             let last = shared.heartbeats.lock().unwrap_or_else(PoisonError::into_inner).get(&s.id).copied();
@@ -164,8 +215,10 @@ pub fn supervise(shared: &Arc<Shared>) {
                 let _ = shared.enforcer().heartbeat(s.id, Seen::Unknown, 0, sample);
             }
 
-            // The backstop
-            let too_quiet = last.is_some_and(|at| now - at > SILENT_TO_DISCONNECT);
+            // The backstop. Silence counts from the latest of the session's first sight, its agent's start and its
+            // last heartbeat: an agent that never reports at all is as quiet as one that stopped
+            let quiet_since = [Some(t.seen_at), t.started_at, last].into_iter().flatten().max().unwrap_or(now);
+            let too_quiet = now - quiet_since > SILENT_TO_DISCONNECT;
             if !shared.console && !s.locked && (t.starts.len() >= RESTARTS_TO_DISCONNECT || too_quiet) {
                 let paused = shared.enforcer().screen_paused(sample);
                 if let Some(why) = paused {
@@ -177,8 +230,11 @@ pub fn supervise(shared: &Arc<Shared>) {
                 }
             }
         }
+        // Signed out: everything about the session goes (its id comes back with a later sign-in)
         let live: Vec<u32> = sessions.iter().map(|s| s.id).collect();
         shared.session_sids.lock().unwrap_or_else(PoisonError::into_inner).retain(|id, _| live.contains(id));
+        shared.heartbeats.lock().unwrap_or_else(PoisonError::into_inner).retain(|id, _| live.contains(id));
+        shared.disconnected.lock().unwrap_or_else(PoisonError::into_inner).retain(|id| live.contains(id));
         tracked.retain(|id, _| {
             let keep = live.contains(id);
             if !keep {
@@ -188,6 +244,42 @@ pub fn supervise(shared: &Arc<Shared>) {
         });
         std::thread::sleep(CHECK_EVERY);
     }
+}
+
+/// Notices the session's agent ended and starts it again. Any end while the session goes on is the agent having
+/// been ended (0 included: a child can end it with any code), except the code it exits with when Windows ends the
+/// session; at most one alert per `ALERT_EVERY`.
+fn keep_agent(shared: &Shared, id: u32, t: &mut Tracked, now: Instant) {
+    if let Some(code) = t.agent.as_ref().and_then(Child::exit_code) {
+        t.agent = None;
+        if code == session::AGENT_EXIT_SESSION_ENDING {
+            log::info(&format!("session {id}: the agent exited because the session is ending"));
+            t.ending_since = Some(now);
+        } else if t.alerted_at.is_none_or(|at| now - at >= ALERT_EVERY) {
+            log::warn(&format!("session {id}: the agent was ended (exit code {code:#x}); starting it again"));
+            t.alerted_at = Some(now);
+            shared.enforcer().report(DeviceEvent::Tamper { kind: TamperKind::AgentRestarted });
+            (shared.wake)();
+        } else {
+            log::warn(&format!(
+                "session {id}: the agent was ended again (exit code {code:#x}); starting it again, the parent was told already"
+            ));
+        }
+    }
+    let waiting_for_signout = t.ending_since.is_some_and(|at| now - at < SIGNOUT_GRACE);
+    if t.agent.is_none() && !waiting_for_signout {
+        t.ending_since = None;
+        match start_agent(shared, id) {
+            Ok(child) => {
+                log::info(&format!("session {id}: agent started (pid {})", child.pid));
+                t.agent = Some(child);
+                t.starts.push_back(now);
+                t.started_at = Some(now);
+            }
+            Err(e) => log::warn(&format!("session {id}: couldn't start the agent ({e})")),
+        }
+    }
+    t.starts.retain(|at| now - *at < RESTARTS_WINDOW);
 }
 
 fn start_agent(shared: &Shared, session_id: u32) -> std::io::Result<Child> {
@@ -270,6 +362,11 @@ fn handle(shared: &Shared, id: u32, conn: &std::fs::File, req: &Request) -> Resp
     let sample = clock::sample();
     match req {
         &Request::Heartbeat { .. } if !shared.applies(id) => Response::Session(SessionView::default()),
+        // Switched away from: the agent is alive (so it isn't silent), but nobody is there to see a screen or use time
+        &Request::Heartbeat { .. } if shared.is_disconnected(id) => {
+            shared.heartbeats.lock().unwrap_or_else(PoisonError::into_inner).insert(id, Instant::now());
+            Response::Session(SessionView::default())
+        }
         &Request::Heartbeat { foreground_pid, idle_ms } => {
             let program = foreground_pid
                 .filter(|pid| *pid != client && process::session_of(*pid) == Some(id))

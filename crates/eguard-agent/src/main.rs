@@ -27,12 +27,19 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(1);
 /// With no service answering this long, the agent exits (the service starts it again when it's back).
 const GIVE_UP_AFTER: Duration = Duration::from_secs(5 * 60);
 
+/// One request on the service's admin pipe (`\\.\pipe\eguard`).
 fn ask(request: &Request) -> Result<Response, String> {
     let mut pipe = eguard_win::pipe::connect(ipc::PIPE_NAME).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => "eGuard's service isn't running. Start it (eguard-service run) and try again.".to_owned(),
         std::io::ErrorKind::PermissionDenied => "This account isn't allowed to talk to eGuard's service.".to_owned(),
         _ => format!("couldn't reach eGuard's service: {e}"),
     })?;
+    // Any program could have made a pipe by that name first: nothing (a pairing code least of all) goes to anything
+    // but eGuard's service beside this exe
+    let genuine = eguard_win::pipe::server_pid(&pipe).and_then(process::image_path).is_some_and(|p| same_file(&p, &service_exe()));
+    if !genuine {
+        return Err(format!("{} isn't served by eGuard's service; another program has taken its name.", ipc::PIPE_NAME));
+    }
     pipe.write_all(&ipc::encode(request)).map_err(|e| e.to_string())?;
     let line = ipc::read_line(&mut pipe).map_err(|e| e.to_string())?.ok_or("the service closed the connection")?;
     ipc::decode(&line).map_err(|e| e.to_string())
@@ -164,11 +171,16 @@ fn same_file(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
-/// One request on this session's pipe, to eGuard's service only.
-fn ask_session(pipe_name: &str, service: &Path, request: &Request) -> Result<Response, String> {
+/// One request on this session's pipe, to eGuard's service only. `dev` (started by console mode): the service runs
+/// in this session too, so only its exe is checked.
+fn ask_session(pipe_name: &str, service: &Path, dev: bool, request: &Request) -> Result<Response, String> {
     let mut pipe = eguard_win::pipe::connect(pipe_name).map_err(|e| e.to_string())?;
-    // Anyone could have made a pipe by that name before the service did: only eGuard's service is believed
-    let genuine = eguard_win::pipe::server_pid(&pipe).and_then(process::image_path).is_some_and(|p| same_file(&p, service));
+    // Anyone could have made a pipe by that name before the service did: only eGuard's service is believed. Its exe
+    // isn't enough: the child could start that same exe in console mode in their own session and serve empty views.
+    // The real service runs in session 0, where nobody signed in can start anything
+    let genuine = eguard_win::pipe::server_pid(&pipe).is_some_and(|pid| {
+        process::image_path(pid).is_some_and(|p| same_file(&p, service)) && (dev || process::session_of(pid) == Some(0))
+    });
     if !genuine {
         return Err("the session pipe isn't eGuard's service".into());
     }
@@ -197,7 +209,7 @@ fn session(args: &[String]) -> Result<(), String> {
                     UiEvent::AskTime(notice) => Request::AskTime { notice },
                 };
                 // The answer shows on the screen with the next heartbeat, which goes now
-                let _ = ask_session(&pipe_name, &service, &request);
+                let _ = ask_session(&pipe_name, &service, dev, &request);
                 next = Instant::now();
                 continue;
             }
@@ -206,7 +218,7 @@ fn session(args: &[String]) -> Result<(), String> {
         }
         next = Instant::now() + HEARTBEAT_EVERY;
         let heartbeat = Request::Heartbeat { foreground_pid: input::foreground_pid(), idle_ms: input.idle_ms() };
-        match ask_session(&pipe_name, &service, &heartbeat) {
+        match ask_session(&pipe_name, &service, dev, &heartbeat) {
             Ok(Response::Session(view)) => {
                 last_answer = Instant::now();
                 ui.show(view);

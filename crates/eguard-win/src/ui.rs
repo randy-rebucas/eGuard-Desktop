@@ -35,7 +35,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MSG, MoveWindow, PostMessageW, RegisterClassExW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW,
     SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+    WM_ENDSESSION, WM_PAINT, WM_QUERYENDSESSION, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
 };
 
 /// Something else had the focus over the overlay for this long: lock the session.
@@ -622,6 +623,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 command(hwnd, ID_CLOSE);
             } else {
                 show(hwnd, false, false);
+            }
+            0
+        }
+        // Signing out or shutting down: eGuard never holds that up (the session's rules end with the session)
+        WM_QUERYENDSESSION => 1,
+        WM_ENDSESSION => {
+            // The session is really ending (not cancelled): exit with the code that tells the service this was
+            // Windows, not someone ending the agent, so the parent gets no "eGuard was closed" alert
+            if wparam != 0 {
+                std::process::exit(crate::session::AGENT_EXIT_SESSION_ENDING as i32);
             }
             0
         }

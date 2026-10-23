@@ -43,14 +43,52 @@ pub enum Mode {
     Console { sandbox: Option<PathBuf> },
 }
 
-/// What this build can do (spec section 11). The AVAILABLE protections are enforced when programs are really ended
-/// (the service, or console mode with a sandbox); a dry run reports them as not applied, which is the truth. The
-/// guided ones are reported off, with why, until Phases 5 and 6.
+/// What this build can do (spec section 11). The AVAILABLE protections are reported applied only by the service,
+/// which ends programs anywhere. Console mode ends them only inside `--sandbox` (or not at all), so it reports them
+/// as not applied, which is the truth: the parent mustn't be told a developer's PC is protected. The guided ones
+/// are reported off, with why, until Phases 5 and 6.
 fn capabilities(enforcing: bool) -> Capabilities {
     Capabilities {
         enforced: if enforcing { AVAILABLE.into_iter().collect() } else { std::collections::BTreeSet::new() },
         uninstall_protection: Err("Removal protection isn't in this version of eGuard for Windows yet.".into()),
         web: Err("This version of eGuard for Windows doesn't set up the browser extension yet.".into()),
+    }
+}
+
+/// How often the service tries again for the admin pipe's name while something else holds it.
+const PIPE_RETRY: Duration = Duration::from_secs(5);
+
+/// What went wrong creating the admin pipe, in words. `FILE_FLAG_FIRST_PIPE_INSTANCE` answers "access denied" when
+/// another process already holds the name; any other error is something else and says so.
+fn pipe_error(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        format!("couldn't create {} ({e}); is another eGuard running?", ipc::PIPE_NAME)
+    } else {
+        format!("couldn't create {} ({e})", ipc::PIPE_NAME)
+    }
+}
+
+/// Creates the admin pipe's first instance, trying every `PIPE_RETRY` until the name is free. Only the admin tools
+/// wait meanwhile: enforcement is already running.
+fn claim_pipe(server: &mut PipeServer) -> eguard_win::pipe::Pending {
+    let mut said = false;
+    loop {
+        match server.create() {
+            Ok(p) => {
+                if said {
+                    log::info(&format!("{} is eGuard's now", ipc::PIPE_NAME));
+                }
+                return p;
+            }
+            Err(e) => {
+                // Loud once, then quiet: a program squatting on the name would otherwise fill the log
+                if !said {
+                    log::error(&format!("{}; pairing and status wait until it's free, protection carries on", pipe_error(&e)));
+                    said = true;
+                }
+                std::thread::sleep(PIPE_RETRY);
+            }
+        }
     }
 }
 
@@ -104,7 +142,7 @@ impl Runner {
         let transport = WinHttp::new(&format!("eGuard-Windows/{APP_VERSION}")).map_err(|e| e.to_string())?;
         let api = Api::new(opts.server, Box::new(transport));
         let (state, secrets) = opts.store.load();
-        let enforcing = matches!(opts.mode, Mode::Service | Mode::Console { sandbox: Some(_) });
+        let enforcing = opts.mode == Mode::Service;
         let mut engine = Engine::new(state, secrets, api, keys, capabilities(enforcing));
         log_notes(&mut engine);
         // Usage and what enforcement remembers move to the enforcer; they're copied back at every save
@@ -181,14 +219,10 @@ impl Runner {
 
     /// Runs until `request_stop`.
     pub fn run(self: &Arc<Self>) -> Result<(), String> {
-        let mut server =
-            PipeServer::new(ipc::PIPE_NAME, &self.pipe_sddl).map_err(|e| format!("the pipe's permissions didn't parse: {e}"))?;
-        // Created here, not on the thread: if another program already owns the pipe's name, fail now and loudly
-        let first = server.create().map_err(|e| format!("couldn't create {} ({e}); is another eGuard running?", ipc::PIPE_NAME))?;
-        let me = Arc::clone(self);
-        std::thread::Builder::new().name("pipe".into()).spawn(move || me.serve_pipe(server, first)).map_err(|e| e.to_string())?;
-        self.start_watcher();
+        // Enforcement first: nothing that goes wrong with the admin pipe may leave the child's rules unenforced
         self.start_enforcement()?;
+        self.start_watcher();
+        self.start_pipe()?;
 
         {
             let mut inner = self.lock();
@@ -344,6 +378,27 @@ impl Runner {
         // Send what the scan found now, not at the next tick
         inner.woken = true;
         self.wake.notify_all();
+    }
+
+    /// The admin pipe (`\\.\pipe\eguard`: pairing, status, scans). If another program holds its name, the service
+    /// keeps enforcing and keeps trying for the name on the pipe's thread; console mode stops with a clear error,
+    /// which is what a developer who left another eGuard running needs to see.
+    fn start_pipe(self: &Arc<Self>) -> Result<(), String> {
+        let mut server =
+            PipeServer::new(ipc::PIPE_NAME, &self.pipe_sddl).map_err(|e| format!("the pipe's permissions didn't parse: {e}"))?;
+        let first = match self.mode {
+            Mode::Service => None,
+            Mode::Console { .. } => Some(server.create().map_err(|e| pipe_error(&e))?),
+        };
+        let me = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("pipe".into())
+            .spawn(move || {
+                let first = first.unwrap_or_else(|| claim_pipe(&mut server));
+                me.serve_pipe(server, first);
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     fn serve_pipe(self: Arc<Self>, mut server: PipeServer, first: eguard_win::pipe::Pending) {

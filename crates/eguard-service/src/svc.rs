@@ -5,6 +5,7 @@
 use crate::log;
 use crate::runner::Runner;
 use std::ffi::OsString;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
@@ -31,36 +32,59 @@ fn service_main(_args: Vec<OsString>) {
     }
 }
 
-fn status(state: ServiceState, accept: ServiceControlAccept, exit: u32) -> ServiceStatus {
+/// The service's own exit code when setting up failed (the data folder, `WinHTTP`, the server URL), so the SCM's
+/// event says "service-specific error 1" instead of a start that timed out (1053).
+const EXIT_SETUP_FAILED: u32 = 1;
+/// The service's own exit code when the runner stopped with an error.
+const EXIT_RUN_FAILED: u32 = 2;
+
+fn status(state: ServiceState, accept: ServiceControlAccept, exit: ServiceExitCode) -> ServiceStatus {
     ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
         current_state: state,
         controls_accepted: accept,
-        exit_code: ServiceExitCode::Win32(exit),
+        exit_code: exit,
         checkpoint: 0,
-        wait_hint: Duration::from_secs(10),
+        wait_hint: Duration::from_secs(30),
         process_id: None,
     }
 }
 
 fn run() -> Result<(), String> {
-    let runner = crate::service_runner()?;
-    let r = std::sync::Arc::clone(&runner);
+    // The control handler first: the SCM hears about everything after it, a setup failure included
+    let runner: Arc<OnceLock<Arc<Runner>>> = Arc::default();
+    let r = Arc::clone(&runner);
     let handler = move |event| match event {
-        // Stopping is allowed until removal protection locks the service (Phase 6)
+        // Stopping is allowed until removal protection locks the service (Phase 6). Not accepted while starting,
+        // so the runner is there by the time a stop can arrive
         ServiceControl::Stop | ServiceControl::Shutdown => {
-            r.request_stop();
+            if let Some(r) = r.get() {
+                r.request_stop();
+            }
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
         _ => ServiceControlHandlerResult::NotImplemented,
     };
     let handle = service_control_handler::register(SERVICE_NAME, handler).map_err(|e| e.to_string())?;
+    let _ = handle.set_service_status(status(ServiceState::StartPending, ServiceControlAccept::empty(), ServiceExitCode::Win32(0)));
+    let started = match crate::service_runner() {
+        Ok(started) => started,
+        Err(e) => {
+            // A non-zero exit code makes the SCM's recovery actions try again (failure actions on non-crash failures)
+            let _ = handle.set_service_status(status(
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                ServiceExitCode::ServiceSpecific(EXIT_SETUP_FAILED),
+            ));
+            return Err(format!("setting up failed: {e}"));
+        }
+    };
+    let _ = runner.set(Arc::clone(&started));
     let accept = ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN;
-    handle.set_service_status(status(ServiceState::Running, accept, 0)).map_err(|e| e.to_string())?;
-    let result = Runner::run(&runner);
-    // A non-zero exit code makes the SCM's recovery actions restart the service
-    let code = u32::from(result.is_err());
+    handle.set_service_status(status(ServiceState::Running, accept, ServiceExitCode::Win32(0))).map_err(|e| e.to_string())?;
+    let result = Runner::run(&started);
+    let code = if result.is_err() { ServiceExitCode::ServiceSpecific(EXIT_RUN_FAILED) } else { ServiceExitCode::Win32(0) };
     let _ = handle.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), code));
     result
 }
