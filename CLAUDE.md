@@ -48,6 +48,8 @@ node tools/dev-family.mjs app NAME BLOCKED | limit GAMES 1 | protect KEY JSON | 
 target\debug\eguard-service scan --catalog fixtures/server/catalog.json --verbose   # dry-run scan of this PC
 target\debug\eguard-service run --sandbox %TEMP%\eguard-sandbox   # console mode; ends programs only in the sandbox
 target\debug\eguard-agent preview block|overlay|warning          # look at a screen with sample words
+target\debug\eguard-agent pair CODE --accounts corew              # pair; on this PC name corew (an administrator)
+target\debug\eguard-agent accounts [--set NAME,NAME]              # which Windows accounts are the child's
 ```
 
 ## Conventions

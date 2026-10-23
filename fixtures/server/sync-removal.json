@@ -1,5 +1,5 @@
 {
-  "deviceId": "cmvkn92z0000tncboofyrvun2",
+  "deviceId": "cmvkzgvfw00g8nczsh0kkhu5e",
   "childName": "Mia",
   "policy": [
     {
@@ -132,15 +132,16 @@
     "categoryLimits": true
   },
   "minAppVersion": null,
-  "serverTime": "2026-10-23T07:24:02.978Z",
+  "serverTime": "2026-10-23T13:06:01.152Z",
   "uninstall": {
     "command": {
       "type": "eguard.device.uninstall",
-      "deviceId": "cmvkn92z0000tncboofyrvun2",
-      "requestedAt": "2026-10-23T07:24:02.906Z",
-      "at": "2026-10-23T07:24:02.978Z"
+      "deviceId": "cmvkzgvfw00g8nczsh0kkhu5e",
+      "requestedAt": "2026-10-23T13:06:00.999Z",
+      "at": "2026-10-23T13:06:01.152Z"
     },
-    "signature": "8zJjA7fsPG7Fg/x0oQpESAEfSv7KvqImpnk6272p7e5ijLaAwp6nTyUtQrN44NnAGYxDvqRULACtf3hVWUR4sA==",
+    "signature": "7Is2QCUxfMSD4quSApuBL4Rw6MFYjQtK8rtvMYYxV9KBkALewXmRQfmo6evjp2KYcppvrvUeCT+fIPtvx7rgiQ==",
     "keyId": "60da38f4c654f71a"
-  }
+  },
+  "browserLink": null
 }

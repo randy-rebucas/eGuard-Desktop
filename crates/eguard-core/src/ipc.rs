@@ -33,6 +33,14 @@ pub enum Request {
         /// The computer's name on the dashboard; the Windows name when left out.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        /// The Windows accounts that are the child's, by name; every standard account when left out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accounts: Option<Vec<String>>,
+    },
+    /// The computer's Windows accounts and which are the child's; with `set`, make those the child's first.
+    Accounts {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set: Option<Vec<String>>,
     },
     Status,
     /// Scan for apps now rather than at the next 6-hourly scan.
@@ -113,6 +121,15 @@ pub struct StatusInfo {
     pub last_scan_at: Option<String>,
 }
 
+/// One Windows account, for choosing the child's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountInfo {
+    pub name: String,
+    pub admin: bool,
+    /// The child's rules apply in it.
+    pub enforced: bool,
+}
+
 /// From the service.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -124,6 +141,10 @@ pub enum Response {
     Status(StatusInfo),
     /// The answer to a heartbeat.
     Session(SessionView),
+    /// The computer's Windows accounts.
+    Accounts {
+        accounts: Vec<AccountInfo>,
+    },
     /// The answer to an ask, in words for the child.
     Asked {
         message: String,
@@ -201,10 +222,10 @@ mod tests {
 
     #[test]
     fn messages_are_versioned_lines() {
-        let line = encode(&Request::Pair { code: "ABCD-2345".into(), name: None });
+        let line = encode(&Request::Pair { code: "ABCD-2345".into(), name: None, accounts: None });
         assert_eq!(line, b"{\"v\":1,\"type\":\"pair\",\"code\":\"ABCD-2345\"}\n");
         let back: Request = decode(&line[..line.len() - 1]).unwrap();
-        assert_eq!(back, Request::Pair { code: "ABCD-2345".into(), name: None });
+        assert_eq!(back, Request::Pair { code: "ABCD-2345".into(), name: None, accounts: None });
         let status = encode(&Response::Paired { child_name: "Mia".into() });
         assert_eq!(status, b"{\"v\":1,\"type\":\"paired\",\"childName\":\"Mia\"}\n");
         let hb = encode(&Request::Heartbeat { foreground_pid: Some(42), idle_ms: 1500 });

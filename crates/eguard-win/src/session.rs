@@ -24,6 +24,8 @@ use windows_sys::Win32::System::Threading::{
 pub struct Session {
     pub id: u32,
     pub user: String,
+    /// The signed-in account's SID (`None` if it couldn't be looked up).
+    pub sid: Option<String>,
     /// The lock screen is up: nobody is using it now.
     pub locked: bool,
 }
@@ -58,9 +60,12 @@ fn info(id: u32) -> Option<Session> {
         // SAFETY: the buffer holds a WTSINFOEXW (checked by size), read without assuming its alignment; level 1 is
         // the only level.
         let level1 = unsafe { buf.cast::<WTSINFOEXW>().read_unaligned().Data.WTSInfoExLevel1 };
+        let (user, domain) = (from_wide(&level1.UserName), from_wide(&level1.DomainName));
+        let sid = if user.is_empty() { None } else { crate::accounts::sid_of(&format!("{domain}\\{user}")) };
         Session {
             id,
-            user: from_wide(&level1.UserName),
+            user,
+            sid,
             // Windows 7 had these two the other way round; Windows 10 and 11 report them as documented
             locked: level1.SessionFlags as u32 == WTS_SESSIONSTATE_LOCK,
         }
@@ -168,6 +173,7 @@ mod tests {
         if me != 0 {
             let s = active().into_iter().find(|s| s.id == me).expect("this session is listed");
             assert_ne!(s.user, "");
+            assert_eq!(s.sid, Some(crate::security::current_user_sid().unwrap()));
         }
         // Without SYSTEM's rights, another session's token isn't ours to have
         assert!(launch(me, Path::new(r"C:\Windows\System32\cmd.exe"), "/c exit").is_err());

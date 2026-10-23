@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod accounts;
 pub mod api;
 pub mod canonical;
 pub mod clock;

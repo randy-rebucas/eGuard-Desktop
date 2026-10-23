@@ -1,7 +1,7 @@
 {
   "catalog": {
     "type": "eguard.desktop.catalog",
-    "version": 1792733730702,
+    "version": 1792758987201,
     "entries": [
       {
         "kind": "GAME",
@@ -822,6 +822,14 @@
       {
         "kind": "TRUSTED_PUBLISHER",
         "matchType": "SIGNER",
+        "match": "intel corp",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
         "match": "intel corporation",
         "displayName": null,
         "category": null,
@@ -831,6 +839,14 @@
         "kind": "TRUSTED_PUBLISHER",
         "matchType": "SIGNER",
         "match": "lenovo",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
+        "match": "lg electronics inc.",
         "displayName": null,
         "category": null,
         "trending": false
@@ -918,6 +934,14 @@
       {
         "kind": "TRUSTED_PUBLISHER",
         "matchType": "SIGNER",
+        "match": "seiko epson corporation",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
         "match": "synaptics incorporated",
         "displayName": null,
         "category": null,
@@ -942,6 +966,14 @@
       {
         "kind": "TRUSTED_PUBLISHER",
         "matchType": "SIGNER",
+        "match": "zoom communications, inc.",
+        "displayName": null,
+        "category": null,
+        "trending": false
+      },
+      {
+        "kind": "TRUSTED_PUBLISHER",
+        "matchType": "SIGNER",
         "match": "zoom video communications, inc.",
         "displayName": null,
         "category": null,
@@ -949,6 +981,6 @@
       }
     ]
   },
-  "signature": "N53tkjynCr8dG++Re7s3Ctu/c2P3z3wA/FDUrEcN3mLeen7vTnoE8M5jd/IQzFAMQ0fDTCHeSsQb4kmz5Sn+nw==",
+  "signature": "8RL6A0ZL15Jo2/4NIFcyBuVH6QlWDLrUMiaKAT57mPRdpoafqFGHiAFOR+6/b/DqNTSzsCjmGmp2a+KOKso6WA==",
   "keyId": "60da38f4c654f71a"
 }

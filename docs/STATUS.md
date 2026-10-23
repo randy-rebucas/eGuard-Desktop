@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-10-23, end of Phase 4.
+Updated 2026-10-23: Phase 4, then a session on the owner's decisions (below).
 
 | Phase | What | Status |
 |---|---|---|
@@ -13,6 +13,53 @@ Updated 2026-10-23, end of Phase 4.
 | 7 | Hardening and release readiness | Needs the code-signing certificate |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## The owner's decisions (2026-10-23, after Phase 4)
+
+Approved and done: findings 2, 4, 5, 7, 8, 10, 11 and open questions Q2, Q4, Q5. Left open: findings 1, 12, 13.
+
+**`~/eguard` (server): changed and tested, NOT committed.** That repo had ~60 files of the owner's own uncommitted
+work, including the files these changes touch, so a commit would have swept it in. Commit them with that work:
+
+| File | Change |
+|---|---|
+| `src/app/api/device/v1/sync/route.ts` | `nextSyncSeconds` is 60 for computers (Q4, finding 10) |
+| `src/app/api/device/v1/events/route.ts` | `UNINSTALL_ACK` deletes only while a removal waits; a valid code with none waiting → 409 + "A removal code was used after you kept the computer" (finding 4). TAMPER kinds `REMOVAL_CODE_GUESSED` (Q5) and `NEW_ACCOUNT` (Q2). A computer's found app reads "X was found on Mia's PC and waits for you" (finding 8) |
+| `src/lib/engine.ts` | A protection a computer leaves out: "eGuard for this computer doesn't apply it yet. An update to eGuard will." (finding 5) |
+| `src/lib/desktop-catalog.ts` | Trusted: `seiko epson corporation`, `lg electronics inc.`, `intel corp`, `zoom communications, inc.` (finding 7); seeded into the dev DB |
+| `src/app/api/device/v1/report/route.ts`, `src/lib/mobile-views.ts`, `prisma/schema.prisma`, `prisma/migrations/20261023180000_computer_accounts/` | `/report` `accounts: [{ name, enforced }]` stored on the Device (new `accounts` JSON column), shown in `GET /devices/{id}` (Q2) |
+| `tests/api/desktop-agent.test.ts` | 5 new tests, 2 changed: 35 pass with `devices.test.ts` |
+| `docs/desktop-agent-spec.md` (1, 3, 4, 10, 11, 12, 13), `docs/desktop-agent-open-questions.md` (Q2, Q4, Q5 Settled), `docs/mobile-api.md` | The spec says what was decided, incl. Win32 screens (finding 11) |
+
+Server checks: `tsc` clean, 580 unit tests pass, the desktop-agent and devices API suites pass (35). The full API
+suite can't pass in one run here: sign-ups are limited to 10 an hour per IP and the suites make more (pre-existing;
+`mobile-api.test.ts` alone exceeds it). The suites that use the changed routes for phones still expect the phones'
+behaviour, which didn't change.
+
+**`~/eguard-browser`:** `.env` `VITE_POLICY_PUBLIC_KEY` set to the key derived from the server's dev signing key
+(finding 2). `.env` is ignored by git, so nothing to commit.
+
+**This repo:**
+- **Shared PCs (Q2).** `eguard-agent pair` lists the Windows accounts and asks which are the child's (preselected:
+  the standard ones; `--accounts NAME,NAME` skips the question); pairing is refused before the code is used if that
+  leaves none. `eguard-agent accounts [--set …]` shows or changes it (admin pipe). Only those accounts' sessions get an
+  agent, have time counted and programs ended (`session_sids`, `Enforcer::applies_to`); session 0 and a session whose
+  account can't be read are still checked (stricter). A paired-before computer (no choice saved) enforces everyone.
+  A new account is reported once (`TAMPER` `NEW_ACCOUNT`) and isn't enforced; the list goes to `/report` when it
+  changes. Core `accounts`, win `accounts` (`NetUserEnum`, `LookupAccountNameW`).
+- **Q5:** `Engine::try_removal_code` counts attempts and sends `REMOVAL_CODE_GUESSED` once per lockout, ready for
+  Phase 6's "Remove with a code".
+- **Finding 6:** `SyncResponse.browser_link` kept for Phase 5; fixtures re-captured (`capture-fixtures.mjs` now also
+  records the 409 for a code after Keep).
+
+Verified live on this PC (console mode, sandbox, family deleted after): paired with `--accounts corew`; the parent's
+device page listed `CodexSandboxOffline`/`CodexSandboxOnline` not limited and `corew` enforced; `nextSyncSeconds` 60;
+the new catalog left Epson, LG and Intel's apps out (40 apps reported instead of 47); the stand-in CS2 was ended in
+1.12 s in `corew`'s session, and after `accounts --set CodexSandboxOnline` it ran untouched. Not tried live: a new
+account (creating one needs an administrator), the code lockout (no "Remove with a code" screen yet).
+
+**For Phase 6:** online, the agent sends `UNINSTALL_ACK` with the code before removing itself and stops on 409 (the
+parent kept the computer); offline, the code alone decides (spec 10).
 
 ## Phase 4: what was built
 
@@ -207,37 +254,37 @@ session over the service-mode pipe.
    always-allowed apps stay usable at bedtime. The Apps tab (`child-forms.tsx`: "bedtime and the app's own limit
    still apply"), mobile-api C2 and child-app-spec 7 say bedtime still applies. The core follows the product
    definition (same behaviour as phones). Suggest fixing the spec's wording in 7 and 8.
-2. **The browser extension's dev public key no longer matches the server's dev signing key.**
+2. **The browser extension's dev public key no longer matches the server's dev signing key.** **Done 2026-10-23** (see "The owner's decisions").
    `~/eguard-browser/.env` `VITE_POLICY_PUBLIC_KEY` is `MFkw…PPOg==`; the key derived from
    `~/eguard/.env.local` `BROWSER_POLICY_SIGNING_KEY` is `MFkw…5Q==` (keyId `60da38f4c654f71a`). A dev build of the
    extension would reject every policy from the local server. Not changed (not this repo).
 3. **"Paired but unsynced" isn't in the spec.** The prompt refers to it. Chosen: before the first `/sync`, new apps
    wait for approval and no time limits apply. Pairing needs the network, and the first sync follows in seconds.
-4. **A removal code still works after "Keep this computer".** The capture did keep → `UNINSTALL_ACK` with the code
+4. **A removal code still works after "Keep this computer".** **Done 2026-10-23** (see "The owner's decisions"). The capture did keep → `UNINSTALL_ACK` with the code
    → 200, device deleted. Inherent to offline codes (the PC can't know about the keep), but the server could refuse
    codes for a device with no removal waiting. Owner's call.
-5. **New (Phase 2): the "not applied" text on computers is the phones' wording.** A protection left out of a full
+5. **New (Phase 2): the "not applied" text on computers is the phones' wording.** **Done 2026-10-23** (see "The owner's decisions"). A protection left out of a full
    report gets "eGuard isn't applying it. A permission it needs may be turned off." (`~/eguard/src/lib/engine.ts`,
    `processReport`, the `missing` entry). On a computer there's no permission to turn on. Suggest a
    platform-aware text there, e.g. for WINDOWS/MACOS "eGuard for this computer doesn't apply it yet." Not changed.
-6. **New (Phase 2): `/sync` now sends `browserLink`** (uncommitted server change, `src/lib/browser-link.ts`, with the
+6. **New (Phase 2): `/sync` now sends `browserLink`** **Fixtures re-captured 2026-10-23**; Phase 5 uses it. (uncommitted server change, `src/lib/browser-link.ts`, with the
    migration `20261023120000_browser_on_computer`). The core ignores fields it doesn't know, so nothing broke; it's
    Phase 5's input. Re-capture the fixtures once the server commits it.
-7. **New (Phase 3): suggested catalog additions** (TRUSTED_PUBLISHER, SIGNER): `seiko epson corporation`, `lg
+7. **New (Phase 3): suggested catalog additions** **Done 2026-10-23** (see "The owner's decisions"). (TRUSTED_PUBLISHER, SIGNER): `seiko epson corporation`, `lg
    electronics inc.`, `intel corp` (the Store's name for Intel; the catalog has `intel corporation`). See "What still
    shows" above. Also worth considering: `zoom communications, inc.` (Zoom's current certificate; the catalog has
    `zoom video communications, inc.`).
-8. **New (Phase 3): the server's wording for a new app on a computer.** An `APP_INSTALLED` while approval is on
+8. **New (Phase 3): the server's wording for a new app on a computer.** **Done 2026-10-23** (see "The owner's decisions"). An `APP_INSTALLED` while approval is on
    reads "Mia asked to install Pixel Quest" (`events/route.ts`, `raiseAppRequest`). On a computer the child didn't
    ask; the scan found it. Suggest "Pixel Quest was found on Mia's PC and waits for you" for computers.
 9. **New (Phase 3): one app, two catalog names.** The scan dedupes by name before sending, but the catalog's
    display name can differ from the Uninstall name (Steam "Counter-Strike 2" vs an Uninstall "Steam App 730"
    both merge to the catalog's name here). If the server ever renames a catalog game, the child's list keeps the
    old name and the ids merge new reports into it, so nothing doubles; noted only so a rename isn't surprising.
-10. **New (Phase 4): "Ask parent" and "Ask for more time" take up to 5 minutes to come true.** The parent answers on
+10. **New (Phase 4): "Ask parent" and "Ask for more time" take up to 5 minutes to come true.** **Done 2026-10-23** (see "The owner's decisions"). The parent answers on
     the dashboard, and the computer learns of it at its next `/sync` (`nextSyncSeconds` is 300). The same server
     change as Q4 (60 s for computers, or a push) fixes it.
-11. **New (Phase 4): the desktop spec says Tauri for the agent (section 3).** The owner chose Win32 for the block
+11. **New (Phase 4): the desktop spec says Tauri for the agent (section 3).** **Done 2026-10-23** (see "The owner's decisions"). The owner chose Win32 for the block
     screen, warnings and overlay (above). Suggest the spec say so, with Tauri kept for later settings screens.
 12. **New (Phase 4): time in browsers and other trusted apps counts toward the day but isn't named in `/usage`.**
     Naming it would put "Google Chrome" on the child's list as if it could be blocked, and it can't be (trusted
@@ -252,10 +299,10 @@ From `~/eguard/docs/desktop-agent-open-questions.md`. None is settled in the spe
 
 | # | Recommendation | State |
 |---|---|---|
-| Q2 Shared PCs | At pairing, the parent ticks which Windows accounts are the child's (default: the signed-in account, if standard). Only those sessions are enforced and counted. A new local account raises an alert (needs a new TAMPER kind or alert: server change) | Pairing UI (Tauri) still to come; server part needs the owner. **Until then the scan covers every account**, so a parent's own apps on a shared PC are reported too |
+| Q2 Shared PCs | At pairing, the parent picks the child's Windows accounts (preselected: the standard ones). Only those are enforced and counted; a new account raises `NEW_ACCOUNT` | **Settled and built** 2026-10-23. The scan still covers every account (a parent's apps on a shared PC are reported, though never ended) |
 | Q3 Anti-cheat | First thing on the VM: `TerminateProcess` on CS2, Fortnite (EAC) and Valorant (Vanguard) from SYSTEM. Fallbacks in order: IFEO `Debugger` stub for blocked exe names (paired with the id match), end the launcher, overlay + `LockWorkStation` | Enforcement built; the spike waits for the VM |
-| Q4 Waking for removal | Short term: the server answers `nextSyncSeconds: 60` to computers always (one-line change in `sync/route.ts`), which makes acceptance test 9 ("within a minute") possible. Later: a long-poll endpoint. Today the agent can't learn of a removal for up to 5 minutes | Needs the owner (server change) |
-| Q5 Guessing the code | **Built:** 5 wrong codes lock input for 15 min, doubling each lockout, capped at 24 h, persisted (`removal::CodeAttempts`, now saved in `state.json`). Telling the parent needs a new TAMPER kind `REMOVAL_CODE_GUESSED` (server change) | Core done; alert needs the owner |
+| Q4 Waking for removal | Computers always get `nextSyncSeconds: 60`. Later, if load matters: a long-poll endpoint | **Settled and built** 2026-10-23 (server, uncommitted) |
+| Q5 Guessing the code | 5 wrong codes lock input for 15 min, doubling each lockout, capped at 24 h, persisted; each lockout sends `REMOVAL_CODE_GUESSED` | **Settled and built** 2026-10-23; the screen comes in Phase 6 |
 | Q6 Offline clock | **Built** (`clock`), and now fed by the service: samples from `GetTickCount64` + BootId every tick (≤ 60 s), persisted with the state. Stated limit: a forward jump while offline across a reboot can end bedtime early or start a new day until the PC is back online | Done |
 | Q1, Q7, Q8, Q9 | Not decided here; they need the owner (admin-account test 8, self-update design, end-of-life recovery, exclusive fullscreen) | Open |
 
@@ -270,6 +317,18 @@ session, the disconnect and lock backstops, test 6, and the Q3 anti-cheat spike 
 has the stand-ins.
 
 ## Gotchas
+
+- **`~/eguard` has the owner's uncommitted work**, mixed with this repo's server changes (see "The owner's
+  decisions"). Don't commit there; list what you changed.
+- **The dev database is managed with `prisma db push`, not `migrate`** (`migrate deploy` answers P3005). After a
+  schema change: preview with `prisma migrate diff --from-schema-datasource prisma/schema.prisma
+  --to-schema-datamodel prisma/schema.prisma --script`, then `db push --skip-generate`; `prisma generate` needs the
+  dev server stopped (it holds the query engine: EPERM). On 2026-10-23 the owner let Claude restart it: it runs from
+  that session (`pnpm dev`) and stops with it.
+- **Sign-ups are limited to 10 an hour per IP.** Test families and API suites use it up; clear `signup:*` rows in
+  the dev DB's `RateLimit` table to go on.
+- On this PC `corew` is an administrator and `CodexSandboxOffline`/`CodexSandboxOnline` are standard: pairing with
+  the defaults would make those two the child's. Pair console tests with `--accounts corew`.
 
 - **The dev server and Prisma.** When `~/eguard`'s schema changes, a running `pnpm dev` keeps the old Prisma
   client in memory and answers 500 on anything that touches the new columns (pairing codes and `/pair` did).

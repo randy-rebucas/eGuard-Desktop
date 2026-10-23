@@ -7,6 +7,8 @@
 //!   taken only from eGuard's agent executable running in that session; the session is the pipe's, never the
 //!   message's.
 //! - A session in use with no agent reporting (killed, hung) counts as in use: fail closed.
+//! - Only the child's Windows accounts (chosen at pairing) get an agent, have their time counted and their programs
+//!   ended; each session's account is published in `session_sids` for the monitor.
 //! - The backstop for an overlay that keeps disappearing (spec section 8): while the screen is paused, an agent
 //!   restarted three times in a minute, or silent for 20 seconds, gets its session disconnected (the lock screen).
 //!   Not in console mode.
@@ -14,7 +16,7 @@
 use crate::log;
 use crate::monitor::Facts;
 use eguard_core::enforce::{Ask, Enforcer, Seen};
-use eguard_core::ipc::{self, Request, Response};
+use eguard_core::ipc::{self, Request, Response, SessionView};
 use eguard_core::wire::{DeviceEvent, TamperKind};
 use eguard_win::pipe::{self, PipeServer};
 use eguard_win::process::{self, Child};
@@ -43,6 +45,8 @@ pub struct Shared {
     pub console: bool,
     /// When each session's agent last reported.
     heartbeats: Mutex<HashMap<u32, Instant>>,
+    /// Each signed-in session's account SID (`None`: couldn't be read), for deciding whose rules apply.
+    pub session_sids: SessionSids,
     /// Called after the child asks for something, so the sync loop sends it now.
     wake: Box<dyn Fn() + Send + Sync>,
 }
@@ -54,15 +58,30 @@ impl std::fmt::Debug for Shared {
 }
 
 impl Shared {
-    pub fn new(enforcer: Arc<Mutex<Enforcer>>, facts: Arc<Facts>, console: bool, wake: Box<dyn Fn() + Send + Sync>) -> Self {
+    pub fn new(
+        enforcer: Arc<Mutex<Enforcer>>,
+        facts: Arc<Facts>,
+        session_sids: SessionSids,
+        console: bool,
+        wake: Box<dyn Fn() + Send + Sync>,
+    ) -> Self {
         let agent_exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("eguard-agent.exe"))).unwrap_or_default();
-        Self { enforcer, facts, agent_exe, console, heartbeats: Mutex::new(HashMap::new()), wake }
+        Self { enforcer, facts, agent_exe, console, heartbeats: Mutex::new(HashMap::new()), session_sids, wake }
+    }
+
+    /// Whether the child's rules apply in session `id` (its account is one of the child's).
+    fn applies(&self, id: u32) -> bool {
+        let sid = self.session_sids.lock().unwrap_or_else(PoisonError::into_inner).get(&id).cloned().flatten();
+        self.enforcer().applies_to(sid.as_deref())
     }
 
     fn enforcer(&self) -> std::sync::MutexGuard<'_, Enforcer> {
         self.enforcer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
+
+/// Each signed-in session's account SID, shared with the monitor.
+pub type SessionSids = Arc<Mutex<HashMap<u32, Option<String>>>>;
 
 #[derive(Debug, Default)]
 struct Tracked {
@@ -80,7 +99,7 @@ pub fn supervise(shared: &Arc<Shared>) {
     loop {
         let sessions: Vec<session::Session> = if shared.console {
             let s = session::active().into_iter().find(|s| s.id == mine);
-            vec![s.unwrap_or(session::Session { id: mine, user: String::new(), locked: false })]
+            vec![s.unwrap_or(session::Session { id: mine, user: String::new(), sid: security::current_user_sid().ok(), locked: false })]
         } else {
             session::active()
         };
@@ -108,6 +127,11 @@ pub fn supervise(shared: &Arc<Shared>) {
                 *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(new_sddl);
                 // Wakes the pipe's waiting instance (made for the last sign-in) so the next one admits this one
                 let _ = pipe::connect(&ipc::session_pipe_name(s.id));
+            }
+            shared.session_sids.lock().unwrap_or_else(PoisonError::into_inner).insert(s.id, s.sid.clone());
+            // Not one of the child's accounts (a parent's own on a family PC): no agent, nothing counted or ended
+            if !shared.applies(s.id) {
+                continue;
             }
 
             // The agent: still there?
@@ -154,6 +178,7 @@ pub fn supervise(shared: &Arc<Shared>) {
             }
         }
         let live: Vec<u32> = sessions.iter().map(|s| s.id).collect();
+        shared.session_sids.lock().unwrap_or_else(PoisonError::into_inner).retain(|id, _| live.contains(id));
         tracked.retain(|id, _| {
             let keep = live.contains(id);
             if !keep {
@@ -244,6 +269,7 @@ fn handle(shared: &Shared, id: u32, conn: &std::fs::File, req: &Request) -> Resp
     };
     let sample = clock::sample();
     match req {
+        &Request::Heartbeat { .. } if !shared.applies(id) => Response::Session(SessionView::default()),
         &Request::Heartbeat { foreground_pid, idle_ms } => {
             let program = foreground_pid
                 .filter(|pid| *pid != client && process::session_of(*pid) == Some(id))
@@ -266,7 +292,9 @@ fn handle(shared: &Shared, id: u32, conn: &std::fs::File, req: &Request) -> Resp
             let result = shared.enforcer().ask(id, Ask::Time { notice }, sample);
             asked(shared, result)
         }
-        Request::Pair { .. } | Request::Status | Request::Scan => Response::Error { message: "That isn't asked on this pipe.".into() },
+        Request::Pair { .. } | Request::Status | Request::Scan | Request::Accounts { .. } => {
+            Response::Error { message: "That isn't asked on this pipe.".into() }
+        }
     }
 }
 

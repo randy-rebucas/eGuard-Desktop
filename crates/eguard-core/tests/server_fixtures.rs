@@ -58,7 +58,9 @@ fn sync_carries_what_computers_need() {
     assert_eq!(cs2.ids, vec![AppId::new(AppIdKind::Steam, "730")]);
     assert_eq!(s.category_limits, vec![CategoryLimit { category: Category::Games, daily_limit_minutes: 60 }]);
     assert!(s.features.category_limits);
-    assert_eq!(s.next_sync_seconds, 300);
+    // Computers always come back within a minute (no push wakes them)
+    assert_eq!(s.next_sync_seconds, 60);
+    assert!(s.browser_link.as_ref().is_some_and(|l| l.value.starts_with(&s.device_id)));
     assert!(s.uninstall.is_none());
     // The first sync after pairing asks for a full report
     let first: SyncResponse = serde_json::from_value(fixture!("sync-first.json")).unwrap();
@@ -211,7 +213,7 @@ fn applying_syncs_keeps_the_last_good_policy() {
 
     let first = state.apply_sync(&fixture!("sync-computer.json"), &keys(), sample_at("2026-10-23T07:24:00Z"), "0.1.0").unwrap();
     assert!(first.uninstall.is_none());
-    assert_eq!(first.next_sync_secs, 300);
+    assert_eq!(first.next_sync_secs, 60);
     let rules = state.rules();
     assert!(rules.policy.approval_required);
     assert_eq!(state.zone().name(), "Asia/Manila");

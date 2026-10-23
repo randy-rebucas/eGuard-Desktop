@@ -9,6 +9,7 @@
 //! `--sandbox` folder, and without one it only logs what it would have ended.
 
 use crate::log;
+use crate::sessions::SessionSids;
 use eguard_core::enforce::{Decision, Enforcer, Program};
 use eguard_win::{apps, authenticode, process};
 use std::collections::{HashMap, HashSet};
@@ -126,11 +127,13 @@ pub struct Monitor {
     tracked: HashMap<(u32, u64), Tracked>,
     /// ETW reports starts: sweep less often.
     etw: bool,
+    /// Each signed-in session's account, so programs in a parent's own session are left alone.
+    session_sids: SessionSids,
 }
 
 impl Monitor {
-    pub fn new(facts: Arc<Facts>, enforcer: Arc<Mutex<Enforcer>>, mode: EndMode, etw: bool) -> Self {
-        Self { facts, enforcer, mode, tracked: HashMap::new(), etw }
+    pub fn new(facts: Arc<Facts>, enforcer: Arc<Mutex<Enforcer>>, mode: EndMode, etw: bool, session_sids: SessionSids) -> Self {
+        Self { facts, enforcer, mode, tracked: HashMap::new(), etw, session_sids }
     }
 
     /// Sweeps every `SWEEP_EVERY` (`SWEEP_EVERY_WITH_ETW` with ETW), and handles each pid from `started` (ETW) as it
@@ -206,11 +209,17 @@ impl Monitor {
     fn enforce(&mut self, which: &[(u32, u64)]) {
         let sample = eguard_win::clock::sample();
         let mut to_end = Vec::new();
+        let sids = self.session_sids.lock().unwrap_or_else(PoisonError::into_inner).clone();
         {
             let mut e = self.enforcer.lock().unwrap_or_else(PoisonError::into_inner);
             for key in which {
                 let Some(t) = self.tracked.get(key) else { continue };
                 let Some(program) = &t.program else { continue };
+                // Programs in a session that isn't the child's are left alone. A session not (yet) known by its
+                // account (the services' session 0, or one just signed in) is checked: the stricter choice
+                if !e.applies_to(sids.get(&t.session).cloned().flatten().as_deref()) {
+                    continue;
+                }
                 if let Decision::End { app, block } = e.check(program, sample) {
                     to_end.push((*key, app, block));
                 }

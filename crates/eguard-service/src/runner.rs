@@ -14,10 +14,11 @@ use crate::log;
 use crate::monitor::{self, EndMode, Facts, Monitor};
 use crate::sessions::{self, Shared};
 use crate::store::Store;
+use eguard_core::accounts::AccountChoice;
 use eguard_core::api::{Api, ServerUrl};
 use eguard_core::enforce::{Enforcer, Memo};
 use eguard_core::engine::{DeviceInfo, Engine, Note};
-use eguard_core::ipc::{self, Request, Response};
+use eguard_core::ipc::{self, AccountInfo, Request, Response};
 use eguard_core::report::{AVAILABLE, Capabilities};
 use eguard_core::scan::{self, Classifier, ExeCache};
 use eguard_core::signature::TrustedKeys;
@@ -217,6 +218,9 @@ impl Runner {
             if queued || poked || inner.woken || Instant::now() >= next_tick {
                 let info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
                 let tick = inner.engine.tick(clock::sample(), &info);
+                // The Windows accounts: a new one is news, and the list goes to /report when it changed
+                let now = inner.engine.now_ms(clock::sample());
+                inner.engine.observe_accounts(&eguard_win::accounts::list(), now);
                 log_notes(&mut inner.engine);
                 self.enforcer().update(inner.engine.enforce_inputs());
                 if tick.changed {
@@ -283,13 +287,15 @@ impl Runner {
                 false
             }
         };
-        let monitor = Monitor::new(Arc::clone(&self.facts), Arc::clone(&self.enforcer), mode, etw);
+        let session_sids: sessions::SessionSids = Arc::default();
+        let monitor = Monitor::new(Arc::clone(&self.facts), Arc::clone(&self.enforcer), mode, etw, Arc::clone(&session_sids));
         std::thread::Builder::new().name("monitor".into()).spawn(move || monitor.run(&rx)).map_err(|e| e.to_string())?;
 
         let me = Arc::clone(self);
         let shared = Arc::new(Shared::new(
             Arc::clone(&self.enforcer),
             Arc::clone(&self.facts),
+            session_sids,
             matches!(self.mode, Mode::Console { .. }),
             Box::new(move || me.poke()),
         ));
@@ -381,7 +387,8 @@ impl Runner {
                 self.wake.notify_all();
                 Response::Status(inner.engine.status())
             }
-            Request::Pair { code, name } => self.pair(&code, name),
+            Request::Pair { code, name, accounts } => self.pair(&code, name, accounts.as_deref()),
+            Request::Accounts { set } => self.accounts(set),
             // A session's agent talks on its own session's pipe
             Request::Heartbeat { .. } | Request::AskParent { .. } | Request::AskTime { .. } => {
                 Response::Error { message: "That is asked on the session's own pipe.".into() }
@@ -389,7 +396,55 @@ impl Runner {
         }
     }
 
-    fn pair(&self, code: &str, name: Option<String>) -> Response {
+    /// The Windows accounts and which are the child's; `set` names the child's first (an administrator at the
+    /// computer: the main pipe admits only administrators in a real install).
+    fn accounts(&self, set: Option<Vec<String>>) -> Response {
+        let list = eguard_win::accounts::list();
+        let mut inner = self.lock();
+        if let Some(names) = set {
+            if !inner.engine.is_paired() {
+                return Response::Error { message: "This computer isn't paired yet.".into() };
+            }
+            if names.iter().all(|n| n.trim().is_empty()) {
+                return Response::Error { message: "Name at least one account: eGuard would apply no rules at all.".into() };
+            }
+            if let Err(e) = inner.engine.set_accounts(&list, &names) {
+                return Response::Error { message: e.to_string() };
+            }
+            let now = inner.engine.now_ms(clock::sample());
+            inner.engine.observe_accounts(&list, now);
+            log_notes(&mut inner.engine);
+            self.enforcer().update(inner.engine.enforce_inputs());
+            self.save(&mut inner);
+            inner.woken = true;
+            self.wake.notify_all();
+        }
+        // Unpaired, no rules apply anywhere yet
+        let paired = inner.engine.is_paired();
+        let accounts = list
+            .iter()
+            .map(|a| AccountInfo { name: a.name.clone(), admin: a.admin, enforced: paired && inner.engine.account_applies(&a.sid) })
+            .collect();
+        Response::Accounts { accounts }
+    }
+
+    fn pair(&self, code: &str, name: Option<String>, accounts: Option<&[String]>) -> Response {
+        // The child's accounts are settled before the code is used: a code works once
+        let list = eguard_win::accounts::list();
+        let choice = match accounts {
+            Some(names) => match AccountChoice::named(&list, names) {
+                Ok(c) => c,
+                Err(e) => return Response::Error { message: e.to_string() },
+            },
+            None => AccountChoice::standard(&list),
+        };
+        if choice.enforced.is_empty() {
+            return Response::Error {
+                message:
+                    "Every account on this computer is an administrator. Name your child's account: eguard-agent pair CODE --accounts NAME"
+                        .into(),
+            };
+        }
         let mut inner = self.lock();
         let mut info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
         if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
@@ -410,7 +465,9 @@ impl Runner {
             };
         }
         let child_name = paired.child_name.clone();
-        inner.engine.adopt(paired);
+        inner.engine.adopt(paired, Some(choice));
+        let now = inner.engine.now_ms(clock::sample());
+        inner.engine.observe_accounts(&list, now);
         log_notes(&mut inner.engine);
         // A new pairing starts its usage afresh, like the rest of the state
         {

@@ -382,6 +382,18 @@ pub struct SyncResponse {
     /// Computers only: `null`, or the signed uninstall command while a removal waits.
     #[serde(default)]
     pub uninstall: Option<SignedEnvelope>,
+    /// Computers only: what the eGuard extension's managed policy carries so browsers pair as part of this computer
+    /// (spec section 9). `null` while a removal waits. Phase 5 uses it.
+    #[serde(default)]
+    pub browser_link: Option<BrowserLink>,
+}
+
+/// `/sync` `browserLink`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserLink {
+    pub value: String,
+    pub expires_at: String,
 }
 
 /* ---------- /report ---------- */
@@ -414,6 +426,16 @@ pub struct ReportRequest {
     pub os_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,
+    /// Computers: the Windows accounts and whether the child's rules apply in each.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<Vec<ReportedAccount>>,
+}
+
+/// One Windows account in `/report` (spec section 12): its name, and whether the child's rules apply in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportedAccount {
+    pub name: String,
+    pub enforced: bool,
 }
 
 /// `{ ok: true }`, plus `ignored` when entries didn't match their schema (a bug in this build: log it).
@@ -476,6 +498,10 @@ pub enum TamperKind {
     SafeMode,
     AgentRestarted,
     ClockChanged,
+    /// Five wrong removal codes in a row locked "Remove with a code" (spec section 10).
+    RemovalCodeGuessed,
+    /// A Windows account appeared that the child's rules don't apply in (spec section 4).
+    NewAccount,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

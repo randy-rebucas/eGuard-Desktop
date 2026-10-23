@@ -116,7 +116,11 @@ try {
   expect(await call("POST", `/devices/${pair.deviceId}/keep`, { token }), 200, "keep");
   save("sync-kept.json", expect(await pc("/sync"), 200, "sync after keep"));
 
-  // The device is removed for good with a code; afterwards its token is refused
+  // A code after "Keep" no longer removes it (the parent hears it was used)
+  save("events-uninstall-ack-code-kept-409.json", { status: 409, body: expect(await pc("/events", { type: "UNINSTALL_ACK", code: device.removalCode.code }), 409, "ack with a code after keep") });
+
+  // Removed again while it's offline: the code typed into it removes it for good; afterwards its token is refused
+  expect(await call("DELETE", `/devices/${pair.deviceId}`, { token, body: { password: PASSWORD } }), 200, "remove again");
   save("events-uninstall-ack-code-response.json", expect(await pc("/events", { type: "UNINSTALL_ACK", code: device.removalCode.code }), 200, "ack with code"));
   save("sync-401.json", { status: 401, body: expect(await pc("/sync"), 401, "sync after removal") });
 

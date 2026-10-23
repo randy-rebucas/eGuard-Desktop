@@ -67,6 +67,7 @@ pub fn full_report(protections: Vec<ReportedProtection>, os_version: &str, app_v
         battery,
         os_version: Some(os_version.to_owned()),
         app_version: Some(app_version.to_owned()),
+        accounts: None,
     }
 }
 
@@ -104,6 +105,7 @@ mod tests {
             min_app_version: None,
             server_time: None,
             uninstall: None,
+            browser_link: None,
         }
     }
 

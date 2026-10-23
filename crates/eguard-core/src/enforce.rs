@@ -147,6 +147,8 @@ pub struct Inputs {
     /// `None` until a verified catalog is in: no program counts as a trusted publisher's until then.
     pub classifier: Option<Classifier>,
     pub inventory: Inventory,
+    /// The SIDs of the Windows accounts the child's rules apply in; `None`: every account.
+    pub accounts: Option<BTreeSet<String>>,
 }
 
 impl Default for Inputs {
@@ -158,6 +160,7 @@ impl Default for Inputs {
             clock: TrustedClock::default(),
             classifier: None,
             inventory: Inventory::default(),
+            accounts: None,
         }
     }
 }
@@ -425,6 +428,15 @@ impl Enforcer {
     pub fn update(&mut self, inputs: Inputs) {
         self.inputs = inputs;
         self.resolved.clear();
+    }
+
+    /// Whether the child's rules apply in the Windows account `sid` (a session's, or a process's owner).
+    pub fn applies_to(&self, sid: Option<&str>) -> bool {
+        // No choice made (every account), or an account that couldn't be read: enforced, the stricter choice
+        match (&self.inputs.accounts, sid) {
+            (Some(set), Some(sid)) => set.contains(sid),
+            _ => true,
+        }
     }
 
     pub fn ledger(&self) -> &UsageLedger {
@@ -807,6 +819,7 @@ mod tests {
             clock: TrustedClock::default(),
             classifier: Some(catalog()),
             inventory: inventory(),
+            accounts: None,
         }
     }
 

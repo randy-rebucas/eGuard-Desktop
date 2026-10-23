@@ -3,14 +3,17 @@
 //! ```text
 //! eguard-agent session [--dev]             started by the service in each session: reports what has the focus
 //!                                          and shows the block screen, warnings and overlay (--dev: console mode)
-//! eguard-agent pair [CODE] [--name NAME]   pair with a code from the parent dashboard (asks for it if left out)
+//! eguard-agent pair [CODE] [--name NAME] [--accounts NAME,NAME]
+//!                                          pair with a code from the parent dashboard (asks for it if left out),
+//!                                          and say which Windows accounts are the child's (asks if left out)
+//! eguard-agent accounts [--set NAME,NAME]  the Windows accounts and which are the child's; --set changes that
 //! eguard-agent status
 //! eguard-agent scan                        look for installed apps now (at most every 2 minutes)
 //! eguard-agent preview [block|overlay|warning]
 //!                                          show a screen with sample words for a few seconds (development)
 //! ```
 
-use eguard_core::ipc::{self, Request, Response, Screen, SessionView, Warning};
+use eguard_core::ipc::{self, AccountInfo, Request, Response, Screen, SessionView, Warning};
 use eguard_win::input::{self, InputWatch};
 use eguard_win::process;
 use eguard_win::ui::{Ui, UiEvent};
@@ -35,34 +38,84 @@ fn ask(request: &Request) -> Result<Response, String> {
     ipc::decode(&line).map_err(|e| e.to_string())
 }
 
+fn prompt(question: &str) -> Result<String, String> {
+    print!("{question}");
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).map_err(|e| e.to_string())?;
+    Ok(line.trim().to_owned())
+}
+
+fn names(list: &str) -> Vec<String> {
+    list.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned).collect()
+}
+
+fn list_accounts(set: Option<Vec<String>>) -> Result<Vec<AccountInfo>, String> {
+    match ask(&Request::Accounts { set })? {
+        Response::Accounts { accounts } => Ok(accounts),
+        Response::Error { message } => Err(message),
+        _ => Err("unexpected answer from the service".into()),
+    }
+}
+
+fn show_accounts(accounts: &[AccountInfo]) {
+    for a in accounts {
+        let role = if a.admin { "administrator" } else { "standard" };
+        let rules = if a.enforced { "the child's: rules apply" } else { "not limited" };
+        println!("  {:<24} {role:<14} {rules}", a.name);
+    }
+}
+
 fn pair(args: &[String]) -> Result<(), String> {
     let mut code = None;
     let mut name = None;
+    let mut accounts = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--name" => name = Some(it.next().ok_or("--name needs a name")?.clone()),
+            "--accounts" => accounts = Some(names(it.next().ok_or("--accounts needs account names, separated by commas")?)),
             c if code.is_none() => code = Some(c.to_owned()),
             other => return Err(format!("unexpected {other}")),
         }
     }
-    let code = if let Some(c) = code {
-        c
-    } else {
-        print!("Pairing code from the parent dashboard: ");
-        std::io::stdout().flush().map_err(|e| e.to_string())?;
-        let mut line = String::new();
-        std::io::stdin().lock().read_line(&mut line).map_err(|e| e.to_string())?;
-        line.trim().to_owned()
+    let code = match code {
+        Some(c) => c,
+        None => prompt("Pairing code from the parent dashboard: ")?,
     };
-    match ask(&Request::Pair { code, name })? {
+    // Which accounts are the child's (spec section 4): asked unless named, standard accounts suggested
+    if accounts.is_none() {
+        let all = list_accounts(None)?;
+        let standard: Vec<&str> = all.iter().filter(|a| !a.admin).map(|a| a.name.as_str()).collect();
+        println!("Windows accounts on this computer:");
+        for a in &all {
+            println!("  {:<24} {}", a.name, if a.admin { "administrator" } else { "standard" });
+        }
+        println!("eGuard applies your child's rules only in their accounts; the others aren't limited.");
+        let typed = prompt(&format!("Your child's accounts, separated by commas [{}]: ", standard.join(", ")))?;
+        if !typed.is_empty() {
+            accounts = Some(names(&typed));
+        }
+    }
+    match ask(&Request::Pair { code, name, accounts })? {
         Response::Paired { child_name } => {
             println!("Paired. This computer is now {child_name}'s on eGuard.");
+            show_accounts(&list_accounts(None)?);
             Ok(())
         }
         Response::Error { message } => Err(message),
         _ => Err("unexpected answer from the service".into()),
     }
+}
+
+fn accounts(args: &[String]) -> Result<(), String> {
+    let set = match args {
+        [] => None,
+        [flag, list] if flag == "--set" => Some(names(list)),
+        _ => return Err("usage: eguard-agent accounts [--set NAME,NAME]".into()),
+    };
+    show_accounts(&list_accounts(set)?);
+    Ok(())
 }
 
 fn status() -> Result<(), String> {
@@ -215,12 +268,14 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("session") => session(&args[1..]),
         Some("pair") => pair(&args[1..]),
+        Some("accounts") => accounts(&args[1..]),
         Some("status") | None => status(),
         Some("scan") => scan(),
         Some("preview") => preview(&args[1..]),
-        Some(_) => {
-            Err("usage: eguard-agent session [--dev] | pair [CODE] [--name NAME] | status | scan | preview [block|overlay|warning]".into())
-        }
+        Some(_) => Err(
+            "usage: eguard-agent session [--dev] | pair [CODE] [--name NAME] [--accounts NAME,NAME] | accounts [--set NAME,NAME] | status | scan | preview [block|overlay|warning]"
+                .into(),
+        ),
     };
     if let Err(e) = result {
         eprintln!("{e}");

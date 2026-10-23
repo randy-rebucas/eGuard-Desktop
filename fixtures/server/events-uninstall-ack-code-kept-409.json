@@ -1,0 +1,6 @@
+{
+  "status": 409,
+  "body": {
+    "error": "No removal was asked for this computer"
+  }
+}

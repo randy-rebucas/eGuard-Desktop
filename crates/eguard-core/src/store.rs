@@ -8,13 +8,14 @@
 //! The device id is in both. A state file that is lost or corrupt is rebuilt from the secrets (`Persisted::recover`),
 //! so the computer stays paired and enforcing, with "approval for everything new" until the next `/sync`.
 
+use crate::accounts::AccountChoice;
 use crate::enforce::Memo;
 use crate::queue::OutboundQueue;
 use crate::removal::CodeAttempts;
 use crate::scan::{ExeCache, Place};
 use crate::state::AgentState;
 use crate::usage::UsageLedger;
-use crate::wire::{FoundApp, ReportedProtection};
+use crate::wire::{FoundApp, ReportedAccount, ReportedProtection};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -54,6 +55,13 @@ pub struct Persisted {
     /// What enforcement remembers across restarts (limits already reported today).
     #[serde(default)]
     pub enforce: Memo,
+    /// The Windows accounts the child's rules apply in, chosen at pairing. `None`: paired before the choice existed,
+    /// so every account is enforced.
+    #[serde(default)]
+    pub accounts: Option<AccountChoice>,
+    /// The accounts as last queued for `/report`, so an unchanged list isn't sent again.
+    #[serde(default)]
+    pub accounts_reported: Option<Vec<ReportedAccount>>,
 }
 
 impl Default for Persisted {
@@ -71,6 +79,8 @@ impl Default for Persisted {
             exe_cache: ExeCache::new(),
             places: Vec::new(),
             enforce: Memo::default(),
+            accounts: None,
+            accounts_reported: None,
         }
     }
 }

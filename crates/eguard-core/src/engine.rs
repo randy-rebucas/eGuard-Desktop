@@ -5,17 +5,18 @@
 //!
 //! Fail closed throughout: a failed, refused or unreadable `/sync` changes nothing but when the next one is tried.
 
+use crate::accounts::{self, Account, AccountChoice, UnknownAccount};
 use crate::api::{Api, ApiError};
 use crate::clock::{ClockChange, ClockSample};
 use crate::enforce::{Inputs, Inventory};
 use crate::queue::{self, Settled};
-use crate::removal::RemovalSecret;
+use crate::removal::{AttemptResult, RemovalSecret};
 use crate::report::{self, Capabilities};
 use crate::scan::{self, Classifier, ExeCache, ScanResult};
 use crate::signature::{CatalogUpdate, TrustedKeys, verify_catalog};
 use crate::state::{AgentState, AuthState, UNAUTHORIZED_SYNC_SECS};
 use crate::store::{DeviceSecrets, Persisted};
-use crate::wire::{Catalog, DeviceEvent, EventEnvelope, PairRequest, Platform, SyncRequest, TamperKind, UsageReport};
+use crate::wire::{Catalog, DeviceEvent, EventEnvelope, PairRequest, Platform, ReportRequest, SyncRequest, TamperKind, UsageReport};
 
 /// The longest the service sleeps: the wall clock is checked for changes about this often.
 pub const MAX_SLEEP_MS: u64 = 60_000;
@@ -214,8 +215,9 @@ impl Engine {
         })
     }
 
-    /// Takes a pairing whose secrets are saved. Save `data` next; the first `/sync` is due right away.
-    pub fn adopt(&mut self, paired: Paired) {
+    /// Takes a pairing whose secrets are saved, and the parent's choice of the child's Windows accounts (`None`:
+    /// every account). Save `data` next; the first `/sync` is due right away.
+    pub fn adopt(&mut self, paired: Paired, accounts: Option<AccountChoice>) {
         match paired.secrets.removal_secret.as_deref().map(RemovalSecret::from_base64url) {
             Some(Ok(_)) => {}
             Some(Err(_)) => self.notes.push(Note::Warn("the removal secret from eGuard isn't 32 bytes; removal codes won't work".into())),
@@ -224,8 +226,12 @@ impl Engine {
         // The catalog is eGuard's, not the device's: it stays. Everything else starts over (the first scan after
         // pairing reports everything)
         let catalog = self.data.catalog.take();
-        self.data =
-            Persisted { agent: Some(AgentState::paired(&paired.secrets.device_id, &paired.child_name)), catalog, ..Persisted::default() };
+        self.data = Persisted {
+            agent: Some(AgentState::paired(&paired.secrets.device_id, &paired.child_name)),
+            catalog,
+            accounts,
+            ..Persisted::default()
+        };
         self.notes.push(Note::Info(format!("paired as {} for {}", paired.secrets.device_id, paired.child_name)));
         self.secrets = Some(paired.secrets);
         self.next_sync_mono_ms = 0;
@@ -340,7 +346,8 @@ impl Engine {
         }
         let unchanged = self.data.last_reported.as_ref() == Some(&protections);
         if outcome.full_report_requested || !outcome.requests.is_empty() || !unchanged {
-            let body = report::full_report(protections.clone(), &info.os_version, &info.app_version, info.battery);
+            let mut body = report::full_report(protections.clone(), &info.os_version, &info.app_version, info.battery);
+            body.accounts.clone_from(&self.data.accounts_reported);
             self.data.queue.push_report(body, now_ms);
             self.data.last_reported = Some(protections);
         }
@@ -439,7 +446,62 @@ impl Engine {
             clock: agent.map(|a| a.clock.clone()).unwrap_or_default(),
             classifier: self.catalog.as_ref().map(Classifier::new),
             inventory: Inventory::new(&self.data.places, self.data.apps_reported.as_ref()),
+            accounts: self.data.accounts.as_ref().map(|c| c.enforced.clone()),
         }
+    }
+
+    /// The computer's Windows accounts, looked at again (at start and every few minutes). An account not seen
+    /// before is news once (`TAMPER` `NEW_ACCOUNT`) and isn't enforced; the list goes to `/report` when it changed.
+    /// Returns true when `data` changed.
+    pub fn observe_accounts(&mut self, list: &[Account], now_ms: i64) -> bool {
+        if !self.is_paired() || list.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        if let Some(choice) = self.data.accounts.as_mut() {
+            let new: Vec<String> = choice.take_new(list).into_iter().map(|a| a.name.clone()).collect();
+            if !new.is_empty() {
+                self.notes
+                    .push(Note::Warn(format!("new Windows account(s) {}: not enforced until an administrator adds them", new.join(", "))));
+                self.data.queue.push_event(EventEnvelope::new(DeviceEvent::Tamper { kind: TamperKind::NewAccount }), now_ms);
+                changed = true;
+            }
+        }
+        let reported = accounts::report(self.data.accounts.as_ref(), list);
+        if self.data.accounts_reported.as_ref() != Some(&reported) {
+            let body = ReportRequest { accounts: Some(reported.clone()), ..ReportRequest::default() };
+            self.data.queue.push_report(body, now_ms);
+            self.data.accounts_reported = Some(reported);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Whether the child's rules apply in the account `sid`.
+    pub fn account_applies(&self, sid: &str) -> bool {
+        accounts::applies(self.data.accounts.as_ref(), sid)
+    }
+
+    /// The parent (an administrator at the computer) names the child's accounts. Reported at the next look.
+    pub fn set_accounts(&mut self, list: &[Account], names: &[String]) -> Result<(), UnknownAccount> {
+        let choice = AccountChoice::named(list, names)?;
+        self.notes.push(Note::Info(format!("the child's accounts are now: {}", names.join(", "))));
+        self.data.accounts = Some(choice);
+        self.data.accounts_reported = None;
+        Ok(())
+    }
+
+    /// A code typed into "Remove with a code" (spec section 10). Wrong ones count toward a lockout, and each new
+    /// lockout tells the parent (`TAMPER` `REMOVAL_CODE_GUESSED`). `None` when this computer has no removal secret.
+    pub fn try_removal_code(&mut self, input: &str, now_ms: i64) -> Option<AttemptResult> {
+        let secrets = self.secrets.as_ref()?;
+        let secret = RemovalSecret::from_base64url(secrets.removal_secret.as_deref()?).ok()?;
+        let result = self.data.code_attempts.attempt(&secret, &secrets.device_id, input, now_ms);
+        if let AttemptResult::LockedOut { newly: true, .. } = result {
+            self.notes.push(Note::Warn("wrong removal codes: \"Remove with a code\" is locked for a while".into()));
+            self.data.queue.push_event(EventEnvelope::new(DeviceEvent::Tamper { kind: TamperKind::RemovalCodeGuessed }), now_ms);
+        }
+        Some(result)
     }
 
     /// Queues what enforcement has to tell the server.
@@ -546,7 +608,7 @@ mod tests {
         t.answers.lock().unwrap().push(json(201, &fixture("pair-response.json")));
         let mut e = engine(t);
         let p = e.pair("7jx8-7r2f", &info()).unwrap();
-        e.adopt(p);
+        e.adopt(p, None);
         let server_time = fixture("sync-first.json")["serverTime"].as_str().unwrap().to_owned();
         (e, server_time)
     }
@@ -735,6 +797,93 @@ mod tests {
         let api = Api::new(ServerUrl::parse("http://localhost:3000", true).unwrap(), Box::new(t.clone()));
         let restarted = Engine::new(data, e.secrets.clone(), api, TrustedKeys::builtin().unwrap(), caps());
         assert!(restarted.catalog.is_some());
+    }
+
+    fn win_accounts() -> Vec<Account> {
+        vec![
+            Account { sid: "S-1-5-21-9-1001".into(), name: "Carla".into(), admin: true },
+            Account { sid: "S-1-5-21-9-1002".into(), name: "Mia".into(), admin: false },
+        ]
+    }
+
+    fn tampers(e: &Engine) -> Vec<TamperKind> {
+        e.data
+            .queue
+            .items()
+            .iter()
+            .filter_map(|q| match &q.item {
+                Outbound::Event(EventEnvelope { event: DeviceEvent::Tamper { kind }, .. }) => Some(*kind),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reported_accounts(e: &Engine) -> Vec<Vec<crate::wire::ReportedAccount>> {
+        e.data
+            .queue
+            .items()
+            .iter()
+            .filter_map(|q| match &q.item {
+                Outbound::Report(r) => r.accounts.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_childs_accounts_are_reported_and_a_new_one_is_news_once() {
+        let t = Scripted::new(vec![json(201, &fixture("pair-response.json"))]);
+        let mut e = engine(&t);
+        let p = e.pair("7jx8-7r2f", &info()).unwrap();
+        e.adopt(p, Some(AccountChoice::standard(&win_accounts())));
+        assert!(e.account_applies("S-1-5-21-9-1002") && !e.account_applies("S-1-5-21-9-1001"));
+        assert!(e.observe_accounts(&win_accounts(), 0));
+        assert!(!e.observe_accounts(&win_accounts(), 1));
+        let sent = reported_accounts(&e);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].iter().map(|a| (a.name.as_str(), a.enforced)).collect::<Vec<_>>(), [("Carla", false), ("Mia", true)]);
+
+        let mut later = win_accounts();
+        later.push(Account { sid: "S-1-5-21-9-1003".into(), name: "Sneaky".into(), admin: false });
+        assert!(e.observe_accounts(&later, 2));
+        e.observe_accounts(&later, 3);
+        assert_eq!(tampers(&e), [TamperKind::NewAccount]);
+        assert!(!e.account_applies("S-1-5-21-9-1003"));
+        assert_eq!(e.enforce_inputs().accounts.map(|s| s.len()), Some(1));
+
+        // An administrator adds it on the computer
+        e.set_accounts(&later, &["mia".into(), "Sneaky".into()]).unwrap();
+        assert!(e.account_applies("S-1-5-21-9-1003"));
+        assert!(e.set_accounts(&later, &["Nobody".into()]).is_err());
+        e.observe_accounts(&later, 4);
+        assert!(reported_accounts(&e).last().unwrap().iter().all(|a| a.enforced == (a.name != "Carla")));
+    }
+
+    #[test]
+    fn paired_before_the_choice_every_account_is_enforced() {
+        let t = Scripted::new(vec![]);
+        let (mut e, _) = paired(&t);
+        assert!(e.account_applies("S-1-5-21-9-1001"));
+        e.observe_accounts(&win_accounts(), 0);
+        assert_eq!(tampers(&e), Vec::<TamperKind>::new());
+        assert!(reported_accounts(&e)[0].iter().all(|a| a.enforced));
+    }
+
+    #[test]
+    fn guessing_the_removal_code_locks_it_and_tells_the_parent_once_per_lockout() {
+        let t = Scripted::new(vec![]);
+        let (mut e, _) = paired(&t);
+        for i in 0..4 {
+            assert!(matches!(e.try_removal_code("AAAAAAAA", i), Some(AttemptResult::Rejected { .. })));
+        }
+        assert!(matches!(e.try_removal_code("AAAAAAAA", 5), Some(AttemptResult::LockedOut { newly: true, .. })));
+        assert!(matches!(e.try_removal_code("AAAAAAAA", 6), Some(AttemptResult::LockedOut { newly: false, .. })));
+        assert_eq!(tampers(&e), [TamperKind::RemovalCodeGuessed]);
+        // The right code works once the lockout is over
+        let secret = RemovalSecret::from_base64url(e.secrets.as_ref().unwrap().removal_secret.as_deref().unwrap()).unwrap();
+        let later = 5 + crate::removal::FIRST_LOCKOUT_MS;
+        let code = crate::removal::code_for_window(&secret, &e.secrets.as_ref().unwrap().device_id, crate::removal::window_of(later));
+        assert_eq!(e.try_removal_code(&code, later), Some(AttemptResult::Accepted));
     }
 
     #[test]

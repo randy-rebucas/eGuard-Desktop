@@ -1,5 +1,5 @@
 {
-  "deviceId": "cmvkn92z0000tncboofyrvun2",
+  "deviceId": "cmvkzgvfw00g8nczsh0kkhu5e",
   "childName": "Mia",
   "policy": [
     {
@@ -125,13 +125,17 @@
   ],
   "extraTimeUntil": null,
   "fullReportRequested": false,
-  "nextSyncSeconds": 300,
+  "nextSyncSeconds": 60,
   "timezone": "Asia/Manila",
   "features": {
     "locationSharing": true,
     "categoryLimits": true
   },
   "minAppVersion": null,
-  "serverTime": "2026-10-23T07:24:04.177Z",
-  "uninstall": null
+  "serverTime": "2026-10-23T13:06:01.296Z",
+  "uninstall": null,
+  "browserLink": {
+    "value": "cmvkzgvfw00g8nczsh0kkhu5e.1795352761296.38EPQA2xN0DT0-Xsr7MqyQUpZXvIEmTI6NUaReJab28",
+    "expiresAt": "2026-11-22T13:06:01.296Z"
+  }
 }

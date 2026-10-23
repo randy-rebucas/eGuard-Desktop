@@ -26,6 +26,7 @@ windows-service = "0.8"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_NetworkManagement_NetManagement",
     "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_Security_Authorization",

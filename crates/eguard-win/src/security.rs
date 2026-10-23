@@ -128,8 +128,17 @@ pub(crate) fn token_sid(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> std::i
             (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid
         }
     };
+    // SAFETY: `sid` points into `buf`, alive for the call.
+    unsafe { sid_string(sid) }
+}
+
+/// A SID as a string (`S-1-5-21-…`).
+///
+/// # Safety
+/// `sid` must point at a valid SID for the duration of the call.
+pub(crate) unsafe fn sid_string(sid: windows_sys::Win32::Security::PSID) -> std::io::Result<String> {
     let mut s = null_mut();
-    // SAFETY: `sid` is valid while `buf` lives; `s` receives a LocalAlloc'd string freed below.
+    // SAFETY: the caller guarantees `sid`; `s` receives a LocalAlloc'd string freed below.
     if unsafe { ConvertSidToStringSidW(sid, &raw mut s) } == 0 {
         return Err(crate::last_error());
     }
