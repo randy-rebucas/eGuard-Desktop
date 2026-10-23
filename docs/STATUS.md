@@ -1,18 +1,72 @@
 # Status
 
-Updated 2026-10-23: Phase 4, then a session on the owner's decisions (below).
+Updated 2026-10-23: Phase 4, the owner's decisions, then a full audit and its fixes (below, branch `audit-fixes`).
 
 | Phase | What | Status |
 |---|---|---|
 | 1 | Core crate, no Windows APIs | Done |
 | 2 | Pairing, sync and the service shell | Done |
-| 3 | Scanning and identification (spec 5, 6) | Done, with the catalog gaps below for the owner |
-| 4 | Enforcement and time (spec 7, 8) | **Built and checked on this PC with stand-ins** (this commit). Tests 3–5 pass in console mode; test 6 and everything that needs SYSTEM wait for the VM (below) |
+| 3 | Scanning and identification (spec 5, 6) | Built; gate not fully met: the XPrinter driver and Discord's leftover updater are still reported (catalog gaps below) |
+| 4 | Enforcement and time (spec 7, 8) | **Built and checked on this PC with stand-ins.** Tests 3–5 pass in console mode; the gate waits for the VM: test 6, everything as SYSTEM, real games (Q3) |
 | 5 | Web (spec 9) | Next |
 | 6 | Removal protection and tamper (spec 10, 11) | Needs a VM |
 | 7 | Hardening and release readiness | Needs the code-signing certificate |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## Audit (2026-10-23, after the owner's decisions)
+
+A full audit (five reviews: Windows FFI and security, core crypto/wire/state, enforcement logic, the binaries, spec
+and wire conformance) found 1 critical, 9 high and ~20 medium/low problems. The owner said fix them all; all are
+fixed on branch `audit-fixes` except #20 (server). Wire conformance was clean: every request matches the server.
+Checks: `cargo test --workspace` 180 passed, 1 ignored (core 132 + 14 fixture, win 29, service 5); clippy and fmt
+clean; `eguard-service scan` dry run: 39 apps reported from 127 candidates. Nothing below was tried live; the VM
+items are at the end.
+
+**The root cause of the worst ones:** facts a child controls (the folder a program is in, including folders a
+forged HKCU Uninstall entry names; its file name; its product name; the file now at its path) could make
+enforcement *less* strict. Now such facts may only tighten a verdict (`enforce::resolve`, `stricter`).
+
+| # | Was | Now |
+|---|---|---|
+| 1 | Anything inside a trusted publisher's folder (incl. per-user ones in AppData) was exempt, even a BLOCKED app | Exempt by folder only under Program Files; the parent's rules first; a folder or name match may only tighten; loose exes in user-writable folders are reported (`scan::merge_with`) |
+| 2 | Console `--sandbox` ended a sandboxed program's whole tree, wherever its children ran; a reused pid could be ended | `end_tree(pid, start, keep)`: identity checked on the handle that ends it; every pid in the tree must be in the sandbox |
+| 3 | A lost `secrets.bin` turned all enforcement off | `Engine::enforces()` (paired state or secrets) drives enforcement |
+| 4 | A `ProgramData\eGuard` made first by the child stayed theirs (and secrets are DPAPI machine scope) | Owner set to SYSTEM; a folder with another owner, or a junction, is moved aside (`eGuard.untrusted-<time>`) and a new one made; temp files always new |
+| 5 | A process whose path couldn't be read once was never checked | Longer buffer, retried; after 5 s checked as an unknown unsigned program |
+| 6 | A program was judged by whatever file is at its path now; cache keyed on forgeable size+mtime | Cache keyed on volume + file id; a signed program outside Program Files counts as signed only while its file is the running one (`process::still_its_file`) |
+| 7 | A pre-created `\\.\pipe\eguard` stopped the service from enforcing; the agent trusted the real exe run in console mode | Enforcement starts first, the pipe is retried; the agent (not `--dev`) requires its server in session 0; `pair`/`accounts` check who serves |
+| 8 | Session 0 and a parent's switched-away session got the child's rules | Session 0 never enforced; disconnected sessions keep their SID (and their agent) |
+| 9 | App ids had no length cap (a 300-char product name dropped a whole `APPS_FOUND` batch or the day's `/usage`) | Capped at 200 UTF-16 units like the server; names measured in UTF-16; `UNKNOWN` category sent as `OTHER` |
+| 10 | Games signed by an untrusted publisher outside scanned folders were untracked | App Approval covers any untrusted signer outside Program Files |
+| 11 | One bad field in a protection failed the whole `/sync` | Parsed item by item; a bad one keeps the last good config |
+| 12 | A corrupt `state.json` reset the day's time, the code lockout, the clock | `state.prev.json` kept and used as fallback |
+| 13 | An old uninstall command could be replayed after an offline reboot | Checked against the clock before the response; `last_uninstall_at_ms`; the clock can't go below the last verified time |
+| 14 | The child had full access to the agent's process | Process/thread DACL: the child may only wait on it and read its name (OWNER RIGHTS too) |
+| 15 | Pipe clients could create instances; gaps with none listening; idle connections jammed it | Clients get `0x12019b`; a spare instance always listens; 5 s to send a line; client checked before reading; anonymous connect |
+| 16–17 | Silent-agent backstop missed an agent that never spoke; `AGENT_RESTARTED` unlimited, exit 0 hid a kill | Silence from the agent's start; one alert per session per 10 min; any exit but `AGENT_EXIT_SESSION_ENDING` (on `WM_ENDSESSION`) is tamper |
+| 18 | `javaw`/`python` games exempt by their runtime's signer | `RUNTIME_HOSTS` never exempt by signer |
+| 19 | Administrators could write the data folder | Administrators read-only (spec 3) |
+| low | Windows exemption covered Microsoft-signed files in user-writable folders under Windows; accessibility by signer prefix; ETW could starve the sweep; console sent "App blocked" for what it didn't end; `--sandbox` reported protections applied; service setup errors unlogged; a queue item rejected forever blocked its lane; DST repeated hour; `[::1]`; release build trusting the dev key | All fixed (`EGUARD_DEV_RELEASE=1` needed for a local release build) |
+
+**For the owner:**
+- **#20, server (not changed):** `~/eguard/src/app/api/device/v1/catalog/route.ts` takes the catalog's version from
+  the newest `updatedAt`, so deleting a row (e.g. a TRUSTED_PUBLISHER found to be bad) never reaches computers.
+  Suggest a version counter bumped on every insert, update and delete (or soft-delete rows).
+- **Spec 7 (App Approval):** it now covers signed programs from publishers the catalog doesn't trust outside Program
+  Files, not only unsigned ones; before the first catalog, signed per-user programs (OneDrive, Teams) wait for
+  approval too. Suggest the spec say so.
+- **Known limits, documented in the code:** unsigned allowed apps outside Program Files (itch.io games) share their
+  rule with any unsigned exe put in their folder; runtimes under Program Files outside a scanned app are untracked;
+  a file overwritten in place (same file id) with forged times and the program started from it again isn't caught
+  (only a content hash would); a program that updates its own exe while running outside Program Files is judged as
+  unknown until it restarts; a server outage of ~12 h gives up on the events queued at the time (50 failures).
+- **Accessibility signers** ("nv access limited", Freedom Scientific, Nuance) are exact names not yet confirmed on
+  real certificates: a wrong one loses its exemption (stricter), it doesn't exempt anything wrongly.
+
+**Needs the VM:** the data folder's owner change and move-aside (SYSTEM), the agent's process DACL (and that the
+child can still open the service's process to check it's in session 0), fast user switching, `WM_ENDSESSION` on
+sign-out, the SCM error on a setup failure, `still_its_file` as SYSTEM on a real game, the pipe retry.
 
 ## The owner's decisions (2026-10-23, after Phase 4)
 
@@ -295,7 +349,7 @@ session over the service-mode pipe.
 
 ## Open questions: recommendations
 
-From `~/eguard/docs/desktop-agent-open-questions.md`. None is settled in the spec yet.
+From `~/eguard/docs/desktop-agent-open-questions.md`. Q2, Q4 and Q5 are settled (below); the rest aren't.
 
 | # | Recommendation | State |
 |---|---|---|
@@ -340,8 +394,9 @@ has the stand-ins.
 - The session pipes check both ends (the agent believes only `eguard-service.exe` beside it; the service answers only
   `eguard-agent.exe` beside it, in that session). `eguard-agent pair|status|scan` on `\\.\pipe\eguard` still don't
   check who serves.
-- `AGENT_RESTARTED` is sent when an agent dies with a non-zero exit code while its session goes on. The service's own
-  restart still needs the guard (Phase 6) to tell a crash from a stop.
+- `AGENT_RESTARTED` is sent when an agent ends with any code but `AGENT_EXIT_SESSION_ENDING` while its session goes
+  on, at most once per session per 10 minutes. The service's own restart still needs the guard (Phase 6) to tell a
+  crash from a stop.
 - **Console mode and the owner's own programs.** A test family has App Approval on by default, so this PC's apps are
   PENDING and would be ended. Console mode ends only inside `--sandbox` and logs the rest as "would end". Never add a
   way around that. Also: the owner may be at the PC during a live check and close the screens by hand (it happened).
@@ -365,3 +420,7 @@ has the stand-ins.
   `http://localhost:3000` unless `EGUARD_SERVER_URL` is. Phase 7 must refuse to build a release with
   `keys::is_dev_build()`.
 - Line endings: this repo is LF (rustfmt). `~/eguard` mixes CRLF/LF.
+- **A release build needs `EGUARD_POLICY_PUBLIC_KEYS`** (or `EGUARD_DEV_RELEASE=1` for a local one, e.g. to measure
+  cost): `keys.rs` refuses to compile a release that would trust the dev key.
+- Console mode reports App Blocked to the parent only for programs inside `--sandbox` (what it really ends).
+- `state.prev.json` beside `state.json` is the fallback copy; both are needed to start from scratch.

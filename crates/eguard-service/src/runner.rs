@@ -359,7 +359,7 @@ impl Runner {
         if let Ok(mut d) = self.watch_dirs.lock() {
             d.clone_from(&collected.watch_dirs);
         }
-        let candidates = scan::merge(collected.candidates);
+        let candidates = scan::merge_with(collected.candidates, crate::monitor::admin_only());
         let result = scan::classify_all(classifier, &candidates);
         log::info(&format!(
             "scanned {} candidates in {:.1} s ({} files checked, {} from the cache)",
@@ -461,7 +461,7 @@ impl Runner {
         let list = eguard_win::accounts::list();
         let mut inner = self.lock();
         if let Some(names) = set {
-            if !inner.engine.is_paired() {
+            if !inner.engine.enforces() {
                 return Response::Error { message: "This computer isn't paired yet.".into() };
             }
             if names.iter().all(|n| n.trim().is_empty()) {
@@ -478,8 +478,8 @@ impl Runner {
             inner.woken = true;
             self.wake.notify_all();
         }
-        // Unpaired, no rules apply anywhere yet
-        let paired = inner.engine.is_paired();
+        // Unpaired, no rules apply anywhere yet (a computer that lost its secrets still enforces)
+        let paired = inner.engine.enforces();
         let accounts = list
             .iter()
             .map(|a| AccountInfo { name: a.name.clone(), admin: a.admin, enforced: paired && inner.engine.account_applies(&a.sid) })

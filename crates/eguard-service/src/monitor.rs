@@ -82,6 +82,21 @@ fn lower(p: &Path) -> String {
     p.to_string_lossy().trim_end_matches('\\').to_lowercase()
 }
 
+/// The Program Files folders (lower case), which only administrators can write to.
+fn program_files_dirs() -> Vec<String> {
+    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"].iter().filter_map(std::env::var_os).map(|v| lower(Path::new(&v))).collect()
+}
+
+/// For the scan (`scan::merge_with`): whether a folder is one a standard account can't write to, judged the same
+/// way as the programs the monitor sees.
+pub fn admin_only() -> impl Fn(&str) -> bool {
+    let dirs = program_files_dirs();
+    move |dir: &str| {
+        let d = lower(Path::new(dir));
+        dirs.iter().any(|p| d == *p || under(&d, p))
+    }
+}
+
 fn under(path: &str, dir: &str) -> bool {
     !dir.is_empty() && path.starts_with(dir) && path[dir.len()..].starts_with('\\')
 }
@@ -121,7 +136,7 @@ impl Facts {
         Self {
             cache: Mutex::new(HashMap::new()),
             system_root: env("SystemRoot").unwrap_or_else(|| r"c:\windows".into()),
-            program_files: ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"].iter().filter_map(|k| env(k)).collect(),
+            program_files: program_files_dirs(),
             own_dir,
         }
     }
@@ -373,7 +388,13 @@ impl Monitor {
                 if !e.applies_to(sid.as_deref()) {
                     continue;
                 }
-                if let Decision::End { app, block } = e.check(program, sample) {
+                // Console mode reports a block to the parent only for what it really ends
+                let will_end = match &self.mode {
+                    EndMode::Real => true,
+                    EndMode::Sandbox(dir) => under(&program.path.to_lowercase(), dir),
+                    EndMode::DryRun => false,
+                };
+                if let Decision::End { app, block } = e.check_with(program, sample, will_end) {
                     to_end.push((*key, app, block));
                 }
             }

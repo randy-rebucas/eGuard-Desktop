@@ -36,7 +36,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let started = std::time::Instant::now();
     let mut cache = ExeCache::new();
     let collected = eguard_win::apps::collect(&mut cache);
-    let candidates = scan::merge(collected.candidates);
+    let candidates = scan::merge_with(collected.candidates, crate::monitor::admin_only());
     let result = scan::classify_all(&classifier, &candidates);
     let events: Vec<EventEnvelope> = scan::events(None, &result.found).into_iter().map(EventEnvelope::new).collect();
 
