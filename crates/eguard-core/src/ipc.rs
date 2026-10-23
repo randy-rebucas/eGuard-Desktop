@@ -8,6 +8,10 @@
 //! One JSON object per line, each with the protocol version `v`. The service treats everything the agent sends as
 //! untrusted: a line longer than `MAX_MESSAGE_BYTES`, a version it doesn't speak or a message that doesn't parse is
 //! answered with an error and the connection closed. Nothing on the pipe ever carries a secret.
+//!
+//! The version changes only when a message's meaning does. A field added later is optional on both sides, so an
+//! older agent skips it (the overlay's app buttons: it shows the overlay without them) and a newer agent reading an
+//! older service gets the field's empty default. Either way nothing the screens enforce goes missing.
 
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +80,27 @@ pub struct Screen {
     /// The answer to the child's last ask, shown instead of the buttons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asked: Option<String>,
+    /// The overlay only: the always-allowed apps still usable now, one button each. The taskbar is under the
+    /// overlay, so these (and Alt+Tab) are how the child gets to them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apps: Vec<AppButton>,
+}
+
+/// An always-allowed app on the overlay. Pressing it brings the app's window to the front, or starts it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppButton {
+    /// The name on the button.
+    pub name: String,
+    /// The program the service saw this app run as in front of the child, full path. The agent starts or looks for
+    /// this path only, never one from anywhere else. `None` until the app has been used on this computer: the button
+    /// can't do anything then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    /// The agent may start `exe` when it isn't running. False for a Store app, which Windows starts only through the
+    /// app's own activation: its button only brings it to the front.
+    #[serde(default)]
+    pub start: bool,
 }
 
 /// A short notice ("5 minutes of gaming time left today"). Shown once: each has a new id.
@@ -235,6 +260,24 @@ mod tests {
         let line = encode(&Response::Session(view.clone()));
         assert_eq!(decode::<Response>(&line[..line.len() - 1]).unwrap(), Response::Session(view));
         assert_eq!(session_pipe_name(2), r"\\.\pipe\eguard-session-2");
+    }
+
+    #[test]
+    fn app_buttons_are_optional_both_ways() {
+        // From an older service (no buttons): the overlay still reads, with none
+        let old = br#"{"v":1,"type":"session","overlay":{"id":0,"title":"T","body":"B","askParent":false,"askTime":true}}"#;
+        let Response::Session(view) = decode::<Response>(old).unwrap() else { panic!() };
+        assert_eq!(view.overlay.unwrap().apps, Vec::<AppButton>::new());
+        // To an older agent: a field it doesn't know, which serde skips
+        let screen = Screen {
+            apps: vec![AppButton { name: "Khan Academy".into(), exe: Some(r"C:\Khan\khan.exe".into()), start: true }],
+            ..Screen::default()
+        };
+        let line = encode(&Response::Session(SessionView { overlay: Some(screen.clone()), ..SessionView::default() }));
+        let text = String::from_utf8(line.clone()).unwrap();
+        assert!(text.contains(r#""apps":[{"name":"Khan Academy","exe":"C:\\Khan\\khan.exe","start":true}]"#), "{text}");
+        let Response::Session(back) = decode::<Response>(&line[..line.len() - 1]).unwrap() else { panic!() };
+        assert_eq!(back.overlay, Some(screen));
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod etw;
 pub mod files;
 pub mod http;
 pub mod input;
+pub mod launch;
 pub mod pipe;
 pub mod process;
 pub mod registry;

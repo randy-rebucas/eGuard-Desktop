@@ -13,7 +13,7 @@
 //!                                          show a screen with sample words for a few seconds (development)
 //! ```
 
-use eguard_core::ipc::{self, AccountInfo, Request, Response, Screen, SessionView, Warning};
+use eguard_core::ipc::{self, AccountInfo, AppButton, Request, Response, Screen, SessionView, Warning};
 use eguard_win::input::{self, InputWatch};
 use eguard_win::process;
 use eguard_win::ui::{Ui, UiEvent};
@@ -205,11 +205,15 @@ fn session(args: &[String]) -> Result<(), String> {
         match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
             Ok(event) => {
                 let request = match event {
-                    UiEvent::AskParent(notice) => Request::AskParent { notice },
-                    UiEvent::AskTime(notice) => Request::AskTime { notice },
+                    UiEvent::AskParent(notice) => Some(Request::AskParent { notice }),
+                    UiEvent::AskTime(notice) => Some(Request::AskTime { notice }),
+                    // An app's button handed the focus over: the heartbeat that tells the service goes now
+                    UiEvent::Opened => None,
                 };
                 // The answer shows on the screen with the next heartbeat, which goes now
-                let _ = ask_session(&pipe_name, &service, dev, &request);
+                if let Some(request) = request {
+                    let _ = ask_session(&pipe_name, &service, dev, &request);
+                }
                 next = Instant::now();
                 continue;
             }
@@ -241,18 +245,25 @@ fn preview(args: &[String]) -> Result<(), String> {
         ask_parent: parent,
         ask_time: time,
         asked: None,
+        apps: Vec::new(),
     };
     let view = match args.first().map(String::as_str) {
-        Some("overlay") => SessionView {
-            overlay: Some(screen(
-                0,
-                "Screen time is up for today",
-                "You've used today's 2 hours. You can still use Khan Academy.",
-                false,
-                true,
-            )),
-            ..SessionView::default()
-        },
+        Some("overlay") => {
+            // Sample apps: two that start a Windows tool when pressed, a long name, and one never used here (disabled)
+            let windir = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+            let app = |name: &str, exe: Option<String>| AppButton { name: name.into(), start: exe.is_some(), exe };
+            let apps = vec![
+                app("Khan Academy", Some(format!(r"{windir}\System32\notepad.exe"))),
+                app("Duolingo", Some(format!(r"{windir}\System32\charmap.exe"))),
+                app("Encyclopaedia Britannica for Kids: the Complete Edition", Some(format!(r"{windir}\System32\notepad.exe"))),
+                app("Scratch", None),
+            ];
+            let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
+            let body = format!("You've used today's 2 hours. You can still use {}.", names.join(", "));
+            let mut overlay = screen(0, "Screen time is up for today", &body, false, true);
+            overlay.apps = apps;
+            SessionView { overlay: Some(overlay), ..SessionView::default() }
+        }
         Some("warning") => {
             SessionView { warning: Some(Warning { id: 1, text: "5 minutes of gaming time left today.".into() }), ..SessionView::default() }
         }
