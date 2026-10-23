@@ -26,7 +26,7 @@ on the owner, gotchas).
 - `crates/eguard-win`: `windows-sys` 0.61 (the same version `windows-service` uses). `WinHTTP`, DPAPI, atomic files,
   named pipe + DACL, clocks, device details, app scan sources (`apps`), Authenticode (embedded and catalog), change
   notifications, processes (`process`, `etw`), sessions (`session`: WTS), input (`input`), the agent's Win32 screens
-  (`ui`). The workspace denies `unsafe`; only this crate's FFI modules allow it.
+  (`ui`), the overlay's app buttons (`launch`: switch to or start an always-allowed app). The workspace denies `unsafe`; only this crate's FFI modules allow it.
 - `crates/eguard-service`, `eguard-agent`, `eguard-guard`: the three binaries (spec section 3). On the owner's PC the
   service runs in console mode (`eguard-service run`); `install` is for a VM. Console mode ends programs only inside
   `--sandbox DIR` (without it, it only logs what it would end): never run it so it can end the owner's own tools.

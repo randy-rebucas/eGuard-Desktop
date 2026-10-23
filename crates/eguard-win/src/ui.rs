@@ -3,7 +3,10 @@
 //!
 //! - the **overlay**: full screen over every monitor, for bedtime and the day's screen time used up, with "Ask for
 //!   more time". It stays on top and takes the focus back every second; if something else keeps the focus for
-//!   `LOCK_AFTER` anyway (a program forced above it), the session is locked (`LockWorkStation`).
+//!   `LOCK_AFTER` anyway (a program forced above it), the session is locked (`LockWorkStation`). It hides the
+//!   taskbar, so when the day's time is up it has a button for each always-allowed app still usable: pressing one
+//!   brings that app to the front or starts it (`launch`), and the overlay holds back from taking the focus for a
+//!   moment (`HAND_OVER_*`) while the service sees the app in front and lifts the overlay for it.
 //! - the **block screen**: a window naming the app eGuard just ended and why, with "Ask parent" or "Ask for more
 //!   time", and "Close".
 //! - the **warning**: a small notice in the corner at 5 and 1 minutes left, gone after a few seconds.
@@ -12,34 +15,44 @@
 //! on one thread with its own message loop; `Ui::show` hands it a new view from any thread.
 #![allow(unsafe_code)]
 
+use crate::launch::{self, Opened};
 use crate::wide::wide;
-use eguard_core::ipc::{Screen, SessionView};
+use eguard_core::ipc::{AppButton, Screen, SessionView};
 use std::cell::RefCell;
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET, DT_CENTER, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
-    DeleteObject, DrawTextW, EndPaint, FF_SWISS, FW_NORMAL, FW_SEMIBOLD, FillRect, HFONT, InvalidateRect, PAINTSTRUCT, SelectObject,
-    SetBkMode, SetTextColor, TRANSPARENT,
+    DeleteObject, DrawTextW, EndPaint, FF_SWISS, FW_NORMAL, FW_SEMIBOLD, FillRect, GetDC, GetTextExtentPoint32W, HFONT, InvalidateRect,
+    PAINTSTRUCT, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Shutdown::LockWorkStation;
 use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, BS_PUSHBUTTON, BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow, GetMessageW,
     GetSystemMetrics, GetWindowThreadProcessId, HMENU, HWND_TOPMOST, IDC_ARROW, IsDialogMessageW, IsWindowVisible, KillTimer, LoadCursorW,
     MSG, MoveWindow, PostMessageW, RegisterClassExW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+    SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, WM_APP, WM_CLOSE,
+    WM_COMMAND, WM_PAINT, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_TABSTOP,
 };
 
 /// Something else had the focus over the overlay for this long: lock the session.
 pub const LOCK_AFTER: Duration = Duration::from_secs(15);
+/// After an app's button brought its window to the front, the overlay leaves the focus alone this long: time for the
+/// next heartbeat to tell the service, which lifts the overlay while that app is in front.
+const HAND_OVER_SWITCH: Duration = Duration::from_secs(5);
+/// The same after an app's button started it: its window takes a while to come up.
+const HAND_OVER_START: Duration = Duration::from_secs(15);
+/// Buttons for always-allowed apps (the service sends at most `eguard_core::enforce::OVERLAY_APPS`).
+const APP_BUTTONS: usize = eguard_core::enforce::OVERLAY_APPS;
 /// How long a warning stays.
 const WARNING_FOR: Duration = Duration::from_secs(8);
 
@@ -51,6 +64,8 @@ const ID_ASK_PARENT: usize = 101;
 const ID_ASK_TIME: usize = 102;
 const ID_CLOSE: usize = 103;
 const ID_DEV_CLOSE: usize = 104;
+/// The first app button's id; the others follow.
+const ID_APP_FIRST: usize = 110;
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
@@ -70,6 +85,9 @@ pub enum UiEvent {
     AskParent(u64),
     /// "Ask for more time" on a block screen (`Some`) or the overlay.
     AskTime(Option<u64>),
+    /// An app's button on the overlay brought it to the front or started it: worth a heartbeat now, so the service
+    /// sees it in front and lifts the overlay sooner.
+    Opened,
 }
 
 /// The newest view, handed from the agent's loop to the UI thread.
@@ -146,6 +164,10 @@ struct State {
     dev_dismissed_overlay: bool,
     /// Since when something else has had the focus while the overlay is up.
     unfocused_since: Option<Instant>,
+    /// The overlay's app buttons, in order, and the text each shows now.
+    app_buttons: Vec<(HWND, String)>,
+    /// An app's button handed the focus to it: the overlay doesn't take it back before then.
+    handed_over_until: Option<Instant>,
 }
 
 thread_local! {
@@ -225,6 +247,9 @@ fn create(dev: bool, events: Sender<UiEvent>) -> std::io::Result<isize> {
     let overlay = create_window(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, 0, 0, 100, 100)?;
     let block = create_window(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, 0, 0, px(scale, 540), px(scale, 280))?;
     let warning = create_window(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, 0, 0, px(scale, 400), px(scale, 72))?;
+    // Made first so Tab reaches them first: they come before "Ask for more time" on the screen
+    let app_buttons: Vec<(HWND, String)> =
+        (0..APP_BUTTONS).map(|i| (create_button(overlay, ID_APP_FIRST + i, "", false), String::new())).collect();
     let mut overlay_buttons = vec![(ID_ASK_TIME, create_button(overlay, ID_ASK_TIME, "Ask for more time", true))];
     if dev {
         overlay_buttons.push((ID_DEV_CLOSE, create_button(overlay, ID_DEV_CLOSE, "Close (development build)", false)));
@@ -249,13 +274,14 @@ fn create(dev: bool, events: Sender<UiEvent>) -> std::io::Result<isize> {
         warning_id: 0,
         dev_dismissed_overlay: false,
         unfocused_since: None,
+        app_buttons,
+        handed_over_until: None,
     };
     let body_font = state.body_font;
-    for w in [&state.overlay, &state.block] {
-        for &(_, b) in &w.buttons {
-            // SAFETY: our own button; the font outlives it.
-            unsafe { SendMessageW(b, WM_SETFONT, body_font as WPARAM, 1) };
-        }
+    let all = state.overlay.buttons.iter().chain(&state.block.buttons).map(|&(_, b)| b).chain(state.app_buttons.iter().map(|(b, _)| *b));
+    for b in all {
+        // SAFETY: our own button; the font outlives it.
+        unsafe { SendMessageW(b, WM_SETFONT, body_font as WPARAM, 1) };
     }
     STATE.with(|s| *s.borrow_mut() = Some(state));
     // SAFETY: our own window; the timer runs on this thread.
@@ -375,6 +401,100 @@ fn place_buttons(w: &Window, s: &Screen, scale: f32, align: Align, row_y: i32) {
     }
 }
 
+/// How wide `text` is in the font selected into `dc`, in pixels.
+fn text_width(dc: windows_sys::Win32::Graphics::Gdi::HDC, text: &str) -> i32 {
+    let w: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE::default();
+    // SAFETY: `w` holds `w.len()` u16s; `size` is a live out-parameter; `dc` is ours until released.
+    unsafe { GetTextExtentPoint32W(dc, w.as_ptr(), w.len() as i32, &raw mut size) };
+    size.cx
+}
+
+/// `text`, cut with "…" so it fits in `max` pixels.
+fn fit_text(dc: windows_sys::Win32::Graphics::Gdi::HDC, text: &str, max: i32) -> String {
+    if text_width(dc, text) <= max {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    (0..chars.len())
+        .rev()
+        .map(|n| format!("{}…", chars[..n].iter().collect::<String>().trim_end()))
+        .find(|s| text_width(dc, s) <= max)
+        .unwrap_or_else(|| "…".to_owned())
+}
+
+/// Lays out the overlay's app buttons in one row centred on `cx` at `row_y`, at most `avail` wide: each as wide as
+/// its name within limits, a long name cut with "…". A button that can't do anything now is shown disabled.
+#[allow(clippy::too_many_arguments)]
+fn place_app_buttons(
+    overlay: HWND,
+    buttons: &mut [(HWND, String)],
+    apps: &[AppButton],
+    enabled: &[bool],
+    font: HFONT,
+    scale: f32,
+    cx: i32,
+    row_y: i32,
+    avail: i32,
+) {
+    let count = apps.len().min(buttons.len());
+    let (height, gap, pad) = (px(scale, 36), px(scale, 10), px(scale, 28));
+    let max_each = if count == 0 { 0 } else { px(scale, 240).min((avail - gap * (count as i32 - 1)) / count as i32).max(px(scale, 48)) };
+    let min_each = px(scale, 120).min(max_each);
+    // SAFETY: a DC for our own window, released below with the font it had put back.
+    let dc = unsafe { GetDC(overlay) };
+    // SAFETY: as above; the font is ours.
+    let old = unsafe { SelectObject(dc, font) };
+    let placed: Vec<(String, i32)> = apps
+        .iter()
+        .take(count)
+        .map(|a| {
+            let width = (text_width(dc, &a.name) + pad).clamp(min_each, max_each);
+            (fit_text(dc, &a.name, width - pad), width)
+        })
+        .collect();
+    // SAFETY: as above.
+    unsafe {
+        SelectObject(dc, old);
+        ReleaseDC(overlay, dc);
+    }
+    let total: i32 = placed.iter().map(|(_, w)| w).sum::<i32>() + gap * (count as i32 - 1).max(0);
+    let mut x = cx - total / 2;
+    for (i, (button, shown)) in buttons.iter_mut().enumerate() {
+        match placed.get(i) {
+            Some((text, w)) => {
+                if shown != text {
+                    let t = wide(text);
+                    // SAFETY: our own button; `t` is zero-terminated.
+                    unsafe { SetWindowTextW(*button, t.as_ptr()) };
+                    shown.clone_from(text);
+                }
+                // SAFETY: our own button.
+                unsafe {
+                    EnableWindow(*button, i32::from(enabled.get(i).copied().unwrap_or(false)));
+                    MoveWindow(*button, x, row_y, *w, height, 1);
+                    ShowWindow(*button, SW_SHOW);
+                }
+                x += w + gap;
+            }
+            // SAFETY: our own button.
+            None => unsafe {
+                ShowWindow(*button, SW_HIDE);
+            },
+        }
+    }
+}
+
+/// Whether an app's button can do anything now: start the program the service named, or bring its window forward.
+fn can_open(app: &AppButton) -> bool {
+    app.exe.as_deref().is_some_and(|exe| (app.start && launch::startable(exe).is_some()) || launch::running(exe))
+}
+
+/// How far the overlay's other buttons and words move down to make room for the app buttons' row.
+fn apps_row(s: &Screen, scale: f32) -> i32 {
+    if s.apps.is_empty() { 0 } else { px(scale, 50) }
+}
+
 /// Applies the newest view: shows, hides and lays out the three screens.
 fn apply() {
     let Some(view) = VIEW.lock().ok().and_then(|mut v| v.take()) else { return };
@@ -393,12 +513,15 @@ fn apply() {
         st.view = SessionView { overlay: overlay.clone(), block: block.clone(), warning: new_warning.clone().or(st.view.warning.clone()) };
         if overlay.is_none() {
             st.unfocused_since = None;
+            // The app a button handed over to is in front and the service lifted the overlay: done
+            st.handed_over_until = None;
         }
-        (st.overlay.hwnd, st.block.hwnd, st.warning.hwnd, overlay, block, block_is_new, new_warning.is_some(), st.scale)
+        let handing_over = st.handed_over_until.is_some_and(|t| Instant::now() < t);
+        (st.overlay.hwnd, st.block.hwnd, st.warning.hwnd, overlay, block, block_is_new, new_warning.is_some(), st.scale, handing_over)
     }) else {
         return;
     };
-    let (overlay_hwnd, block_hwnd, warning_hwnd, overlay, block, block_is_new, new_warning, scale) = plan;
+    let (overlay_hwnd, block_hwnd, warning_hwnd, overlay, block, block_is_new, new_warning, scale, handing_over) = plan;
 
     if let Some(s) = &overlay {
         // SAFETY: plain metric reads.
@@ -416,10 +539,20 @@ fn apply() {
         unsafe { MoveWindow(overlay_hwnd, vx, vy, vw, vh, 1) };
         // The words sit in the middle of the main monitor, which starts at (0, 0) in screen coordinates
         let (cx, cy) = (-vx + pw / 2, -vy + ph / 2);
-        let _ = with(|st| place_buttons(&st.overlay, s, scale, Align::Center(cx), cy + px(scale, 40)));
+        // Whether each app's button can do anything is read here, outside the state (it lists windows)
+        let enabled: Vec<bool> = s.apps.iter().map(can_open).collect();
+        let _ = with(|st| {
+            let (hwnd, font) = (st.overlay.hwnd, st.body_font);
+            let avail = pw - px(scale, 64);
+            place_app_buttons(hwnd, &mut st.app_buttons, &s.apps, &enabled, font, scale, cx, cy + px(scale, 40), avail);
+            place_buttons(&st.overlay, s, scale, Align::Center(cx), cy + px(scale, 40) + apps_row(s, scale));
+        });
         show(overlay_hwnd, true, true);
         keep_on_top(overlay_hwnd);
-        force_foreground(overlay_hwnd);
+        // An app's button just handed the focus over: leave it there until the service answers
+        if !handing_over {
+            force_foreground(overlay_hwnd);
+        }
     } else {
         show(overlay_hwnd, false, false);
     }
@@ -457,7 +590,9 @@ fn apply() {
 
 /// Every second while the overlay is up: back on top, the focus back, and the lock backstop.
 fn keep() {
-    let Some((hwnd, dev, since)) = with(|st| (st.overlay.hwnd, st.dev, st.unfocused_since)) else { return };
+    let Some((hwnd, dev, since, handed_over)) = with(|st| (st.overlay.hwnd, st.dev, st.unfocused_since, st.handed_over_until)) else {
+        return;
+    };
     // SAFETY: our own window.
     if unsafe { IsWindowVisible(hwnd) } == 0 {
         let has_overlay = with(|st| st.view.overlay.is_some()).unwrap_or(false);
@@ -468,9 +603,18 @@ fn keep() {
         show(hwnd, true, true);
     }
     keep_on_top(hwnd);
+    let now = Instant::now();
+    // An app's button handed the focus to that app: don't take it back (nor count it toward the lock) for a moment.
+    // If the service still wants the overlay once that's over, it takes the focus back as before.
+    if handed_over.is_some_and(|t| now < t) {
+        let _ = with(|st| st.unfocused_since = None);
+        return;
+    }
+    if handed_over.is_some() {
+        let _ = with(|st| st.handed_over_until = None);
+    }
     force_foreground(hwnd);
     let ours = own_window_focused();
-    let now = Instant::now();
     let since = if ours { None } else { Some(since.unwrap_or(now)) };
     let _ = with(|st| st.unfocused_since = since);
     if since.is_some_and(|t| now - t >= LOCK_AFTER) {
@@ -523,7 +667,8 @@ fn paint(hwnd: HWND) {
                     text(st.title_font, OVERLAY_TEXT, &s.title, col(p(-130), p(-60)), DT_CENTER | DT_SINGLELINE | DT_VCENTER);
                     text(st.body_font, OVERLAY_MUTED, &s.body, col(p(-50), p(30)), DT_CENTER | DT_WORDBREAK);
                     if let Some(a) = &s.asked {
-                        text(st.body_font, OVERLAY_TEXT, a, col(p(90), p(150)), DT_CENTER | DT_WORDBREAK);
+                        let down = apps_row(s, st.scale);
+                        text(st.body_font, OVERLAY_TEXT, a, col(p(90) + down, p(150) + down), DT_CENTER | DT_WORDBREAK);
                     }
                 }
                 Kind::Block => {
@@ -550,7 +695,29 @@ fn paint(hwnd: HWND) {
     }
 }
 
+/// The overlay's button for app `i`: bring it to the front or start it, then hold back from taking the focus while
+/// the service catches up.
+fn open_app(i: usize) {
+    let Some(app) = with(|st| st.view.overlay.as_ref().and_then(|o| o.apps.get(i).cloned())).flatten() else { return };
+    // Only the program the service named in this view, never a path from anywhere else
+    let Some(exe) = app.exe.as_deref() else { return };
+    let wait = match launch::open(exe, app.start) {
+        Opened::Switched => HAND_OVER_SWITCH,
+        Opened::Started => HAND_OVER_START,
+        Opened::Nothing => return,
+    };
+    let _ = with(|st| {
+        st.handed_over_until = Some(Instant::now() + wait);
+        st.unfocused_since = None;
+        let _ = st.events.send(UiEvent::Opened);
+    });
+}
+
 fn command(hwnd: HWND, id: usize) {
+    if (ID_APP_FIRST..ID_APP_FIRST + APP_BUTTONS).contains(&id) {
+        open_app(id - ID_APP_FIRST);
+        return;
+    }
     let Some(()) = with(|st| {
         let is_overlay = hwnd == st.overlay.hwnd;
         match id {
@@ -649,6 +816,7 @@ mod tests {
             ask_parent: true,
             ask_time: false,
             asked: None,
+            apps: Vec::new(),
         };
         ui.show(SessionView {
             block: Some(block),

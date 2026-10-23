@@ -16,7 +16,7 @@ Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md
 
 ## The owner's decisions (2026-10-23, after Phase 4)
 
-Approved and done: findings 2, 4, 5, 7, 8, 10, 11 and open questions Q2, Q4, Q5. Left open: findings 1, 12, 13.
+Approved and done: findings 2, 4, 5, 7, 8, 10, 11 and open questions Q2, Q4, Q5. Left open: findings 1, 12. Finding 13 was approved later the same day and built (overlay app buttons).
 
 **`~/eguard` (server): changed and tested, NOT committed.** That repo had ~60 files of the owner's own uncommitted
 work, including the files these changes touch, so a commit would have swept it in. Commit them with that work:
@@ -291,7 +291,29 @@ session over the service-mode pipe.
     publisher, never ended). The parent sees the day's total, not "Chrome 2h". Owner's call; WEB (Phase 5) may change
     the picture.
 13. **New (Phase 4): the overlay hides the taskbar.** A child reaches an always-allowed app with Alt+Tab (the overlay
-    names them). A launcher row on the overlay would be friendlier; worth a design pass.
+    names them). A launcher row on the overlay would be friendlier; worth a design pass. **Approved and built
+    2026-10-23:** see "Overlay app buttons" below.
+
+### Overlay app buttons (finding 13)
+
+When the day's screen time is up, the overlay has a row of standard buttons (Tab, MSAA "Press"), one per
+always-allowed app still usable (not paused by its own limit), at most 6 (`enforce::OVERLAY_APPS`); none at bedtime.
+`Screen.apps: [{ name, exe?, start }]` (ipc): optional, so protocol version 1 stays (an older agent skips it, an older
+service sends none). The exe is the program the service last saw **in front** as that app (`Memo.exes`, by the
+list's name, persisted, pruned to the child's list), so a helper or updater in the app's folder is never picked.
+Names are cut to 60 characters, paths over 520 bytes left out, and the buttons kept under 4 KB of JSON, so the line
+stays under 8 KB. `start` is false for a Store app (MSSTORE id or under `WindowsApps`): it's only brought forward.
+The agent (`eguard-win::launch`) acts only on that path, and only if it's a plain local `X:\…\*.exe` (no share,
+device path, `..`, quotes, streams): a window of that program in front (restored, `AllowSetForegroundWindow`), else
+`CreateProcessW` as the child, no arguments, in its folder, never elevated. The overlay then doesn't take the focus
+back for 5 s (15 s after a start) and sends a heartbeat at once; the service sees the app in front and lifts the
+overlay. A button that can't do anything (never used here, or a Store app not running) is disabled.
+Checked on this PC with `preview overlay`: the row draws (long name cut with "…", disabled one greyed), MSAA reads
+all four as push buttons, pressing one started `charmap`, and with `charmap` already open pressed brought it to the
+front without a second copy. **Needs the VM:** a real child session with the service (the overlay stepping aside
+after the press, end to end). Known gap: a UWP Store app's window belongs to `ApplicationFrameHost.exe` (Windows'),
+so the service never sees the app itself in front: its button stays disabled, and the overlay doesn't step aside
+for it either (as before).
 
 ## Open questions: recommendations
 

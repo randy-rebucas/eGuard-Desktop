@@ -15,13 +15,13 @@
 //! Anything else is "untracked": never ended, its time counts toward the day but not toward an app.
 
 use crate::clock::{ClockSample, TrustedClock};
-use crate::ipc::{Screen, SessionView, Warning};
+use crate::ipc::{AppButton, Screen, SessionView, Warning};
 use crate::localtime::{FamilyZone, LocalMoment};
 use crate::rules::{self, Block, Rules, Subject, Verdict};
 use crate::scan::launchers::Launcher;
 use crate::scan::{self, Candidate, Classifier, ExeFacts, Origin, Place, Skip};
 use crate::usage::{DayUsage, UsageApp, UsageLedger};
-use crate::wire::{AppId, AppIdKind, AppRule, AppSource, Category, DeviceEvent, FoundApp, UsageReport};
+use crate::wire::{AppId, AppIdKind, AppRule, AppSource, Approval, Category, DeviceEvent, FoundApp, UsageReport};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -41,6 +41,14 @@ const NOTICE_MERGE_MS: i64 = 30_000;
 pub const USAGE_EVERY_MS: i64 = 5 * 60_000;
 /// The server keeps 30 days of usage; older days are dropped.
 const USAGE_KEEP_DAYS: i64 = 31;
+/// At most this many always-allowed apps get a button on the overlay (one row, even on a small screen).
+pub const OVERLAY_APPS: usize = 6;
+/// An app's name on the overlay is cut to this many characters.
+const OVERLAY_NAME_MAX_CHARS: usize = 60;
+/// A program path longer than this isn't sent (Windows' usual limit is 260 characters).
+const OVERLAY_EXE_MAX_BYTES: usize = 520;
+/// The overlay's buttons take at most this much of the pipe's 8 KB line, as JSON.
+const OVERLAY_APPS_MAX_BYTES: usize = 4 * 1024;
 
 /// Accessibility tools that live outside the Windows folder, by file name and the signer that must have signed them
 /// (so a renamed game can't pass for one). Windows' own (Narrator, Magnifier, the on-screen keyboard, Voice Access)
@@ -310,6 +318,11 @@ pub struct Memo {
     /// `LIMIT_REACHED` already sent, as `date|day` or `date|<CATEGORY>`.
     #[serde(default)]
     pub limits_reported: BTreeSet<String>,
+    /// The program each app on the child's list last ran as in front of the child, by the list's name: what the
+    /// overlay's button for an always-allowed app starts or looks for. Seen in front, so it's the app's window and
+    /// not a helper or updater from its folder.
+    #[serde(default)]
+    pub exes: BTreeMap<String, String>,
 }
 
 /// Enforcement state (module docs).
@@ -381,20 +394,49 @@ fn block_screen(id: u64, app: &str, block: Block, asked: Option<String>) -> Scre
         ),
         Block::DailyLimit { minutes: m } => ("Screen time is up for today".to_owned(), format!("You've used today's {}.", minutes(m))),
     };
-    Screen { id, title, body, ask_parent: !block.is_time(), ask_time: block.is_time(), asked }
+    Screen { id, title, body, ask_parent: !block.is_time(), ask_time: block.is_time(), asked, apps: Vec::new() }
 }
 
-/// The full-screen overlay for a paused screen.
-fn overlay_screen(block: Block, asked: Option<String>, always: &[String]) -> Screen {
-    let (title, body) = match block {
-        Block::Bedtime => ("It's bedtime".to_owned(), "The computer is paused until bedtime ends.".to_owned()),
+/// The full-screen overlay for a paused screen. `always`: the always-allowed apps still usable now, named in the
+/// words and given a button each (bedtime covers them too, so it has neither).
+fn overlay_screen(block: Block, asked: Option<String>, always: Vec<AppButton>) -> Screen {
+    let (title, body, apps) = match block {
+        Block::Bedtime => ("It's bedtime".to_owned(), "The computer is paused until bedtime ends.".to_owned(), Vec::new()),
         Block::DailyLimit { minutes: m } => {
-            let still = if always.is_empty() { String::new() } else { format!(" You can still use {}.", always.join(", ")) };
-            ("Screen time is up for today".to_owned(), format!("You've used today's {}.{still}", minutes(m)))
+            let names: Vec<&str> = always.iter().map(|a| a.name.as_str()).collect();
+            let still = if names.is_empty() { String::new() } else { format!(" You can still use {}.", names.join(", ")) };
+            ("Screen time is up for today".to_owned(), format!("You've used today's {}.{still}", minutes(m)), always)
         }
         other => return block_screen(0, "This app", other, asked),
     };
-    Screen { id: 0, title, body, ask_parent: false, ask_time: true, asked }
+    Screen { id: 0, title, body, ask_parent: false, ask_time: true, asked, apps }
+}
+
+/// `name` cut to `OVERLAY_NAME_MAX_CHARS`, so a long name can't crowd the overlay's line off the pipe.
+fn short_name(name: &str) -> String {
+    match name.char_indices().nth(OVERLAY_NAME_MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", name[..cut].trim_end()),
+        None => name.to_owned(),
+    }
+}
+
+/// The overlay's button for `rule`, with the program last seen as that app in `exes`.
+fn app_button(rule: &AppRule, exes: &BTreeMap<String, String>) -> AppButton {
+    // A path too long for the pipe's line is left out: the button then does nothing, which is the safe side
+    let exe = exes.get(&rule.name).filter(|p| p.len() <= OVERLAY_EXE_MAX_BYTES).cloned();
+    // A Store app's program can't be started directly (Windows activates the package), only brought to the front
+    let store = rule.ids.iter().any(|i| i.kind == AppIdKind::Msstore)
+        || exe.as_deref().is_some_and(|p| p.to_ascii_lowercase().contains(r"\windowsapps\"));
+    AppButton { name: short_name(&rule.name), start: exe.is_some() && !store, exe }
+}
+
+/// Keeps the first buttons that fit in `OVERLAY_APPS_MAX_BYTES` of JSON, so the whole view stays under the pipe's
+/// line limit whatever the names and paths are.
+fn fit_buttons(mut apps: Vec<AppButton>) -> Vec<AppButton> {
+    while serde_json::to_vec(&apps).map_or(usize::MAX, |v| v.len()) > OVERLAY_APPS_MAX_BYTES {
+        apps.pop();
+    }
+    apps
 }
 
 fn warning_text(secs: u32, block: Block, app: Option<&str>) -> String {
@@ -428,6 +470,11 @@ impl Enforcer {
     pub fn update(&mut self, inputs: Inputs) {
         self.inputs = inputs;
         self.resolved.clear();
+        // Programs are remembered only for apps still on the child's list (so the memo can't grow without end)
+        if self.inputs.paired {
+            let apps = &self.inputs.rules.apps;
+            self.memo.exes.retain(|name, _| apps.iter().any(|r| r.name == *name));
+        }
     }
 
     /// Whether the child's rules apply in the Windows account `sid` (a session's, or a process's owner).
@@ -520,6 +567,11 @@ impl Enforcer {
             },
             _ => None,
         };
+        if let (Seen::Program(p), Some(AppMatch { rule: Some(r), .. })) = (seen, &app)
+            && self.memo.exes.get(&r.name) != Some(&p.path)
+        {
+            self.memo.exes.insert(r.name.clone(), p.path.clone());
+        }
         let counts = self.inputs.paired
             && match seen {
                 Seen::Ours => false,
@@ -586,17 +638,19 @@ impl Enforcer {
         if paused.is_none() {
             sess.overlay_asked = None;
         }
+        let exes = &self.memo.exes;
         let overlay = paused.filter(|_| !usable_here).map(|b| {
             let asked = sess.overlay_asked.as_ref().filter(|(was, _)| *was == b).map(|(_, m)| m.clone());
-            let always: Vec<String> = rules
+            // The same set the overlay steps aside for: always allowed, and not paused by bedtime or its own limit
+            let always: Vec<AppButton> = rules
                 .apps
                 .iter()
-                .filter(|r| r.approval == crate::wire::Approval::AlwaysAllowed)
+                .filter(|r| r.approval == Approval::AlwaysAllowed)
                 .filter(|r| matches!(rules::evaluate(&rules, Subject::Listed(r), &today, at, now), Verdict::Allow { .. }))
-                .map(|r| r.name.clone())
-                .take(5)
+                .take(OVERLAY_APPS)
+                .map(|r| app_button(r, exes))
                 .collect();
-            overlay_screen(b, asked, &always)
+            overlay_screen(b, asked, fit_buttons(always))
         });
 
         // The newest block screen in this session
@@ -1075,6 +1129,67 @@ mod tests {
     }
 
     #[test]
+    fn the_overlay_offers_a_button_per_usable_always_allowed_app() {
+        let always = |name: &str, limit, ids: &[AppId]| rule(name, Approval::AlwaysAllowed, limit, Category::Education, ids);
+        let store = AppId::new(AppIdKind::Msstore, "microsoft.minecrafteducation_8wekyb3d8bbwe");
+        let mut apps = vec![
+            always("Khan Academy", None, &[]),
+            // Paused by its own limit: not usable, so not offered
+            always("Duolingo", Some(1), &[]),
+            always("Minecraft Education", None, std::slice::from_ref(&store)),
+            rule("Pixel Quest", Approval::Allowed, None, Category::Games, &[]),
+        ];
+        apps.extend((1..=5).map(|n| always(&format!("Reader {n}"), None, &[])));
+        let mut r = rules_with(apps);
+        r.policy.screen_time = Some((1, 1));
+        let mut e = enforcer(r.clone());
+        let khan = program(r"C:\Users\Mia\AppData\Local\Khan\khan.exe", None, Some("Khan Academy"));
+        let minecraft = program(
+            r"C:\Program Files\WindowsApps\Microsoft.MinecraftEducation_1.0_x64__8wekyb3d8bbwe\Minecraft.Education.exe",
+            None,
+            Some("Minecraft Education"),
+        );
+        let duolingo = program(r"C:\Users\Mia\AppData\Local\Duolingo\duolingo.exe", None, Some("Duolingo"));
+        let pixel = program(r"C:\Users\Mia\Downloads\Pixel Quest\PixelQuest.exe", None, None);
+        play(&mut e, &khan, 0, 2);
+        play(&mut e, &minecraft, 3, 2);
+        play(&mut e, &duolingo, 6, 61);
+        let overlay = play(&mut e, &pixel, 68, 61).pop().unwrap().overlay.unwrap();
+        let names: Vec<&str> = overlay.apps.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["Khan Academy", "Minecraft Education", "Reader 1", "Reader 2", "Reader 3", "Reader 4"]);
+        assert!(overlay.body.ends_with(" You can still use Khan Academy, Minecraft Education, Reader 1, Reader 2, Reader 3, Reader 4."));
+        // The program seen in front: started directly, except a Store app's; one never seen can't do anything
+        assert_eq!(overlay.apps[0], AppButton { name: "Khan Academy".into(), exe: Some(khan.path.clone()), start: true });
+        assert_eq!((overlay.apps[1].exe.as_deref(), overlay.apps[1].start), (Some(minecraft.path.as_str()), false));
+        assert_eq!(overlay.apps[2], AppButton { name: "Reader 1".into(), exe: None, start: false });
+        // A block screen never has any
+        e.ended(1, "Pixel Quest", Block::DailyLimit { minutes: 1 }, at(130));
+        assert_eq!(e.heartbeat(1, Seen::Ours, 0, at(131)).block.unwrap().apps, Vec::<AppButton>::new());
+        // Remembered across restarts, for apps still on the list only
+        assert_eq!(e.memo().exes.get("Khan Academy"), Some(&khan.path));
+        r.apps.retain(|a| a.name != "Khan Academy");
+        e.update(inputs(r));
+        assert!(!e.memo().exes.contains_key("Khan Academy") && e.memo().exes.contains_key("Minecraft Education"));
+    }
+
+    #[test]
+    fn the_overlay_stays_within_the_pipes_line_limit() {
+        let long = "雪".repeat(200);
+        let apps: Vec<AppRule> =
+            (0..8).map(|n| rule(&format!("{n}{long}"), Approval::AlwaysAllowed, None, Category::Education, &[])).collect();
+        let mut r = rules_with(apps.clone());
+        r.policy.screen_time = Some((1, 1));
+        let mut e = enforcer(r);
+        e.memo.exes = apps.iter().map(|a| (a.name.clone(), format!(r"C:\{}\app.exe", "\"\\".repeat(170)))).collect();
+        let pixel = program(r"C:\Users\Mia\Downloads\Pixel Quest\PixelQuest.exe", None, None);
+        let view = play(&mut e, &pixel, 0, 61).pop().unwrap();
+        let overlay = view.overlay.as_ref().unwrap();
+        assert!(!overlay.apps.is_empty() && overlay.apps.len() <= OVERLAY_APPS);
+        assert_eq!(overlay.apps[0].name, format!("0{}…", "雪".repeat(59)));
+        assert!(crate::ipc::encode(&crate::ipc::Response::Session(view.clone())).len() <= crate::ipc::MAX_MESSAGE_BYTES);
+    }
+
+    #[test]
     fn bedtime_pauses_everything_and_extra_time_lifts_it() {
         let mut r = rules_with(vec![rule("Khan Academy", Approval::AlwaysAllowed, None, Category::Education, &[])]);
         // 15:00 to 16:00 every day, in Manila
@@ -1082,7 +1197,9 @@ mod tests {
         let mut e = enforcer(r.clone());
         let khan = program(r"C:\Users\Mia\AppData\Local\Khan\khan.exe", None, Some("Khan Academy"));
         assert_eq!(e.check(&khan, at(0)), Decision::End { app: "Khan Academy".into(), block: Block::Bedtime });
-        assert_eq!(e.heartbeat(1, Seen::Program(&khan), 0, at(1)).overlay.unwrap().title, "It's bedtime");
+        let overlay = e.heartbeat(1, Seen::Program(&khan), 0, at(1)).overlay.unwrap();
+        // Bedtime covers always-allowed apps too: no buttons for them
+        assert_eq!((overlay.title.as_str(), overlay.apps.len()), ("It's bedtime", 0));
         r.extra_time_until_ms = Some(at(0).wall_ms + 10 * 60_000);
         e.update(inputs(r));
         assert_eq!(e.check(&khan, at(2)), Decision::Allow);
