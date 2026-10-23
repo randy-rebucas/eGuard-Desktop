@@ -179,6 +179,12 @@ pub fn session_pipe_sddl(logon_sid: &str) -> String {
     format!("D:P(A;;GA;;;SY)(A;;{CLIENT_RIGHTS};;;{logon_sid})")
 }
 
+/// A session's pipe in console mode: also the user running the service, who must create its instances (as SYSTEM
+/// does in a real install; the logon SID's rights don't include that).
+pub fn console_session_pipe_sddl(logon_sid: &str, user_sid: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})(A;;{CLIENT_RIGHTS};;;{logon_sid})")
+}
+
 /// The process at the other end of a connection the server accepted.
 pub fn client_pid(conn: &File) -> Option<u32> {
     use std::os::windows::io::AsRawHandle;

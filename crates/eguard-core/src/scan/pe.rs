@@ -68,9 +68,28 @@ pub fn is_graphics_import(dll: &str) -> bool {
         || d.starts_with("xinput")
 }
 
+/// A web browser's engine, as its main program imports it: Chromium's early-start DLL (`chrome_elf.dll`,
+/// `msedge_elf.dll`, and the same file under other names in Chromium's forks) or Gecko's `mozglue.dll`. The import is
+/// part of the program: without it the browser doesn't start. Apps built on Chromium (Electron, CEF) don't import
+/// either from their own exe, even where a `chrome_elf.dll` ships beside it.
+pub fn is_browser_import(dll: &str) -> bool {
+    let d = dll.to_ascii_lowercase();
+    d == "mozglue.dll" || d.strip_suffix("_elf.dll").is_some_and(|stem| !stem.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_engines_by_import() {
+        for dll in ["chrome_elf.dll", "MSEDGE_ELF.DLL", "opera_elf.dll", "mozglue.dll"] {
+            assert!(is_browser_import(dll), "{dll}");
+        }
+        for dll in ["_elf.dll", "elf.dll", "libcef.dll", "kernel32.dll", "mozglue.dll.bak", "d3d11.dll"] {
+            assert!(!is_browser_import(dll), "{dll}");
+        }
+    }
 
     /// A minimal PE32+ with one section holding an import table that names `dlls`.
     fn pe_with_imports(dlls: &[&str]) -> Vec<u8> {

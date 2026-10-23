@@ -183,13 +183,17 @@ pub fn supervise(shared: &Arc<Shared>) {
             let logon = if shared.console { security::current_logon_sid() } else { session::logon_sid(s.id) };
             match logon {
                 Ok(sid) if t.sid != sid => {
+                    let sddl = match (shared.console, security::current_user_sid()) {
+                        (true, Ok(me)) => pipe::console_session_pipe_sddl(&sid, &me),
+                        _ => pipe::session_pipe_sddl(&sid),
+                    };
                     let slot = pipes.entry(s.id).or_insert_with(|| {
                         let slot = Arc::new(Mutex::new(None));
                         let (sh, sl, id) = (Arc::clone(shared), Arc::clone(&slot), s.id);
                         let _ = std::thread::Builder::new().name(format!("session-{id}")).spawn(move || serve(&sh, id, &sl));
                         slot
                     });
-                    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(pipe::session_pipe_sddl(&sid));
+                    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(sddl);
                     t.sid = sid;
                     // A new sign-in in this session: it gets its agent now
                     t.ending_since = None;

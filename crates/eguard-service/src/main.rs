@@ -20,6 +20,7 @@ mod scan;
 mod sessions;
 mod store;
 mod svc;
+mod web;
 
 use eguard_core::api::ServerUrl;
 use eguard_core::keys;
@@ -91,7 +92,7 @@ fn console(args: &[String]) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: eguard-service run [--server URL] [--data-dir DIR] [--sandbox DIR] | install | uninstall".into()
+    "usage: eguard-service run [--server URL] [--data-dir DIR] [--sandbox DIR] | scan | web | install | uninstall".into()
 }
 
 fn main() {
@@ -100,7 +101,13 @@ fn main() {
         Some("run") => console(&args[1..]),
         Some("scan") => scan::run(&args[1..]),
         Some("install") => svc::install().map(|()| println!("eGuard service installed and started")),
-        Some("uninstall") => svc::uninstall().map(|()| println!("eGuard service removed")),
+        Some("uninstall") => {
+            svc::uninstall().and_then(|()| web::remove_machine()).map(|()| println!("eGuard service and its browser policies removed"))
+        }
+        Some("web") => {
+            web::show();
+            Ok(())
+        }
         Some(_) => Err(usage()),
         // No arguments: Windows started us. If not, the dispatcher fails at once and we say how to run it
         None => svc::dispatch().map_err(|_| usage()),

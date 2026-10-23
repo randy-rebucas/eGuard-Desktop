@@ -1,12 +1,16 @@
-//! Reading the registry: values under HKLM, and walking keys (Uninstall entries, each user's hive).
+//! The registry: values under HKLM, walking keys (Uninstall entries, each user's hive), and writing the browser
+//! policies (`browsers`).
 #![allow(unsafe_code)]
 
 use crate::wide::{from_wide, wide};
+use std::collections::BTreeMap;
+use std::io;
 use std::ptr::{null, null_mut};
-use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, WIN32_ERROR};
 use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey,
-    RegEnumKeyExW, RegGetValueW, RegOpenKeyExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY, KEY_WRITE, REG_DWORD,
+    REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW,
+    RegEnumKeyExW, RegEnumValueW, RegGetValueW, RegOpenKeyExW, RegSetValueExW,
 };
 
 /// Which half of the registry on 64-bit Windows: 32-bit programs' entries live under `WOW6432Node`.
@@ -20,6 +24,24 @@ pub enum View {
 pub enum Root {
     LocalMachine,
     Users,
+    /// The account running this program's own hive.
+    CurrentUser,
+}
+
+fn root_key(root: Root) -> HKEY {
+    match root {
+        Root::LocalMachine => HKEY_LOCAL_MACHINE,
+        Root::Users => HKEY_USERS,
+        Root::CurrentUser => HKEY_CURRENT_USER,
+    }
+}
+
+fn view_flag(view: View) -> u32 {
+    if view == View::Wow32 { KEY_WOW64_32KEY } else { KEY_WOW64_64KEY }
+}
+
+fn check(rc: WIN32_ERROR) -> io::Result<()> {
+    if rc == ERROR_SUCCESS { Ok(()) } else { Err(io::Error::from_raw_os_error(rc as i32)) }
 }
 
 /// An open key, closed on drop.
@@ -39,16 +61,34 @@ impl Drop for Key {
 impl Key {
     /// Opens `path` under `root` for reading. `None` when it doesn't exist or isn't readable.
     pub fn open(root: Root, path: &str, view: View) -> Option<Self> {
-        let root = match root {
-            Root::LocalMachine => HKEY_LOCAL_MACHINE,
-            Root::Users => HKEY_USERS,
+        Self::open_under(root_key(root), path, view)
+    }
+
+    /// Opens `path` under `root` for reading and writing, creating it (and the keys above it) when missing.
+    pub fn create(root: Root, path: &str, view: View) -> io::Result<Self> {
+        let p = wide(path);
+        let mut out: HKEY = null_mut();
+        // SAFETY: `p` is zero-terminated; no class, default security (inherited from the parent key); `out`
+        // receives a key we close on drop; the disposition isn't wanted.
+        let rc = unsafe {
+            RegCreateKeyExW(
+                root_key(root),
+                p.as_ptr(),
+                0,
+                null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_READ | KEY_WRITE | view_flag(view),
+                null(),
+                &raw mut out,
+                null_mut(),
+            )
         };
-        Self::open_under(root, path, view)
+        check(rc).map(|()| Self(out))
     }
 
     fn open_under(parent: HKEY, path: &str, view: View) -> Option<Self> {
         let p = wide(path);
-        let sam = KEY_READ | if view == View::Wow32 { KEY_WOW64_32KEY } else { KEY_WOW64_64KEY };
+        let sam = KEY_READ | view_flag(view);
         let mut out: HKEY = null_mut();
         // SAFETY: `p` is zero-terminated; `out` receives a key we close on drop.
         let rc = unsafe { RegOpenKeyExW(parent, p.as_ptr(), 0, sam, &raw mut out) };
@@ -91,6 +131,75 @@ impl Key {
 
     pub fn dword(&self, value: &str) -> Option<u32> {
         get_dword(self.0, value)
+    }
+
+    /// The `REG_SZ` values, by name (at most 10 000; values of other types are left out).
+    pub fn strings(&self) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        let mut name = [0u16; 512];
+        for i in 0..10_000 {
+            let mut len = name.len() as u32;
+            let mut kind = 0u32;
+            // SAFETY: `name` is writable for `len` characters; only the name and type are asked for (data pointers
+            // null), so nothing else is written.
+            let rc = unsafe { RegEnumValueW(self.0, i, name.as_mut_ptr(), &raw mut len, null(), &raw mut kind, null_mut(), null_mut()) };
+            match rc {
+                ERROR_SUCCESS if kind == REG_SZ => {
+                    let n = from_wide(&name[..len as usize]);
+                    if let Some(v) = get_string(self.0, &n) {
+                        out.insert(n, v);
+                    }
+                }
+                ERROR_SUCCESS | ERROR_MORE_DATA => {}
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// Writes a `REG_SZ`.
+    pub fn set_string(&self, value: &str, data: &str) -> io::Result<()> {
+        let v = wide(value);
+        let d = wide(data);
+        let bytes = u32::try_from(d.len() * 2).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: `v` and `d` are zero-terminated and outlive the call; `bytes` is `d`'s size, terminator included.
+        check(unsafe { RegSetValueExW(self.0, v.as_ptr(), 0, REG_SZ, d.as_ptr().cast(), bytes) })
+    }
+
+    /// Writes a `REG_DWORD`.
+    pub fn set_dword(&self, value: &str, data: u32) -> io::Result<()> {
+        let v = wide(value);
+        // SAFETY: `v` is zero-terminated; the data is 4 bytes, as REG_DWORD needs.
+        check(unsafe { RegSetValueExW(self.0, v.as_ptr(), 0, REG_DWORD, (&raw const data).cast(), 4) })
+    }
+
+    /// Deletes a value. One that isn't there is fine.
+    pub fn delete_value(&self, value: &str) -> io::Result<()> {
+        let v = wide(value);
+        // SAFETY: `v` is zero-terminated.
+        match unsafe { RegDeleteValueW(self.0, v.as_ptr()) } {
+            ERROR_FILE_NOT_FOUND => Ok(()),
+            rc => check(rc),
+        }
+    }
+
+    /// Deletes the subkey `path` and everything under it. One that isn't there is fine.
+    pub fn delete_tree(&self, path: &str) -> io::Result<()> {
+        let p = wide(path);
+        // SAFETY: `p` is zero-terminated; this key was opened with write access (`create`), which the call needs.
+        match unsafe { RegDeleteTreeW(self.0, p.as_ptr()) } {
+            ERROR_FILE_NOT_FOUND => Ok(()),
+            rc => check(rc),
+        }
+    }
+
+    /// True when the key has no values and no subkeys.
+    pub fn is_empty(&self) -> bool {
+        let mut name = [0u16; 2];
+        let mut len = name.len() as u32;
+        // SAFETY: as in `strings`; an empty key answers ERROR_NO_MORE_ITEMS at once, any value or a long name doesn't.
+        let rc = unsafe { RegEnumValueW(self.0, 0, name.as_mut_ptr(), &raw mut len, null(), null_mut(), null_mut(), null_mut()) };
+        rc == ERROR_NO_MORE_ITEMS && self.subkeys().is_empty()
     }
 }
 

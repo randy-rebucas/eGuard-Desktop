@@ -24,4 +24,5 @@ pub mod signature;
 pub mod state;
 pub mod store;
 pub mod usage;
+pub mod web;
 pub mod wire;

@@ -14,7 +14,7 @@
 use crate::registry::{Key, Root, View};
 use crate::{authenticode, version};
 use eguard_core::scan::launchers::{self, Launcher};
-use eguard_core::scan::{CachedExe, Candidate, ExeCache, ExeFacts, Origin, is_maintenance_exe, pe};
+use eguard_core::scan::{CachedExe, Candidate, ExeCache, ExeFacts, FACTS_VERSION, Origin, is_maintenance_exe, pe};
 use eguard_core::wire::{AppId, AppIdKind};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -187,14 +187,15 @@ fn main_exe(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
 
 /// Signature, product name and imports of one file, checked now (callers cache it by path, size and time).
 pub fn exe_facts(path: &Path) -> ExeFacts {
-    let graphics = read_head(path).and_then(|b| pe::imports(&b)).is_some_and(|dlls| dlls.iter().any(|d| pe::is_graphics_import(d)));
+    let imports = read_head(path).and_then(|b| pe::imports(&b)).unwrap_or_default();
     let signer = authenticode::signer_names(path);
     ExeFacts {
         file_name: path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default(),
         signer: signer.as_ref().and_then(|s| s.name().map(str::to_owned)),
         signer_alt: signer.as_ref().and_then(|s| s.alternative().map(str::to_owned)),
         product: if is_exe(path) { version::product_name(path) } else { None },
-        graphics,
+        graphics: imports.iter().any(|d| pe::is_graphics_import(d)),
+        browser: imports.iter().any(|d| pe::is_browser_import(d)),
     }
 }
 
@@ -321,7 +322,8 @@ impl Collector<'_> {
         // The file's identity is part of the key: another file put at this path is checked afresh
         let key = format!("{}|{}", lower(path), id.tag());
         self.used.insert(key.clone());
-        if let Some(c) = self.cache.get(&key).filter(|c| c.size == id.size && c.modified_ms == id.modified_ms) {
+        if let Some(c) = self.cache.get(&key).filter(|c| c.size == id.size && c.modified_ms == id.modified_ms && c.version == FACTS_VERSION)
+        {
             self.out.cache_hits += 1;
             return Some(c.facts.clone());
         }
@@ -329,7 +331,7 @@ impl Collector<'_> {
         let facts = exe_facts(path);
         // Kept only when the file checked is still the one identified before (not swapped while it was read)
         if file_identity(path) == Some(id) {
-            self.cache.insert(key, CachedExe { size: id.size, modified_ms: id.modified_ms, facts: facts.clone() });
+            self.cache.insert(key, CachedExe { size: id.size, modified_ms: id.modified_ms, facts: facts.clone(), version: FACTS_VERSION });
         }
         Some(facts)
     }

@@ -4,7 +4,9 @@
 //! 1. A GAME entry in the catalog (launcher id, exe name, signer, product name): reported under the catalog's name.
 //! 2. Installed through a game launcher: reported, as a game.
 //! 3. Signed (valid Authenticode) by a `TRUSTED_PUBLISHER`: not reported, never blocked.
-//! 4. Anything else: reported as from an unknown publisher; a game when it shows game signals.
+//! 4. Anything else: reported as from an unknown publisher; a browser when its program imports a browser engine
+//!    (spec section 9: eGuard's extension runs in Chrome, Edge and Firefox only, which their publishers sign), else a
+//!    game when it shows game signals.
 //!
 //! The platform has already left out what never counts: system components, updates, and anything under the
 //! Windows folder (drivers and Windows' own apps live there, and a standard account can't install into it).
@@ -51,7 +53,13 @@ pub struct ExeFacts {
     pub product: Option<String>,
     /// Imports DirectX or Vulkan (`pe::is_graphics_import`).
     pub graphics: bool,
+    /// Imports a web browser's engine (`pe::is_browser_import`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub browser: bool,
 }
+
+/// What `ExeFacts` holds, by version: a cached entry from an older version lacks a fact and is checked again.
+pub const FACTS_VERSION: u32 = 1;
 
 /// `ExeFacts` for a file as it was: a changed size or modification time means it's checked again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +68,9 @@ pub struct CachedExe {
     pub size: u64,
     pub modified_ms: i64,
     pub facts: ExeFacts,
+    /// `FACTS_VERSION` when it was checked (0: before `browser`).
+    #[serde(default)]
+    pub version: u32,
 }
 
 /// Facts by lower-case path. Persisted; entries a scan didn't use are dropped after it.
@@ -262,8 +273,16 @@ impl Classifier {
         } else if let Some(s) = c.signers().find(|s| self.trusted.contains(*s)) {
             return Err(Skip::TrustedPublisher(s.to_owned()));
         } else {
+            let browser = c.exe.as_ref().is_some_and(|e| e.browser);
             let game = c.game_files || c.exe.as_ref().is_some_and(|e| e.graphics) || says_game(&c.name);
-            (c.name.as_str(), AppSource::UnknownPublisher, if game { Category::Games } else { Category::Other })
+            let category = if browser {
+                Category::Browsers
+            } else if game {
+                Category::Games
+            } else {
+                Category::Other
+            };
+            (c.name.as_str(), AppSource::UnknownPublisher, category)
         };
         let app = wire::app_name(name).ok_or(Skip::BlankName)?;
         Ok(FoundApp { app, ids, source: Some(source), category: Some(category) })
@@ -594,6 +613,25 @@ mod tests {
         tg.exe = exe("telegram.exe", Some("telegram fz-llc"), Some("Telegram Desktop"));
         assert_eq!(c.classify(&tg).unwrap().source, Some(AppSource::UnknownPublisher));
         assert!(says_game("Some Game") && says_game("GAMES hub") && !says_game("Gamepad Tester"));
+    }
+
+    #[test]
+    fn a_browser_the_extension_cant_run_in_is_reported_as_one() {
+        let c = classifier();
+        let browser = |name: &str, signer: Option<&str>| {
+            let mut b = Candidate::new(name, Origin::Uninstall);
+            b.exe = exe("browser.exe", signer, Some(name));
+            b.exe.as_mut().unwrap().browser = true;
+            b
+        };
+        assert_eq!(c.classify(&browser("Opera GX Stable", Some("opera norway as"))).unwrap().category, Some(Category::Browsers));
+        assert_eq!(c.classify(&browser("Tor Browser", None)).unwrap().category, Some(Category::Browsers));
+        // Before game signals: a browser that imports DirectX is still a browser
+        let mut gx = browser("Opera GX", None);
+        gx.game_files = true;
+        assert_eq!(c.classify(&gx).unwrap().category, Some(Category::Browsers));
+        // A trusted publisher's (Edge, and WebView2, which imports Edge's engine too) is left out as before
+        assert!(c.classify(&browser("Microsoft Edge WebView2 Runtime", Some("microsoft corporation"))).is_err());
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! - the pipe (`\\.\pipe\eguard`): pairing, status, scans;
 //! - scans, on a thread of their own when due;
 //! - the process monitor (`monitor`): ending what the rules say to end;
-//! - the session supervisor (`sessions`): an agent and a pipe per signed-in session.
+//! - the session supervisor (`sessions`): an agent and a pipe per signed-in session;
+//! - the browsers' policies (`web`), after every tick.
 //!
 //! The engine (sync state) and the enforcer (rules in force, usage) each sit behind their own lock, so ending a
 //! program never waits for a network call. After each tick the loop hands the enforcer the newest rules, and takes
@@ -14,6 +15,7 @@ use crate::log;
 use crate::monitor::{self, EndMode, Facts, Monitor};
 use crate::sessions::{self, Shared};
 use crate::store::Store;
+use crate::web::Browsers;
 use eguard_core::accounts::AccountChoice;
 use eguard_core::api::{Api, ServerUrl};
 use eguard_core::enforce::{Enforcer, Memo};
@@ -45,13 +47,14 @@ pub enum Mode {
 
 /// What this build can do (spec section 11). The AVAILABLE protections are reported applied only by the service,
 /// which ends programs anywhere. Console mode ends them only inside `--sandbox` (or not at all), so it reports them
-/// as not applied, which is the truth: the parent mustn't be told a developer's PC is protected. The guided ones
-/// are reported off, with why, until Phases 5 and 6.
+/// as not applied, which is the truth: the parent mustn't be told a developer's PC is protected. Removal protection
+/// is reported off, with why, until Phase 6. Web filtering starts off and is decided after the browsers are set up
+/// (`apply_web`), before the first sync.
 fn capabilities(enforcing: bool) -> Capabilities {
     Capabilities {
         enforced: if enforcing { AVAILABLE.into_iter().collect() } else { std::collections::BTreeSet::new() },
         uninstall_protection: Err("Removal protection isn't in this version of eGuard for Windows yet.".into()),
-        web: Err("This version of eGuard for Windows doesn't set up the browser extension yet.".into()),
+        web: Err("eGuard hasn't set up its browser extension on this computer yet.".into()),
     }
 }
 
@@ -125,6 +128,7 @@ pub struct Runner {
     scanning: AtomicBool,
     /// Launcher folders the last scan found, for the watcher.
     watch_dirs: Arc<Mutex<Vec<PathBuf>>>,
+    browsers: Browsers,
 }
 
 fn log_notes(engine: &mut Engine) {
@@ -143,6 +147,8 @@ impl Runner {
         let api = Api::new(opts.server, Box::new(transport));
         let (state, secrets) = opts.store.load();
         let enforcing = opts.mode == Mode::Service;
+        let browsers =
+            Browsers::new(if enforcing { eguard_win::browsers::Place::machine() } else { eguard_win::browsers::Place::development() });
         let mut engine = Engine::new(state, secrets, api, keys, capabilities(enforcing));
         log_notes(&mut engine);
         // Usage and what enforcement remembers move to the enforcer; they're copied back at every save
@@ -168,6 +174,7 @@ impl Runner {
             poked: AtomicBool::new(false),
             scanning: AtomicBool::new(false),
             watch_dirs: Arc::new(Mutex::new(Vec::new())),
+            browsers,
         }))
     }
 
@@ -240,6 +247,8 @@ impl Runner {
                 self.save(&mut inner);
             }
             log_notes(&mut inner.engine);
+            // Before the first sync, so its report already says whether web filtering holds
+            self.apply_web(&mut inner);
         }
 
         let mut next_tick = Instant::now();
@@ -257,7 +266,8 @@ impl Runner {
                 inner.engine.observe_accounts(&eguard_win::accounts::list(), now);
                 log_notes(&mut inner.engine);
                 self.enforcer().update(inner.engine.enforce_inputs());
-                if tick.changed {
+                let web_changed = self.apply_web(&mut inner);
+                if tick.changed || web_changed {
                     self.save(&mut inner);
                 }
                 self.start_scan_if_due(&mut inner);
@@ -274,6 +284,20 @@ impl Runner {
         self.save(&mut inner);
         log::info("stopped");
         Ok(())
+    }
+
+    /// Forces eGuard's extension in each browser, with the link from the last sync, and tells the engine whether web
+    /// filtering holds (what `/report` says). Nothing before pairing. True when that changed (a report is queued, and
+    /// sent at the next tick).
+    fn apply_web(&self, inner: &mut Inner) -> bool {
+        if !inner.engine.enforces() {
+            return false;
+        }
+        let now = inner.engine.now_ms(clock::sample());
+        let setup = self.browsers.apply(inner.engine.browser_link(), now);
+        let held = eguard_core::web::capability(self.mode == Mode::Service, &setup);
+        let info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
+        inner.engine.set_web(held, &info, now)
     }
 
     fn start_watcher(self: &Arc<Self>) {
@@ -534,6 +558,8 @@ impl Runner {
             *e = Enforcer::new(UsageLedger::default(), Memo::default());
             e.update(inner.engine.enforce_inputs());
         }
+        self.browsers.forget_link();
+        self.apply_web(&mut inner);
         self.save(&mut inner);
         inner.woken = true;
         self.wake.notify_all();

@@ -13,7 +13,7 @@
 use crate::localtime::LocalMoment;
 use crate::usage::DayUsage;
 use crate::wire::{
-    AppRule, Approval, BedtimeDays, Category, CategoryLimit, PolicyEntry, ProtectionConfig, SyncResponse, TimeRequestReason,
+    AppRule, Approval, BedtimeDays, Category, CategoryLimit, PolicyEntry, ProtectionConfig, SyncResponse, TimeRequestReason, WebMode,
 };
 
 /// How far ahead `seconds_left` looks for a bedtime about to start (warnings are at 5 and 1 minutes).
@@ -80,6 +80,9 @@ pub struct Policy {
     pub bedtime: Option<Bedtime>,
     /// App Approval on, or Downloads "parent approval": new apps wait for the parent.
     pub approval_required: bool,
+    /// Web filtering on (any mode but off, including one this build doesn't know): a browser eGuard's extension
+    /// can't run in waits for the parent (spec section 9).
+    pub web_filter: bool,
 }
 
 impl Policy {
@@ -91,6 +94,7 @@ impl Policy {
                 c @ ProtectionConfig::Bedtime { .. } => p.bedtime = Bedtime::from_config(c),
                 ProtectionConfig::AppApproval { enabled } => p.approval_required |= *enabled,
                 ProtectionConfig::Downloads { require_approval } => p.approval_required |= *require_approval,
+                ProtectionConfig::Web { mode, .. } => p.web_filter = *mode != WebMode::Off,
                 _ => {}
             }
         }
@@ -170,6 +174,9 @@ pub enum Block {
     Pending,
     /// Not on the list, and approval is on: send `APP_REQUESTED`, then it's pending.
     NeedsApproval,
+    /// A browser eGuard's extension can't run in, not on the list while web filtering is on: like `NeedsApproval`,
+    /// whether or not approval is on, since websites in it would go unfiltered.
+    Browser,
     Bedtime,
     AppLimit {
         minutes: u32,
@@ -186,7 +193,7 @@ pub enum Block {
 impl Block {
     /// Paused for time (extra time lifts it), rather than not allowed at all.
     pub fn is_time(self) -> bool {
-        !matches!(self, Block::Blocked | Block::Pending | Block::NeedsApproval)
+        !matches!(self, Block::Blocked | Block::Pending | Block::NeedsApproval | Block::Browser)
     }
 
     /// "Ask for more time" sends `TIME_REQUESTED` with this reason.
@@ -244,6 +251,9 @@ fn time_rules(rules: &Rules, subject: Subject<'_>, always: bool, today: &DayUsag
 fn approval_of(rules: &Rules, subject: Subject<'_>) -> Result<bool, Block> {
     let approval = match subject {
         Subject::Listed(a) => a.approval,
+        Subject::Unlisted { category, .. } if rules.policy.web_filter && category.effective() == Category::Browsers => {
+            return Err(Block::Browser);
+        }
         Subject::Unlisted { .. } if rules.policy.approval_required => return Err(Block::NeedsApproval),
         Subject::Unlisted { .. } => Approval::Allowed,
     };
@@ -417,7 +427,12 @@ mod tests {
 
     fn rules() -> Rules {
         Rules {
-            policy: Policy { screen_time: Some((120, 180)), bedtime: Some(bed(true, "21:00", "07:00")), approval_required: false },
+            policy: Policy {
+                screen_time: Some((120, 180)),
+                bedtime: Some(bed(true, "21:00", "07:00")),
+                approval_required: false,
+                web_filter: false,
+            },
             apps: vec![
                 rule("Roblox", Approval::Allowed, Some(60), Category::Games),
                 rule("Minecraft", Approval::Allowed, None, Category::Games),
@@ -511,6 +526,34 @@ mod tests {
         assert_eq!(verdict(&r, "Something New", &usage(&[]), &moment(THU, "15:00")), Verdict::Block(Block::NeedsApproval));
         // Listed apps are unaffected
         assert!(matches!(verdict(&r, "Minecraft", &usage(&[]), &moment(THU, "15:00")), Verdict::Allow { .. }));
+    }
+
+    #[test]
+    fn web_filtering_makes_other_browsers_wait_even_without_approval() {
+        let at = moment(THU, "15:00");
+        let opera = |r: &Rules| evaluate(r, Subject::Unlisted { name: "Opera", category: Category::Browsers }, &usage(&[]), &at, 0);
+        let mut r = rules();
+        assert!(matches!(opera(&r), Verdict::Allow { .. }));
+        r.policy = Policy::from_entries(&[PolicyEntry {
+            key: crate::wire::ProtectionKey::Web,
+            config: ProtectionConfig::Web { mode: WebMode::Filter, blocked_sites: 0 },
+        }]);
+        assert!(r.policy.web_filter && !r.policy.approval_required);
+        assert_eq!(opera(&r), Verdict::Block(Block::Browser));
+        r.policy.approval_required = true;
+        assert_eq!(opera(&r), Verdict::Block(Block::Browser));
+        // Another unlisted app waits only for approval
+        let other = evaluate(&r, Subject::Unlisted { name: "Tool", category: Category::Other }, &usage(&[]), &at, 0);
+        assert_eq!(other, Verdict::Block(Block::NeedsApproval));
+        // A mode this build doesn't know still filters; off doesn't
+        let web = |mode| {
+            Policy::from_entries(&[PolicyEntry {
+                key: crate::wire::ProtectionKey::Web,
+                config: ProtectionConfig::Web { mode, blocked_sites: 0 },
+            }])
+        };
+        assert!(web(WebMode::Unknown).web_filter && web(WebMode::Allowlist).web_filter && !web(WebMode::Off).web_filter);
+        assert!(!Block::Browser.is_time());
     }
 
     #[test]

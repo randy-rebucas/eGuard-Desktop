@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-10-23: Phase 4, the owner's decisions, then a full audit and its fixes (below, branch `audit-fixes`).
+Updated 2026-10-24: Phase 5 (web), below. Before it: Phase 4, the owner's decisions, a full audit and its fixes.
 
 | Phase | What | Status |
 |---|---|---|
@@ -8,11 +8,94 @@ Updated 2026-10-23: Phase 4, the owner's decisions, then a full audit and its fi
 | 2 | Pairing, sync and the service shell | Done |
 | 3 | Scanning and identification (spec 5, 6) | Done: the last two the gate left (the XPrinter driver, Discord's leftover updater) are left out since 2026-10-23 (`scan::left_out`) |
 | 4 | Enforcement and time (spec 7, 8) | **Built and checked on this PC with stand-ins.** Tests 3–5 pass in console mode; the gate waits for the VM: test 6, everything as SYSTEM, real games (Q3) |
-| 5 | Web (spec 9) | Next |
-| 6 | Removal protection and tamper (spec 10, 11) | Needs a VM |
+| 5 | Web (spec 9) | **Built and checked on this PC** with a stand-in browser and an inert copy of the policies. The prompt gives no "Done when"; real browsers wait for the VM and for the extension's store ids, and 6 items wait for the owner (below) |
+| 6 | Removal protection and tamper (spec 10, 11) | Next. Needs a VM |
 | 7 | Hardening and release readiness | Needs the code-signing certificate |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## Phase 5: what was built (2026-10-24)
+
+Writing browser policies on this PC is on the prompt's "ask me first" list, so nothing here touches HKLM: the service
+(SYSTEM) writes the real policies; console mode writes the same layout under HKCU `Software\eGuard\Dev\Policies`,
+which no browser reads.
+
+| Crate / module | What it does |
+|---|---|
+| core `web` | The extension in each browser's store: ids fixed at build time (`EGUARD_CHROME_EXTENSION_ID`, `EGUARD_EDGE_EXTENSION_ID`, `EGUARD_FIREFOX_EXTENSION_URL`; Firefox's id is its manifest's `browser-extension@eguard.family`). A release refuses to compile without all three or with a malformed Chrome/Edge id (`EGUARD_DEV_RELEASE=1` for a local one, as with the keys). `forcelist`: eGuard's entry in `ExtensionInstallForcelist` beside a school's, in the first free number; Chrome reads `1`, `2`, … and stops at a gap, so a gap moves the later entries down. `firefox_settings`: eGuard's entry merged into others' `ExtensionSettings` JSON. `LinkKeeper`: every `/sync` brings a fresh 30-day link; the written one is kept a day (else every browser's policy changed every minute), dropped at once when `/sync` sends none (a removal waits) and on a new pairing. `capability`: WEB is reported once the extension is set up in all three and this is the service |
+| core `scan`, `pe` | `ExeFacts.browser`: the exe imports a browser engine (`*_elf.dll`, Chromium's early-start DLL under each fork's name, or `mozglue.dll`). Rule 4 reports such an app as BROWSERS (before game signals). Trusted publishers' browsers (Chrome, Edge, Firefox, also WebView2 and Copilot, which import Edge's engine) are left out as before: they read the policies eGuard writes. Cached facts carry `FACTS_VERSION`, so older cache entries are checked again |
+| core `rules`, `enforce` | `Policy.web_filter` (WEB in any mode but OFF). An unlisted BROWSERS app waits for the parent while it's on, **with or without App Approval** (`Block::Browser`, strictness 7): "X needs your parent's OK. eGuard can't keep websites safe in this browser, so your parent decides about it. Chrome, Edge and Firefox work as usual." An untrusted browser is tracked even under Program Files (another program there isn't). A listed one follows the parent's answer |
+| core `engine` | `set_web` (queues a report when it changes what's said), `browser_link`; reporting factored into `report_if_changed` |
+| `eguard-win` `registry`, `browsers` | Registry writes (create, set string/DWORD, delete value/tree, list strings). `browsers::apply/status/remove` per browser at a `Place` (HKLM `SOFTWARE\Policies`, or the dev copy). Chrome/Edge: forcelist, `3rdparty\extensions\<id>\policy` `deviceLink`, `IncognitoModeAvailability`/`InPrivateModeAvailability` = 1 and `BrowserGuestModeEnabled` = 0. Firefox: `ExtensionSettings` (force_installed, `private_browsing: true`), `3rdparty\Extensions\<id>` `deviceLink`, `DisableSafeMode` = 1. Only what differs is written; `remove` leaves others' entries and no gap |
+| `eguard-service` `web` | After every tick (and before the first, and right after pairing): apply, then `set_web`. A deleted policy comes back at the next tick. Logs only changes. `eguard-service web` shows what's in place (reads only); `uninstall` also takes the HKLM policies out |
+| `tools/enforce` | `browser.rs` + `browser_elf.rs`: an unsigned stand-in browser that imports `pixel_elf.dll` (`raw-dylib`); `setup.ps1` puts it in `<Dir>\Pixel Browser` with an HKCU Uninstall entry |
+
+**Also fixed (from the audit, console mode only):** a session pipe's DACL let only SYSTEM create instances, so in
+console mode (the service runs as the user) the pipe never came up ("Access is denied" every 5 s) and no block screen
+could show. Console mode now also grants the user running it (`pipe::console_session_pipe_sddl`); service mode is
+unchanged.
+
+**Verified (2026-10-24, on this PC, console mode, `--sandbox`, against the dev server; family, stand-ins, dev
+policies and dev data deleted after):**
+- `cargo test --workspace`: 207 passed, 1 ignored (core 154 + 14 fixture, win 34, service 5). Clippy (pedantic) and
+  fmt clean. The Windows tests write and remove the policies under a throwaway HKCU key, with a school's forcelist
+  entry beside eGuard's. The release guards refuse a build without the ids and with a malformed one.
+- Dry-run scan of this PC: still 37 apps from 127 candidates, none BROWSERS. Four exes read as browsers (Chrome, Edge,
+  Firefox, Copilot), all trusted and left out. CapCut (ships CEF's `chrome_elf.dll` but doesn't import it), VS Code,
+  Discord and Docker (Electron) aren't browsers.
+- With placeholder ids (a build with fake but well-formed ids; console writes only the dev copy): the three browsers'
+  policies were written once with the link `/sync` sent (the device's id leads it), then not again across five syncs;
+  the Chrome forcelist entry and Firefox's `ExtensionSettings`, deleted by hand, came back at the next tick (12 s).
+- The scan sent "Pixel Browser" as BROWSERS: the parent's Apps tab listed it so (PENDING). Started, it was ended in
+  0.90 s ("Pixel Browser is waiting for your parent"). An unlisted copy (in a folder the scan doesn't walk) was ended
+  in 1.14 s with the browser screen above; "Ask parent" gave the parent "App approval requested: Mia asked to install
+  otherbrowser."
+- The device page showed Web as not applied: "eGuard runs in development mode on this computer…" (console mode never
+  reports it applied, like the AVAILABLE protections).
+- Not shown live: "approval off, web filter on" (console mode can't turn App Approval off: see the gotchas); the core
+  tests cover it.
+
+**Needs the VM (and the extension's store ids):** the service writing HKLM as SYSTEM; Chrome and Edge installing the
+forced extension on a computer that isn't in a domain (allowed for Web Store extensions); `chrome://policy`,
+`edge://policy` and Firefox's `about:policies` reading every value (Firefox: `ExtensionSettings` as REG_SZ JSON, and its
+`private_browsing` key); the extension reading `deviceLink` (it can't yet, below) and pairing without a slot; Incognito,
+InPrivate and Guest gone; Troubleshoot Mode refused; whether Chrome started with `--disable-extensions` still loads a
+policy-installed extension; a real Opera/Brave/Tor ended while web filtering is on.
+
+**For the owner (Phase 5):**
+1. **The extension can't read the link yet** (`~/eguard-browser`, not changed): Chrome and Edge only pass a managed
+   policy to an extension whose manifest declares `storage.managed_schema` (a JSON schema with a `deviceLink` string).
+   The extension must then read `chrome.storage.managed` `deviceLink` and send it on `/browser/v1/pair`. Neither exists
+   (`apps/extension/src/config/manifest.ts`, `background/service.ts`). Also: with Incognito/InPrivate turned off by
+   policy, its "Allow in Incognito" check (`status.ts`, `isAllowedIncognitoAccess()`) will keep saying it's not
+   protected. Suggest the agent also write a managed `privateWindows: "off"` the extension trusts; that's a change to
+   the extension's managed schema, so it's yours to decide.
+2. **Store ids.** Chrome and Edge assign them on first upload (unlisted is enough); the AMO `.xpi` URL too. A release
+   build needs all three; until then nothing is forced in real browsers.
+3. **Server: a browser found while App Approval is off becomes ALLOWED** (`events/route.ts`, `approvalRequired`), so it
+   runs unfiltered once the scan reports it. The agent holds an unlisted browser while web filtering is on, which
+   covers the minutes before the report. Suggest: create BROWSERS apps PENDING while WEB is on, in `APP_INSTALLED` and
+   `APPS_FOUND`. Not changed (server).
+4. **Wire: `APP_REQUESTED` has only `app`.** A browser first met through "Ask parent" is listed as OTHER (seen live:
+   "otherbrowser"), so the parent can't tell it's a browser. Suggest optional `category`, `ids`, `source` as
+   `APP_INSTALLED` has. Also true of an unscanned game today.
+5. **Spec 9 wording (needs your OK):** Firefox is set up through its registry policies, not `policies.json` (Firefox
+   reads them in every copy on the computer, including portable and Store ones, and ignores `policies.json` when they
+   exist). And four settings the spec doesn't name are written, because without them the extension is one click
+   away from off: Incognito/InPrivate off, Guest mode off (Chrome, Edge), the extension allowed in Firefox's private
+   windows, Troubleshoot Mode off. Dropping any is one line in `web::Browser::settings`. Brave reads
+   `SOFTWARE\Policies\BraveSoftware\Brave` and Chrome Web Store extensions: it could be covered like Chrome instead of
+   waiting as BROWSERS; not done (the spec names three).
+6. **Finding 12 (time in browsers isn't named in `/usage`), which you asked to settle in Phase 5.** Recommendation:
+   leave it. Naming Chrome in `/usage` would add it to the child's list, and the parent's rules come before trust,
+   so with App Approval on it would land PENDING and Chrome would be ended. The web filter is the extension's job;
+   the day's total already counts browser time.
+
+**Known limits:** the scan walks AppData three folders deep, so a browser deeper down (Playwright's unsigned
+Chromium under `ms-playwright\chromium-*\chrome-win64`) isn't reported, though it's caught when it runs. A shortcut
+to a browser's launcher stub (Playwright's Nightly `private_browsing.exe`, which imports no engine) is reported as
+OTHER; its `firefox.exe` is still a browser when it runs. The policies come back within a minute of being deleted,
+but no TAMPER kind fits ("eGuard's browser settings were changed" would need a server change).
 
 ## Audit (2026-10-23, after the owner's decisions)
 
@@ -406,15 +489,16 @@ From `~/eguard/docs/desktop-agent-open-questions.md`. Q2, Q4 and Q5 are settled 
 | Q6 Offline clock | **Built** (`clock`), and now fed by the service: samples from `GetTickCount64` + BootId every tick (≤ 60 s), persisted with the state. Stated limit: a forward jump while offline across a reboot can end bedtime early or start a new day until the PC is back online | Done |
 | Q1, Q7, Q8, Q9 | Not decided here; they need the owner (admin-account test 8, self-update design, end-of-life recovery, exclusive fullscreen) | Open |
 
-## Next: Phase 5 (web, spec 9)
+## Next: Phase 6 (removal protection and tamper, spec 10, 11)
 
-Chrome/Edge `ExtensionInstallForcelist`, Firefox `policies.json`, the BROWSERS category for the rest. Writing browser
-policies changes this PC's security settings: that's on the "ask me first" list, so it's done on the VM (or the owner
-says otherwise). Inputs: `/sync` `browserLink` (finding 6), the extension's key mismatch (finding 2).
+The WiX MSI, service DACL, guard task, SafeBoot, every TAMPER kind, `ADMIN_ACCOUNT`, the signed uninstall flow with
+`UNINSTALL_ACK` (online: send it with the code and stop on 409) and "Remove with a code" (`Engine::try_removal_code`
+is ready). Removal must take out the browser policies too: `web::remove_machine` (already called by
+`eguard-service uninstall`). It needs a VM.
 
-Before or alongside it, on the VM (Phase 4's open items): install the service, check ETW, agents in a child's
-session, the disconnect and lock backstops, test 6, and the Q3 anti-cheat spike with real games. `tools/enforce/`
-has the stand-ins.
+On the VM before or alongside it: Phase 4's open items (install the service, ETW, agents in a child's session, the
+disconnect and lock backstops, test 6, the Q3 anti-cheat spike) and Phase 5's (above; real browsers need the
+extension's store ids first). `tools/enforce/` has the stand-ins.
 
 ## Gotchas
 
@@ -443,6 +527,14 @@ has the stand-ins.
 - `AGENT_RESTARTED` is sent when an agent ends with any code but `AGENT_EXIT_SESSION_ENDING` while its session goes
   on, at most once per session per 10 minutes. The service's own restart still needs the guard (Phase 6) to tell a
   crash from a stop.
+- **Console mode can't take a protection off.** It reports the AVAILABLE protections (and WEB) as not applied, so the
+  server fails a parent's change to one (App Approval off, Downloads approval off) at the next report, and `/sync`
+  goes back to the old value. Check such cases in the core's tests, or on the VM.
+- **Console mode's browser policies** go to HKCU `Software\eGuard\Dev\Policies` (no browser reads it). A dev build has
+  no extension ids, so it writes nothing at all: to see the writes, build with placeholder ids
+  (`EGUARD_CHROME_EXTENSION_ID=abcdefghijklmnopabcdefghijklmnop`, `EGUARD_EDGE_EXTENSION_ID=ponmlkjihgfedcbaponmlkjihgfedcba`,
+  `EGUARD_FIREFOX_EXTENSION_URL=https://example.invalid/x.xpi`), and build again without them after. Never run a
+  placeholder build as the service: it would force an extension that doesn't exist.
 - **Console mode and the owner's own programs.** A test family has App Approval on by default, so this PC's apps are
   PENDING and would be ended. Console mode ends only inside `--sandbox` and logs the rest as "would end". Never add a
   way around that. Also: the owner may be at the PC during a live check and close the screens by hand (it happened).

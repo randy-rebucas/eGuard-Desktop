@@ -262,7 +262,7 @@ pub fn resolve(p: &Program, inputs: &Inputs) -> Resolved {
 ///
 /// From the strictest:
 /// 8. blocked: `BLOCKED`, `FILTERED`, or an approval this build doesn't know;
-/// 7. waiting: `PENDING`, or not on the list while App Approval is on;
+/// 7. waiting: `PENDING`, or not on the list while App Approval is on (or, for a browser, while web filtering is);
 /// 6. allowed with its own daily limit;
 /// 5. not on the list while App Approval is off: allowed, but its category's limit applies, and it's the scan's or
 ///    the catalog's category rather than one a name lent it;
@@ -277,6 +277,7 @@ fn strictness(r: &Resolved, rules: &Rules) -> u8 {
     };
     match &a.rule {
         None if rules.policy.approval_required => 7,
+        None if rules.policy.web_filter && a.category.effective() == Category::Browsers => 7,
         None => 5,
         Some(rule) => match (rule.approval, rule.daily_limit_minutes.is_some()) {
             (Approval::Blocked | Approval::Filtered | Approval::Unknown, _) => 8,
@@ -374,22 +375,24 @@ fn own_outcome(p: &Program, inputs: &Inputs, host: bool) -> (Resolved, bool) {
     let product = p.exe.product.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let mut c = Candidate::new(product.unwrap_or_else(|| file_stem(&p.exe.file_name)), Origin::Uninstall);
     c.exe = Some(p.exe.clone());
+    let browser = p.exe.browser.then_some(Category::Browsers);
     let (found, trusted) = match &inputs.classifier {
         Some(classifier) => match classifier.classify(&c) {
             Ok(f) => (Some(f), false),
-            Err(Skip::TrustedPublisher(_)) => (untrusted(&c, None), !host),
+            Err(Skip::TrustedPublisher(_)) => (untrusted(&c, browser), !host),
             Err(Skip::BlankName) => (None, false),
         },
         // No catalog yet: nothing is trusted, and nothing is known to be a game
-        None => (untrusted(&c, None), false),
+        None => (untrusted(&c, browser), false),
     };
     let Some(found) = found else { return (Resolved::Untracked, false) };
 
     let game = matches!(found.source, Some(AppSource::Catalog | AppSource::Launcher));
     let baseline = if trusted {
         Resolved::Exempt(Exempt::Trusted)
-    } else if game || !p.program_files || inputs.inventory.app_with(&found.app, &found.ids).is_some() {
-        // Outside Program Files, any signer the catalog doesn't trust: a game on a USB stick is signed by someone
+    } else if game || p.exe.browser || !p.program_files || inputs.inventory.app_with(&found.app, &found.ids).is_some() {
+        // Outside Program Files, any signer the catalog doesn't trust: a game on a USB stick is signed by someone.
+        // A browser anywhere: websites in it go unfiltered, wherever it's installed
         app_match(&found, None)
     } else {
         Resolved::Untracked
@@ -425,7 +428,7 @@ fn folder_outcome(p: &Program, inputs: &Inputs, place: &Place, name: &str, host:
     c.launcher = launcher_of(&c.ids).or_else(|| (listed_as.and_then(|a| a.source) == Some(AppSource::Launcher)).then_some(Launcher::Steam));
     c.dir = Some(place.dir.clone());
     c.exe = Some(p.exe.clone());
-    let category = listed_as.and_then(|a| a.category);
+    let category = listed_as.and_then(|a| a.category).or_else(|| p.exe.browser.then_some(Category::Browsers));
     let found = match &inputs.classifier {
         Some(classifier) => match classifier.classify(&c) {
             Ok(f) => Some(f),
@@ -572,6 +575,11 @@ fn block_screen(id: u64, app: &str, block: Block, asked: Option<String>) -> Scre
         Block::NeedsApproval => (
             format!("{app} needs your parent's OK"),
             "New apps need your parent's OK first. Ask, and it opens once they allow it.".to_owned(),
+        ),
+        Block::Browser => (
+            format!("{app} needs your parent's OK"),
+            "eGuard can't keep websites safe in this browser, so your parent decides about it. Chrome, Edge and Firefox work as usual."
+                .to_owned(),
         ),
         Block::Bedtime => ("It's bedtime".to_owned(), format!("{app} opens again after bedtime.")),
         Block::AppLimit { minutes: m } => (format!("Time's up for {app}"), format!("You've used today's {} of {app}.", minutes(m))),
@@ -995,6 +1003,7 @@ mod tests {
             signer_alt: None,
             product: product.map(str::to_owned),
             graphics: false,
+            browser: false,
         }
     }
 
@@ -1383,6 +1392,41 @@ mod tests {
         assert_eq!(e.check(&new, at(0)), Decision::End { app: "coolgame".into(), block: Block::NeedsApproval });
         // Only a blocked app raises APP_BLOCKED
         assert_eq!(e.take_events(), Vec::<DeviceEvent>::new());
+    }
+
+    #[test]
+    fn browsers_the_extension_cant_run_in_wait_while_web_filtering_is_on() {
+        let browser = |path: &str, signer: Option<&str>| {
+            let mut p = program(path, signer, Some("Opera GX"));
+            p.exe.browser = true;
+            p
+        };
+        // Signed by a publisher the catalog doesn't trust, under Program Files, never scanned: tracked anyway
+        let opera = browser(r"C:\Program Files\Opera GX\opera.exe", Some("opera norway as"));
+        let tor = browser(r"C:\Users\Mia\Desktop\Tor Browser\Browser\firefox.exe", None);
+        let chrome = browser(r"C:\Program Files\Google\Chrome\Application\chrome.exe", Some("google llc"));
+        let mut r = rules_with(vec![]);
+        let mut e = enforcer(r.clone());
+        // Web filtering off, approval off: browsers are apps like any other
+        assert_eq!(e.check(&opera, at(0)), Decision::Allow);
+        r.policy.web_filter = true;
+        e.update(inputs(r.clone()));
+        assert_eq!(e.check(&opera, at(0)), Decision::End { app: "Opera GX".into(), block: Block::Browser });
+        assert_eq!(e.check(&tor, at(0)), Decision::End { app: "Opera GX".into(), block: Block::Browser });
+        // Chrome is the extension's: never ended
+        assert_eq!(e.resolve(&chrome), Resolved::Exempt(Exempt::Trusted));
+        // The parent's answer decides once it's on the list
+        r.apps = vec![rule("Opera GX", Approval::Allowed, None, Category::Browsers, &[AppId::exe(Some("opera norway as"), "Opera GX")])];
+        e.update(inputs(r.clone()));
+        assert_eq!(e.check(&opera, at(0)), Decision::Allow);
+        // Without the browser signal, the same untrusted program under Program Files is untracked as before
+        let mut plain = opera.clone();
+        plain.exe.browser = false;
+        plain.exe.product = Some("Plain Tool".into());
+        assert_eq!(e.resolve(&plain), Resolved::Untracked);
+        // The block screen says why
+        let s = block_screen(1, "Opera GX", Block::Browser, None);
+        assert!(s.ask_parent && !s.ask_time && s.body.contains("Chrome, Edge and Firefox"));
     }
 
     /// Plays `app` in the foreground with input, one heartbeat a second, for `secs` seconds from `from`.

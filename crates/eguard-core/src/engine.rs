@@ -16,7 +16,9 @@ use crate::scan::{self, Classifier, ExeCache, ScanResult};
 use crate::signature::{CatalogUpdate, TrustedKeys, verify_catalog};
 use crate::state::{AgentState, AuthState, UNAUTHORIZED_SYNC_SECS};
 use crate::store::{DeviceSecrets, Persisted};
-use crate::wire::{Catalog, DeviceEvent, EventEnvelope, PairRequest, Platform, ReportRequest, SyncRequest, TamperKind, UsageReport};
+use crate::wire::{
+    BrowserLink, Catalog, DeviceEvent, EventEnvelope, PairRequest, Platform, ReportRequest, SyncRequest, TamperKind, UsageReport,
+};
 
 /// The longest the service sleeps: the wall clock is checked for changes about this often.
 pub const MAX_SLEEP_MS: u64 = 60_000;
@@ -347,8 +349,6 @@ impl Engine {
         }
         let now_ms = agent.clock.now(s).map_or(s.wall_ms, |n| n.ms);
         let update_required = agent.update_required;
-        let sync = agent.last_sync.as_ref().expect("just applied");
-        let protections = report::protections(sync, &self.caps);
         if let Some(c) = outcome.clock_change {
             self.clock_changed(c, now_ms);
         }
@@ -365,14 +365,39 @@ impl Engine {
         if update_required {
             self.notes.push(Note::Warn("eGuard needs a newer version of this app; enforcement carries on".into()));
         }
-        let unchanged = self.data.last_reported.as_ref() == Some(&protections);
-        if outcome.full_report_requested || !outcome.requests.is_empty() || !unchanged {
-            let mut body = report::full_report(protections.clone(), &info.os_version, &info.app_version, info.battery);
-            body.accounts.clone_from(&self.data.accounts_reported);
-            self.data.queue.push_report(body, now_ms);
-            self.data.last_reported = Some(protections);
-        }
+        self.report_if_changed(outcome.full_report_requested || !outcome.requests.is_empty(), info, now_ms);
         u64::from(outcome.next_sync_secs) * 1000
+    }
+
+    /// Queues a full `/report` when `force`, or when what it would say differs from the last one queued. Nothing
+    /// before the first good `/sync`: the report answers the parent's policy.
+    fn report_if_changed(&mut self, force: bool, info: &DeviceInfo, now_ms: i64) {
+        let Some(sync) = self.data.agent.as_ref().and_then(|a| a.last_sync.as_ref()) else { return };
+        let protections = report::protections(sync, &self.caps);
+        if !force && self.data.last_reported.as_ref() == Some(&protections) {
+            return;
+        }
+        let mut body = report::full_report(protections.clone(), &info.os_version, &info.app_version, info.battery);
+        body.accounts.clone_from(&self.data.accounts_reported);
+        self.data.queue.push_report(body, now_ms);
+        self.data.last_reported = Some(protections);
+    }
+
+    /// Whether web filtering holds now (`Capabilities::web`; the platform sets up the browsers after each tick). A
+    /// change that changes what `/report` says queues one. True when it changed.
+    pub fn set_web(&mut self, web: Result<(), String>, info: &DeviceInfo, now_ms: i64) -> bool {
+        if self.caps.web == web {
+            return false;
+        }
+        self.caps.web = web;
+        self.report_if_changed(false, info, now_ms);
+        true
+    }
+
+    /// The link for this computer's browsers, from the last good `/sync` (spec section 9). `None` before one, while
+    /// a removal waits, and from a server that doesn't send it.
+    pub fn browser_link(&self) -> Option<&BrowserLink> {
+        self.data.agent.as_ref()?.last_sync.as_ref()?.browser_link.as_ref()
     }
 
     /// `GET /catalog?since=` the kept version. A catalog that doesn't verify is ignored and the kept one stays.
@@ -700,6 +725,35 @@ mod tests {
         drop(seen);
         // Next sync in nextSyncSeconds (300), not before
         assert_eq!(tick.sleep_ms, MAX_SLEEP_MS);
+    }
+
+    #[test]
+    fn web_set_up_after_a_sync_is_reported_once() {
+        let t = Scripted::new(vec![]);
+        let (mut e, now) = paired(&t);
+        // Before any sync there's nothing to answer
+        assert!(e.set_web(Ok(()), &info(), 0));
+        assert!(e.data.queue.is_empty() && e.browser_link().is_none());
+        e.set_web(Err("No extension yet.".into()), &info(), 0);
+
+        let mut first = fixture("sync-first.json");
+        first["deviceId"] = j!(e.secrets.as_ref().unwrap().device_id);
+        t.answers.lock().unwrap().extend([json(200, &first), json(200, &j!({ "ok": true }))]);
+        e.tick(at(1_000, &now), &info());
+        assert!(e.data.queue.is_empty());
+        assert!(e.browser_link().is_some_and(|l| l.value.starts_with(&e.secrets.as_ref().unwrap().device_id)));
+
+        assert!(e.set_web(Ok(()), &info(), 2_000));
+        let queued = e.data.queue.items();
+        assert_eq!(queued.len(), 1);
+        let crate::queue::Outbound::Report(report) = &queued[0].item else { panic!("{:?}", queued[0].item) };
+        let web = report.protections.iter().find(|p| p.key == ProtectionKey::Web).unwrap();
+        // The parent's config, no longer the off state with why
+        assert_eq!(web.error, None);
+        assert_ne!(web.config, j!({ "mode": "OFF", "blockedSites": 0 }));
+        // The same again: nothing new
+        assert!(!e.set_web(Ok(()), &info(), 3_000));
+        assert_eq!(e.data.queue.len(), 1);
     }
 
     #[test]

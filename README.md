@@ -3,17 +3,19 @@
 The desktop agent for eGuard: it runs on a child's Windows PC, pairs with the parent's dashboard, and enforces the
 family's rules (app approval, time limits, bedtime, web filtering) even while the PC is offline.
 
-The agent is being built in phases. Today it pairs, syncs, reports, and tells the parent which games and apps are
-installed, but doesn't enforce anything yet; see [docs/STATUS.md](docs/STATUS.md) for what's done, what's next and what's waiting on a decision.
+The agent is being built in phases. Today it pairs, syncs, reports, finds the games and apps installed, enforces the
+parent's app rules, time limits and bedtime, and forces eGuard's browser extension into Chrome, Edge and Firefox; it
+can't protect itself from removal yet. See [docs/STATUS.md](docs/STATUS.md) for what's done, what's next and what's
+waiting on a decision.
 
 | Phase | What | Status |
 |---|---|---|
 | 1 | Core crate, no Windows APIs | Done |
 | 2 | Pairing, sync and the service shell | Done |
 | 3 | Scanning and identification | Done |
-| 4 | Enforcement and time | Next |
-| 5 | Web | |
-| 6 | Removal protection and tamper | |
+| 4 | Enforcement and time | Built; checked with stand-ins, waits for a VM |
+| 5 | Web | Built; checked with stand-ins, waits for a VM and the extension's store ids |
+| 6 | Removal protection and tamper | Next |
 | 7 | Hardening and release readiness | |
 
 ## Layout
