@@ -137,7 +137,7 @@ SYSTEM and a second account wait for the VM.
 | `tools/dev-family.mjs`, `tools/enforce/` | `app`, `limit`, `protect`, `screen-time` act as the parent. Stand-ins and scripts (see CLAUDE.md) |
 
 `Capabilities::enforced` now has SCREEN_TIME, BEDTIME, APP_APPROVAL, DOWNLOADS when programs are really ended (the
-service, or console mode with `--sandbox`); a console dry run still reports them as not applied.
+service only, since the audit; console mode, with or without `--sandbox`, reports them as not applied).
 
 **The overlay** covers every monitor, takes the focus back every second and stays on top. While the day's screen
 time is up it steps aside when an always-allowed app that's still usable has the focus (Alt+Tab; it names those
