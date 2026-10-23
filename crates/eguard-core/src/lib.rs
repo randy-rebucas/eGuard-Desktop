@@ -15,6 +15,7 @@ pub mod engine;
 pub mod ipc;
 pub mod keys;
 pub mod localtime;
+pub mod logging;
 pub mod queue;
 pub mod removal;
 pub mod report;

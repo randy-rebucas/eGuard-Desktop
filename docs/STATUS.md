@@ -11,7 +11,7 @@ Phase 4, the owner's decisions, a full audit and its fixes.
 | 4 | Enforcement and time (spec 7, 8) | **Built and checked on this PC with stand-ins.** Tests 3–5 pass in console mode; the gate waits for the VM: test 6, everything as SYSTEM, real games (Q3) |
 | 5 | Web (spec 9) | **Built and checked on this PC** with a stand-in browser and an inert copy of the policies. The prompt gives no "Done when"; real browsers wait for the VM and for the extension's store ids, and 6 items wait for the owner (below) |
 | 6 | Removal protection and tamper (spec 10, 11) | **Part 1 built and checked on this PC** (the removal flow, "Remove with a code", tamper reporting, `ADMIN_ACCOUNT`). Part 2 (installer, service lock, guard, Safe Mode registration) waits for the VM and two decisions (below) |
-| 7 | Hardening and release readiness | Needs the code-signing certificate |
+| 7 | Hardening and release readiness | **Started:** structured, rotated, scrubbed logs (below). Not built: a crash handler, the signed self-update (Q7, the owner's design), signing (the certificate), the end-to-end VM run |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
 

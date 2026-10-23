@@ -16,6 +16,7 @@
 //! ```
 
 use eguard_core::ipc::{self, AccountInfo, AppButton, Request, Response, Screen, SessionView, Warning};
+use eguard_core::logging;
 use eguard_win::input::{self, InputWatch};
 use eguard_win::process;
 use eguard_win::ui::{Ui, UiEvent};
@@ -195,6 +196,10 @@ fn ask_session(pipe_name: &str, service: &Path, dev: bool, request: &Request) ->
 fn session(args: &[String]) -> Result<(), String> {
     let dev = args.iter().any(|a| a == "--dev");
     let id = process::session_of(process::current_pid()).ok_or("couldn't tell which session this is")?;
+    // This user's own log: the agent runs as the person signed in, who can't write eGuard's data folder
+    let log = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("eGuard").join("logs").join("agent.log"));
+    logging::init("agent", log.as_deref(), false);
+    logging::info(&format!("eguard-agent {} in session {id}", env!("CARGO_PKG_VERSION")));
     let pipe_name = ipc::session_pipe_name(id);
     let service = service_exe();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -230,9 +235,15 @@ fn session(args: &[String]) -> Result<(), String> {
                 ui.show(view);
             }
             // eGuard removed itself: nothing left to show
-            Ok(Response::Removed) => return Ok(()),
+            Ok(Response::Removed) => {
+                logging::info("eGuard was removed from this computer; closing");
+                return Ok(());
+            }
             // Keep showing what was shown: a service that's away doesn't lift a pause
-            _ if last_answer.elapsed() > GIVE_UP_AFTER => return Ok(()),
+            _ if last_answer.elapsed() > GIVE_UP_AFTER => {
+                logging::warn("eGuard's service hasn't answered for 5 minutes; closing (it starts a new agent when it's back)");
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -342,6 +353,7 @@ fn main() {
         ),
     };
     if let Err(e) = result {
+        logging::error(&e);
         eprintln!("{e}");
         std::process::exit(1);
     }
