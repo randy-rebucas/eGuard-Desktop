@@ -38,6 +38,9 @@ pub enum VerifyError {
     WrongDevice,
     #[error("the command is too old or from the future")]
     Stale,
+    /// Not newer than an uninstall command already accepted: one seen before, sent again.
+    #[error("the command isn't newer than one already accepted")]
+    Replayed,
     #[error("the catalog is older than the one already kept")]
     Rollback,
 }
@@ -106,6 +109,9 @@ pub struct UninstallCommand {
     pub device_id: String,
     pub requested_at: String,
     pub at: String,
+    /// `at` as Unix ms: each command the server signs has a newer one, so a command not newer than the last accepted
+    /// is a replay.
+    pub at_ms: i64,
 }
 
 #[derive(Deserialize)]
@@ -119,7 +125,8 @@ struct UninstallFields {
 }
 
 /// Checks `/sync`'s `uninstall` (`{ command, signature, keyId }`, as received): eGuard's signature, the type, that
-/// it names this device, and that `at` is within an hour of `now_ms` (eGuard's clock, see `clock`).
+/// it names this device, and that `at` is within an hour of `now_ms`: eGuard's clock as it stood before the answer
+/// that carried the command arrived (see `state::AgentState::apply_sync`), never a time from that same answer.
 pub fn verify_uninstall(keys: &TrustedKeys, envelope: &Value, own_device_id: &str, now_ms: i64) -> Result<UninstallCommand, VerifyError> {
     let command = envelope.get("command").filter(|c| c.is_object()).ok_or(VerifyError::Malformed)?;
     let signature = envelope.get("signature").and_then(Value::as_str).ok_or(VerifyError::Malformed)?;
@@ -137,7 +144,7 @@ pub fn verify_uninstall(keys: &TrustedKeys, envelope: &Value, own_device_id: &st
     if (now_ms - at).abs() > UNINSTALL_MAX_AGE_MS {
         return Err(VerifyError::Stale);
     }
-    Ok(UninstallCommand { device_id: f.device_id, requested_at: f.requested_at, at: f.at })
+    Ok(UninstallCommand { device_id: f.device_id, requested_at: f.requested_at, at: f.at, at_ms: at })
 }
 
 /// What `GET /catalog` brought.

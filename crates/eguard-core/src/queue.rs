@@ -8,6 +8,8 @@
 //! waiting to be retried. Lanes don't hold each other up. Failures back off from 30 seconds to 15 minutes with
 //! jitter. A `400` drops the item (a bug in this build; the caller logs it). A `401` never drops anything and never
 //! switches protection off: the agent keeps everything and keeps retrying at the slowest pace (spec principle 5).
+//! An item the server keeps failing on (5xx, 403, 404, 413…) is given up after `MAX_REJECTIONS` tries or
+//! `GIVE_UP_AFTER_MS`, so it can't hold its lane forever; no network, `401` and `429` never count toward that.
 
 use crate::wire::{EventEnvelope, ReportRequest, UsageReport};
 use serde::{Deserialize, Serialize};
@@ -19,6 +21,10 @@ pub const BACKOFF_MAX_MS: i64 = 15 * 60_000;
 pub const RATE_LIMITED_MIN_MS: i64 = 5 * 60_000;
 /// Events kept at most; past it the oldest of the busiest type goes first.
 pub const MAX_EVENTS: usize = 2_000;
+/// An item the server has failed on this many times is given up (about half a day at the slowest backoff).
+pub const MAX_REJECTIONS: u32 = 50;
+/// Or once the server has been failing on it for this long, whichever comes first.
+pub const GIVE_UP_AFTER_MS: i64 = 7 * 24 * 60 * 60_000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "endpoint", content = "body", rename_all = "camelCase")]
@@ -55,6 +61,13 @@ pub struct Queued {
     pub item: Outbound,
     pub attempts: u32,
     pub not_before_ms: i64,
+    /// Times the server answered and didn't take this item for a reason of its own (5xx, 403, 404, 413…). Not counted:
+    /// no network, 401 and 429, which say nothing about the item.
+    #[serde(default)]
+    pub rejections: u32,
+    /// When the server first did so (eGuard's clock).
+    #[serde(default)]
+    pub first_rejected_ms: Option<i64>,
 }
 
 /// How a send went, from the HTTP status.
@@ -70,8 +83,10 @@ pub enum SendOutcome {
     Unauthorized,
     /// 429. `retry_after_secs` from the response, when it said.
     RateLimited { retry_after_secs: Option<u32> },
-    /// 5xx, a timeout, no network.
+    /// The server answered with another status (5xx, 403, 404, 413…). Counts toward giving the item up.
     Failed,
+    /// No answer: no network, DNS, TLS, a timeout. Not the item's fault, so it's kept however long it takes.
+    Unreachable,
 }
 
 impl SendOutcome {
@@ -93,6 +108,9 @@ pub enum Settled {
     Done,
     /// Dropped because the server refused it; log it, it's a bug.
     Dropped(Outbound),
+    /// Given up after the server kept failing on it (`MAX_REJECTIONS`, `GIVE_UP_AFTER_MS`), so it no longer holds
+    /// up the items behind it in its lane. Log it.
+    GaveUp(Outbound),
     /// Kept; tried again at `not_before_ms`.
     Retry {
         not_before_ms: i64,
@@ -122,7 +140,7 @@ impl OutboundQueue {
     fn push(&mut self, item: Outbound, now_ms: i64) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.items.push(Queued { seq, item, attempts: 0, not_before_ms: now_ms });
+        self.items.push(Queued { seq, item, attempts: 0, not_before_ms: now_ms, rejections: 0, first_rejected_ms: None });
         seq
     }
 
@@ -130,6 +148,9 @@ impl OutboundQueue {
     pub fn push_usage(&mut self, report: UsageReport, now_ms: i64) {
         if let Some(q) = self.items.iter_mut().find(|q| matches!(&q.item, Outbound::Usage(u) if u.date == report.date)) {
             q.item = Outbound::Usage(report);
+            // A new body: what the server made of the old one says nothing about it
+            q.rejections = 0;
+            q.first_rejected_ms = None;
             return;
         }
         self.push(Outbound::Usage(report), now_ms);
@@ -196,9 +217,17 @@ impl OutboundQueue {
                 Some(Settled::Done)
             }
             SendOutcome::BadRequest | SendOutcome::Conflict => Some(Settled::Dropped(self.items.remove(i).item)),
-            SendOutcome::Unauthorized | SendOutcome::RateLimited { .. } | SendOutcome::Failed => {
+            SendOutcome::Unauthorized | SendOutcome::RateLimited { .. } | SendOutcome::Failed | SendOutcome::Unreachable => {
                 let q = &mut self.items[i];
                 q.attempts += 1;
+                // One item the server keeps failing on would hold its whole lane forever: after enough tries it goes
+                if outcome == SendOutcome::Failed {
+                    q.rejections += 1;
+                    let first = *q.first_rejected_ms.get_or_insert(now_ms);
+                    if q.rejections >= MAX_REJECTIONS || now_ms - first >= GIVE_UP_AFTER_MS {
+                        return Some(Settled::GaveUp(self.items.remove(i).item));
+                    }
+                }
                 let wait = match outcome {
                     SendOutcome::Unauthorized => BACKOFF_MAX_MS,
                     SendOutcome::RateLimited { retry_after_secs } => {
@@ -347,6 +376,36 @@ mod tests {
         let b = q.push_event(blocked("Roblox"), 0);
         assert_eq!(q.settle(b, SendOutcome::Unauthorized, 0, 0.5), Some(Settled::Retry { not_before_ms: BACKOFF_MAX_MS }));
         assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn an_item_the_server_keeps_failing_on_is_given_up_and_its_lane_moves_on() {
+        let mut q = OutboundQueue::default();
+        let a = q.push_event(blocked("Roblox"), 0);
+        let b = q.push_event(blocked("Minecraft"), 0);
+        // No network, 401 and 429 aren't the item's fault: never given up for those
+        for _ in 0..200 {
+            for o in [SendOutcome::Unreachable, SendOutcome::Unauthorized, SendOutcome::RateLimited { retry_after_secs: None }] {
+                assert!(matches!(q.settle(a, o, 0, 0.5), Some(Settled::Retry { .. })));
+            }
+        }
+        for i in 1..MAX_REJECTIONS {
+            assert!(matches!(q.settle(a, SendOutcome::Failed, i64::from(i), 0.5), Some(Settled::Retry { .. })));
+        }
+        assert!(matches!(q.settle(a, SendOutcome::Failed, 100, 0.5), Some(Settled::GaveUp(_))));
+        assert_eq!(q.due(100).iter().map(|i| i.seq).collect::<Vec<_>>(), vec![b]);
+
+        // Or after a week of failing, however few the tries
+        assert!(matches!(q.settle(b, SendOutcome::Failed, 0, 0.5), Some(Settled::Retry { .. })));
+        assert!(matches!(q.settle(b, SendOutcome::Failed, GIVE_UP_AFTER_MS, 0.5), Some(Settled::GaveUp(_))));
+        assert!(q.is_empty());
+
+        // A day's totals replaced by newer ones start counting again
+        q.push_usage(usage("2026-10-23", 5), 0);
+        let u = q.items()[0].seq;
+        q.settle(u, SendOutcome::Failed, 0, 0.5);
+        q.push_usage(usage("2026-10-23", 9), 0);
+        assert_eq!((q.items()[0].rejections, q.items()[0].first_rejected_ms), (0, None));
     }
 
     #[test]

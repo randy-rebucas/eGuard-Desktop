@@ -140,6 +140,14 @@ impl Engine {
                 notes.push(Note::Warn("the state file doesn't match this computer's secrets; starting from the secrets".into()));
                 Persisted::recover(s)
             }
+            None if data.agent.is_some() => {
+                notes.push(Note::Warn(
+                    "this computer was paired but its secrets are missing or unreadable: it keeps enforcing the last rules it had, \
+                     and can't reach eGuard until it's removed from the dashboard and paired again"
+                        .into(),
+                ));
+                data
+            }
             _ => data,
         };
         let mut data = data;
@@ -170,8 +178,17 @@ impl Engine {
         }
     }
 
+    /// This computer has its secrets and can talk to eGuard (sync, send, pair refused). For enforcement use `enforces`.
     pub fn is_paired(&self) -> bool {
         self.secrets.is_some()
+    }
+
+    /// This computer was paired, so the child's rules apply: the secrets are there, or the state says it was paired
+    /// and the secrets were lost or don't decrypt. A deleted token never switches protection off (spec principle
+    /// 5): without it the computer can't sync, but it keeps enforcing the last good policy, counting time and
+    /// scanning, and what it queues waits for the secrets to come back.
+    pub fn enforces(&self) -> bool {
+        self.secrets.is_some() || self.data.agent.is_some()
     }
 
     pub fn server(&self) -> &str {
@@ -185,8 +202,9 @@ impl Engine {
 
     /// Exchanges a pairing code for the device's secrets. Nothing is kept until `adopt`.
     pub fn pair(&self, code: &str, info: &DeviceInfo) -> Result<Paired, PairError> {
-        // A state without secrets is a computer that was paired and lost its secrets: it stays as it is
-        if self.is_paired() || self.data.agent.is_some() {
+        // A state without secrets is a computer that was paired and lost its secrets: it stays as it is, so losing a
+        // file can't move the computer to another family's rules (or none)
+        if self.enforces() {
             return Err(PairError::AlreadyPaired);
         }
         let code = normalize_code(code).ok_or(PairError::BadCode)?;
@@ -324,6 +342,9 @@ impl Engine {
             }
         };
         self.sync_failures = 0;
+        for n in &outcome.notes {
+            self.notes.push(Note::Warn(n.clone()));
+        }
         let now_ms = agent.clock.now(s).map_or(s.wall_ms, |n| n.ms);
         let update_required = agent.update_required;
         let sync = agent.last_sync.as_ref().expect("just applied");
@@ -405,7 +426,7 @@ impl Engine {
     /// When a scan is due, what it needs: the catalog's rules and the cache of checked files. A scan waits for a
     /// verified catalog: without one, every trusted publisher's app would be reported.
     pub fn scan_due(&self, now_ms: i64) -> Option<(Classifier, ExeCache)> {
-        let catalog = self.catalog.as_ref().filter(|_| self.is_paired())?;
+        let catalog = self.catalog.as_ref().filter(|_| self.enforces())?;
         let since = self.data.last_scan_ms.map(|t| now_ms - t);
         let due = match since {
             None => true,
@@ -440,7 +461,7 @@ impl Engine {
     pub fn enforce_inputs(&self) -> Inputs {
         let agent = self.data.agent.as_ref();
         Inputs {
-            paired: self.is_paired(),
+            paired: self.enforces(),
             rules: agent.map(AgentState::rules).unwrap_or_default(),
             zone: agent.map_or_else(crate::localtime::FamilyZone::utc, AgentState::zone),
             clock: agent.map(|a| a.clock.clone()).unwrap_or_default(),
@@ -454,7 +475,7 @@ impl Engine {
     /// before is news once (`TAMPER` `NEW_ACCOUNT`) and isn't enforced; the list goes to `/report` when it changed.
     /// Returns true when `data` changed.
     pub fn observe_accounts(&mut self, list: &[Account], now_ms: i64) -> bool {
-        if !self.is_paired() || list.is_empty() {
+        if !self.enforces() || list.is_empty() {
             return false;
         }
         let mut changed = false;
@@ -506,7 +527,7 @@ impl Engine {
 
     /// Queues what enforcement has to tell the server.
     pub fn queue_enforcement(&mut self, events: Vec<DeviceEvent>, usage: Vec<UsageReport>, now_ms: i64) {
-        if !self.is_paired() {
+        if !self.enforces() {
             return;
         }
         for e in events {
@@ -531,6 +552,12 @@ impl Engine {
                     Some(Settled::Dropped(item)) => {
                         self.notes.push(Note::Warn(format!("eGuard refused a {} message ({outcome:?}); dropped", item.lane())));
                     }
+                    Some(Settled::GaveUp(item)) => {
+                        self.notes.push(Note::Warn(format!(
+                            "eGuard kept failing on a {} message ({outcome:?}); given up so the ones after it can go",
+                            item.lane()
+                        )));
+                    }
                     _ => {}
                 }
             }
@@ -544,7 +571,7 @@ impl Engine {
     pub fn status(&self) -> crate::ipc::StatusInfo {
         let agent = self.data.agent.as_ref();
         crate::ipc::StatusInfo {
-            paired: self.is_paired(),
+            paired: self.enforces(),
             device_id: agent.map(|a| a.device_id.clone()),
             child_name: agent.map(|a| a.child_name.clone()).filter(|n| !n.is_empty()),
             server: self.server().to_owned(),
@@ -552,7 +579,8 @@ impl Engine {
                 .and_then(|a| a.last_sync_ms)
                 .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
                 .map(|t| t.to_string()),
-            authorized: agent.is_none_or(|a| a.auth == AuthState::Ok),
+            // Without its secrets a paired computer can't reach eGuard: shown as not authorized, protection on
+            authorized: (self.is_paired() || agent.is_none()) && agent.is_none_or(|a| a.auth == AuthState::Ok),
             queued: self.data.queue.len(),
             apps_reported: self.data.apps_reported.as_ref().map(std::collections::BTreeMap::len),
             last_scan_at: self.data.last_scan_ms.and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok()).map(|t| t.to_string()),
@@ -747,6 +775,44 @@ mod tests {
         // Before any sync, new apps wait for the parent
         assert!(e.data.agent.as_ref().unwrap().rules().policy.approval_required);
         assert!(!report::AVAILABLE.contains(&ProtectionKey::Web));
+    }
+
+    #[test]
+    fn lost_secrets_keep_the_rules_in_force_and_cant_be_paired_away() {
+        let t = Scripted::new(vec![]);
+        let (mut e, now) = paired(&t);
+        let mut first = fixture("sync-computer.json");
+        first["deviceId"] = j!(e.secrets.as_ref().unwrap().device_id);
+        t.answers.lock().unwrap().extend([json(200, &first), json(200, &j!({ "ok": true }))]);
+        *t.catalog.lock().unwrap() = Some(fixture("catalog.json"));
+        e.tick(at(1_000, &now), &info());
+        let t0 = crate::clock::parse_iso_ms(&now).unwrap();
+        let enforced = e.enforce_inputs();
+        assert!(enforced.paired && enforced.rules.app("Counter-Strike 2").is_some());
+
+        // secrets.bin deleted (or no longer decrypts); state.json is still there
+        let api = Api::new(ServerUrl::parse("http://localhost:3000", true).unwrap(), Box::new(t.clone()));
+        let mut lost = Engine::new(e.data.clone(), None, api, TrustedKeys::builtin().unwrap(), caps());
+        assert!(!lost.is_paired() && lost.enforces());
+        assert!(lost.take_notes().iter().any(|n| matches!(n, Note::Warn(m) if m.contains("secrets"))));
+        // The same rules, time counted, scans run, accounts watched
+        let inputs = lost.enforce_inputs();
+        assert!(inputs.paired);
+        assert_eq!(inputs.rules, enforced.rules);
+        assert!(lost.scan_due(t0).is_some());
+        let queued = lost.data.queue.len();
+        lost.queue_enforcement(vec![DeviceEvent::AppBlocked { app: "Counter-Strike 2".into() }], vec![], t0);
+        assert_eq!(lost.data.queue.len(), queued + 1);
+        assert!(lost.observe_accounts(&win_accounts(), t0));
+        // Shown as paired but not authorized
+        let status = lost.status();
+        assert!(status.paired && !status.authorized);
+        // And it can't be moved to another family by pairing again
+        assert_eq!(lost.pair("ABCD2345", &info()).unwrap_err(), PairError::AlreadyPaired);
+        // Nothing goes out without a token
+        let asked = t.seen.lock().unwrap().len();
+        lost.tick(at(400_000, &now), &info());
+        assert_eq!(t.seen.lock().unwrap().len(), asked);
     }
 
     #[test]
