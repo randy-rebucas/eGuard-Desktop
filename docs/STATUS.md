@@ -18,8 +18,8 @@ Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md
 
 A full audit (five reviews: Windows FFI and security, core crypto/wire/state, enforcement logic, the binaries, spec
 and wire conformance) found 1 critical, 9 high and ~20 medium/low problems. The owner said fix them all; all are
-fixed on branch `audit-fixes` except #20 (server). Wire conformance was clean: every request matches the server.
-Checks: `cargo test --workspace` 180 passed, 1 ignored (core 132 + 14 fixture, win 29, service 5); clippy and fmt
+fixed (merged to `main`). Wire conformance was clean except the catalog's version (below).
+Checks: `cargo test --workspace` 181 passed, 1 ignored (core 133 + 14 fixture, win 29, service 5); clippy and fmt
 clean; `eguard-service scan` dry run: 39 apps reported from 127 candidates. Nothing below was tried live; the VM
 items are at the end.
 
@@ -50,12 +50,19 @@ enforcement *less* strict. Now such facts may only tighten a verdict (`enforce::
 | low | Windows exemption covered Microsoft-signed files in user-writable folders under Windows; accessibility by signer prefix; ETW could starve the sweep; console sent "App blocked" for what it didn't end; `--sandbox` reported protections applied; service setup errors unlogged; a queue item rejected forever blocked its lane; DST repeated hour; `[::1]`; release build trusting the dev key | All fixed (`EGUARD_DEV_RELEASE=1` needed for a local release build) |
 
 **For the owner:**
-- **#20, server (not changed):** `~/eguard/src/app/api/device/v1/catalog/route.ts` takes the catalog's version from
-  the newest `updatedAt`, so deleting a row (e.g. a TRUSTED_PUBLISHER found to be bad) never reaches computers.
-  Suggest a version counter bumped on every insert, update and delete (or soft-delete rows).
-- **Spec 7 (App Approval):** it now covers signed programs from publishers the catalog doesn't trust outside Program
-  Files, not only unsigned ones; before the first catalog, signed per-user programs (OneDrive, Teams) wait for
-  approval too. Suggest the spec say so.
+- **#20 was already done on the server** (in the owner's uncommitted work): `GET /catalog`'s `version` is now a
+  16-character hash of the entries, so a removed entry shows (spec 4, the `GET /catalog` row). **The agent didn't
+  follow it**: it read `version` as a number and refused older ones, so against today's server it would refuse every
+  catalog and never scan. Fixed: `Catalog.version` is a string (a number from a kept older copy or the fixture is
+  read as one), compared only for equality; "unchanged" counts only for the version kept. The fixtures still have
+  the old numeric version: re-capture them (`node tools/capture-fixtures.mjs`) when the dev server runs.
+- **Suggestion (server, owner's call):** a hash has no order, so a signed older catalog replayed by a proxy with its
+  own root certificate is accepted (it could re-trust a publisher removed since, until the next real catalog). A
+  signed `issuedAt` in the catalog would let the agent refuse older ones again.
+- **Spec 7 changed in `~/eguard/docs/desktop-agent-spec.md` (NOT committed: it's untracked, part of the owner's
+  work):** trusted publishers are exempt by their own signature or a Program Files folder only; runtimes never by
+  signer; App Approval covers any exe outside Program Files a trusted publisher didn't sign (and everything before
+  the first catalog); facts the child controls only tighten.
 - **Known limits, documented in the code:** unsigned allowed apps outside Program Files (itch.io games) share their
   rule with any unsigned exe put in their folder; runtimes under Program Files outside a scanned app are untracked;
   a file overwritten in place (same file id) with forged times and the program started from it again isn't caught

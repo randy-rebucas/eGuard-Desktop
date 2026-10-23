@@ -41,8 +41,6 @@ pub enum VerifyError {
     /// Not newer than an uninstall command already accepted: one seen before, sent again.
     #[error("the command isn't newer than one already accepted")]
     Replayed,
-    #[error("the catalog is older than the one already kept")]
-    Rollback,
 }
 
 /// One key the build trusts.
@@ -150,17 +148,25 @@ pub fn verify_uninstall(keys: &TrustedKeys, envelope: &Value, own_device_id: &st
 /// What `GET /catalog` brought.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogUpdate {
-    /// The copy already kept is the newest.
-    Unchanged { version: u64 },
-    /// A newer catalog, verified. Keep it (with its signature) as the last good copy.
+    /// The copy already kept is the server's current one.
+    Unchanged { version: String },
+    /// Another catalog, verified. Keep it (with its signature) as the last good copy.
     Changed(Catalog),
 }
 
-/// Checks a `GET /catalog` answer (as received). A catalog must carry eGuard's signature and the catalog type, and
-/// may not be older than `kept_version` (the last good copy), so an old catalog can't be replayed.
-pub fn verify_catalog(keys: &TrustedKeys, response: &Value, kept_version: Option<u64>) -> Result<CatalogUpdate, VerifyError> {
+/// Checks a `GET /catalog` answer (as received). A catalog must carry eGuard's signature and the catalog type.
+/// "Unchanged" counts only for the version kept (`kept_version`, the last good copy).
+///
+/// The version is a hash of the entries, so it can't say which catalog is newer: a signed older catalog replayed
+/// by someone who can answer for the server (a proxy with its own root certificate) is accepted. What it can do is
+/// limited to the catalog's lists (a publisher removed since is trusted again) until the next real one arrives.
+pub fn verify_catalog(keys: &TrustedKeys, response: &Value, kept_version: Option<&str>) -> Result<CatalogUpdate, VerifyError> {
     if response.get("unchanged").and_then(Value::as_bool) == Some(true) {
-        let version = response.get("version").and_then(Value::as_u64).ok_or(VerifyError::Malformed)?;
+        let version = response.get("version").and_then(crate::wire::catalog_version).ok_or(VerifyError::Malformed)?;
+        // The server answers "unchanged" only for the version it was sent; anything else isn't an answer about ours
+        if kept_version != Some(version.as_str()) {
+            return Err(VerifyError::Malformed);
+        }
         return Ok(CatalogUpdate::Unchanged { version });
     }
     let catalog = response.get("catalog").filter(|c| c.is_object()).ok_or(VerifyError::Malformed)?;
@@ -171,9 +177,6 @@ pub fn verify_catalog(keys: &TrustedKeys, response: &Value, kept_version: Option
     let parsed: Catalog = serde_json::from_value(catalog.clone()).map_err(|_| VerifyError::Malformed)?;
     if parsed.kind != CATALOG_TYPE {
         return Err(VerifyError::WrongType(parsed.kind));
-    }
-    if kept_version.is_some_and(|kept| parsed.version < kept) {
-        return Err(VerifyError::Rollback);
     }
     Ok(CatalogUpdate::Changed(parsed))
 }

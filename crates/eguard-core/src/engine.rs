@@ -375,15 +375,14 @@ impl Engine {
         u64::from(outcome.next_sync_secs) * 1000
     }
 
-    /// `GET /catalog?since=` the kept version. A catalog that doesn't verify, or is older than the kept one, is
-    /// ignored and the kept one stays.
+    /// `GET /catalog?since=` the kept version. A catalog that doesn't verify is ignored and the kept one stays.
     fn refresh_catalog(&mut self, token: &str, s: ClockSample) {
-        let kept = self.catalog.as_ref().map(|c| c.version);
-        let wait_ms = match self.api.catalog(token, kept) {
-            Ok(raw) => match verify_catalog(&self.keys, &raw, kept) {
+        let kept = self.catalog.as_ref().map(|c| c.version.clone());
+        let wait_ms = match self.api.catalog(token, kept.as_deref()) {
+            Ok(raw) => match verify_catalog(&self.keys, &raw, kept.as_deref()) {
                 Ok(CatalogUpdate::Changed(c)) => {
                     self.notes.push(Note::Info(format!("catalog version {} ({} entries)", c.version, c.entries.len())));
-                    // A newer catalog may change what's reported: the next scan uses it
+                    // Another catalog may change what's reported: the next scan uses it
                     self.scan_requested = self.catalog.is_some();
                     self.catalog = Some(c);
                     self.data.catalog = Some(raw);

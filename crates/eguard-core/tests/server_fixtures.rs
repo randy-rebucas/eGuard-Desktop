@@ -142,13 +142,16 @@ fn the_servers_catalog_verifies() {
     assert!(catalog.entries.iter().any(|e| e.kind == CatalogKind::TrustedPublisher && e.match_value == "microsoft corporation"));
     // A key order other than the server's still verifies (the signature covers canonical JSON)
     let reordered: Value = serde_json::from_str(&serde_json::to_string_pretty(&v).unwrap()).unwrap();
-    assert!(verify_catalog(&keys(), &reordered, Some(catalog.version)).is_ok());
-    // Unchanged, and no going back to an older one
+    assert!(verify_catalog(&keys(), &reordered, Some(&catalog.version)).is_ok());
+    // Unchanged only about the version kept
     assert_eq!(
-        verify_catalog(&keys(), &fixture!("catalog-unchanged.json"), Some(catalog.version)),
-        Ok(CatalogUpdate::Unchanged { version: catalog.version })
+        verify_catalog(&keys(), &fixture!("catalog-unchanged.json"), Some(&catalog.version)),
+        Ok(CatalogUpdate::Unchanged { version: catalog.version.clone() })
     );
-    assert_eq!(verify_catalog(&keys(), &v, Some(catalog.version + 1)), Err(VerifyError::Rollback));
+    assert_eq!(verify_catalog(&keys(), &fixture!("catalog-unchanged.json"), Some("0123456789abcdef")), Err(VerifyError::Malformed));
+    assert_eq!(verify_catalog(&keys(), &fixture!("catalog-unchanged.json"), None), Err(VerifyError::Malformed));
+    // A version is a hash, with no order: a catalog other than the kept one is simply another one
+    assert!(matches!(verify_catalog(&keys(), &v, Some("0123456789abcdef")), Ok(CatalogUpdate::Changed(_))));
 }
 
 #[test]

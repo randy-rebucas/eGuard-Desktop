@@ -787,14 +787,39 @@ pub struct CatalogEntry {
 pub struct Catalog {
     #[serde(rename = "type")]
     pub kind: String,
-    pub version: u64,
+    /// A hash of the entries (mobile-api, `GET /catalog`): it only tells one catalog from another, never which is
+    /// newer, so it's compared as a string. Read from a number too (`catalog_version`).
+    #[serde(deserialize_with = "de_catalog_version")]
+    pub version: String,
     pub entries: Vec<CatalogEntry>,
+}
+
+/// A catalog's `version` as a string. The server sends a 16-character hash; earlier servers sent a number, which a
+/// kept copy from then still has.
+pub fn catalog_version(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => n.as_u64().map(|n| n.to_string()),
+        _ => None,
+    }
+}
+
+fn de_catalog_version<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    catalog_version(&serde_json::Value::deserialize(d)?).ok_or_else(|| serde::de::Error::custom("a catalog version is a string"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn a_catalog_version_is_the_servers_hash_or_an_older_number() {
+        let read = |version: Value| serde_json::from_value::<Catalog>(json!({ "type": "t", "version": version, "entries": [] }));
+        assert_eq!(read(json!("3f9a0c1d2e4b5a6c")).unwrap().version, "3f9a0c1d2e4b5a6c");
+        assert_eq!(read(json!(1_792_758_987_201_u64)).unwrap().version, "1792758987201");
+        assert!(read(json!("")).is_err() && read(json!(null)).is_err() && read(json!(-1)).is_err());
+    }
 
     fn utf16_len(s: &str) -> usize {
         s.encode_utf16().count()

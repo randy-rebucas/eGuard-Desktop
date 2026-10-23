@@ -197,8 +197,12 @@ impl Api {
     }
 
     /// `GET /catalog?since=<version>`. Raw JSON: `signature::verify_catalog` checks it as received.
-    pub fn catalog(&self, token: &str, since: Option<u64>) -> Result<Value, ApiError> {
-        let query = since.map(|v| format!("?since={v}")).unwrap_or_default();
+    pub fn catalog(&self, token: &str, since: Option<&str>) -> Result<Value, ApiError> {
+        // A version is a hash or a number; anything else (a kept copy someone edited) just fetches the whole catalog
+        let query = since
+            .filter(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric()))
+            .map(|v| format!("?since={v}"))
+            .unwrap_or_default();
         let res = self.transport.send(HttpRequest {
             method: Method::Get,
             url: self.server.device(&format!("/catalog{query}")),
