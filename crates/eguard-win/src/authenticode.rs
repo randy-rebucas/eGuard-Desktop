@@ -127,9 +127,14 @@ fn catalog_member(admin: isize, handle: HANDLE, path: &std::path::Path) -> Optio
     result
 }
 
-/// Microsoft's name on a signature (O "Microsoft Corporation", CN "Microsoft Windows" or a hardware-publisher CN).
+/// The names Microsoft signs Windows' own files with (lower case), matched whole: a prefix would also take any
+/// company whose name merely starts with "Microsoft ".
+const MICROSOFT_NAMES: [&str; 3] = ["microsoft corporation", "microsoft windows", "microsoft windows publisher"];
+
+/// Microsoft's name on a signature: O "Microsoft Corporation", or CN "Microsoft Windows" / "Microsoft Windows
+/// Publisher" (WHQL's hardware publisher carries O "Microsoft Corporation" too).
 pub fn is_microsoft(s: &Signer) -> bool {
-    [s.organization.as_deref(), s.common_name.as_deref()].into_iter().flatten().any(|n| n.starts_with("microsoft "))
+    [s.organization.as_deref(), s.common_name.as_deref()].into_iter().flatten().any(|n| MICROSOFT_NAMES.contains(&n))
 }
 
 /// Signed by Microsoft, embedded or through a catalog (spec section 7: never block Windows' own programs).
@@ -205,6 +210,17 @@ mod tests {
         assert!(!microsoft_signed(&plain));
         std::fs::remove_file(&plain).unwrap();
         assert!(!microsoft_signed(std::path::Path::new(r"C:\no\such\file.exe")));
+    }
+
+    #[test]
+    fn only_microsoft_own_names_count_as_microsoft() {
+        let s = |o: Option<&str>, cn: Option<&str>| Signer { organization: o.map(str::to_owned), common_name: cn.map(str::to_owned) };
+        assert!(is_microsoft(&s(Some("microsoft corporation"), Some(".net"))));
+        assert!(is_microsoft(&s(None, Some("microsoft windows"))));
+        assert!(is_microsoft(&s(Some("x"), Some("microsoft windows publisher"))));
+        assert!(!is_microsoft(&s(Some("microsoft games ltd"), Some("microsoft windows games"))));
+        assert!(!is_microsoft(&s(Some("microsoft corporation ltd"), None)));
+        assert!(!is_microsoft(&s(None, None)));
     }
 
     #[test]
