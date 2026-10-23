@@ -9,8 +9,8 @@ use crate::accounts::{self, Account, AccountChoice, UnknownAccount};
 use crate::api::{Api, ApiError};
 use crate::clock::{ClockChange, ClockSample};
 use crate::enforce::{Inputs, Inventory};
-use crate::queue::{self, Settled};
-use crate::removal::{AttemptResult, RemovalSecret};
+use crate::queue::{self, Outbound, SendOutcome, Settled};
+use crate::removal::{AttemptResult, RemovalSecret, Removing};
 use crate::report::{self, Capabilities};
 use crate::scan::{self, Classifier, ExeCache, ScanResult};
 use crate::signature::{CatalogUpdate, TrustedKeys, verify_catalog};
@@ -29,6 +29,13 @@ pub const SCAN_EVERY_MS: i64 = 6 * 60 * 60_000;
 const CATALOG_EVERY_MS: u64 = 6 * 60 * 60_000;
 /// Scans asked for by a change (an install writes many keys) wait at least this long after the last.
 pub const SCAN_MIN_GAP_MS: i64 = 2 * 60_000;
+/// One `TAMPER` of each kind per this long: the server raises one alert per kind and hour anyway.
+pub const TAMPER_EVERY_MS: i64 = 60 * 60_000;
+/// While one of the child's accounts is an administrator, `ADMIN_ACCOUNT` is sent again this often.
+pub const ADMIN_ALERT_EVERY_MS: i64 = 24 * 60 * 60_000;
+/// eGuard's signed command waits this long for the server to hear `UNINSTALL_ACK` before removing anyway: the command
+/// is eGuard's word, and a server that stops answering mustn't keep a removal waiting forever.
+pub const ACK_WAIT_MS: i64 = 10 * 60_000;
 
 /// The computer as `/pair`, `/sync` and `/report` describe it. Cut to the server's limits by `DeviceInfo::new`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +95,32 @@ pub struct Paired {
     pub child_name: String,
 }
 
+/// Where eGuard's own removal stands (`Engine::removal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    /// Nothing authorized it.
+    None,
+    /// Authorized by eGuard's command; the server hasn't heard yet. Asked again at the next tick.
+    Wait,
+    /// Remove eGuard now.
+    Remove,
+    /// The server said no removal waits (409): the parent kept the computer. Nothing is removed.
+    Kept,
+}
+
+/// What the parent reads on the device page while one of the child's accounts is an administrator.
+fn admin_reason(names: &[String]) -> String {
+    let who = match names {
+        [one] => format!("{one} is an administrator"),
+        [rest @ .., last] => format!("{} and {last} are administrators", rest.join(", ")),
+        [] => String::new(),
+    };
+    format!(
+        "{who} on this computer, and an administrator can remove eGuard. Make the account a standard one: Settings › Accounts › \
+         Other users › Change account type."
+    )
+}
+
 /// What a tick did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tick {
@@ -123,6 +156,8 @@ pub struct Engine {
     catalog_failures: u32,
     /// Something changed (an Uninstall key, a launcher's folder): scan again soon.
     scan_requested: bool,
+    /// The child's accounts that are administrators, as last looked at (`observe_accounts`).
+    child_admins: Vec<String>,
     notes: Vec<Note>,
     jitter: fn() -> f64,
 }
@@ -175,6 +210,7 @@ impl Engine {
             next_catalog_mono_ms: 0,
             catalog_failures: 0,
             scan_requested: false,
+            child_admins: Vec::new(),
             notes,
             jitter: random_unit,
         }
@@ -353,11 +389,8 @@ impl Engine {
             self.clock_changed(c, now_ms);
         }
         if let Some(cmd) = &outcome.uninstall {
-            // Acting on it comes with removal (spec section 10); until then the computer keeps enforcing
-            self.notes.push(Note::Warn(format!(
-                "eGuard asked to remove this computer (verified, requested {}); this version can't remove itself yet",
-                cmd.requested_at
-            )));
+            self.notes.push(Note::Warn(format!("eGuard asked to remove this computer (verified, requested {})", cmd.requested_at)));
+            self.authorize_removal(None, now_ms);
         }
         if let Some(e) = &outcome.uninstall_rejected {
             self.notes.push(Note::Warn(format!("an uninstall command failed verification and was ignored: {e}")));
@@ -373,7 +406,7 @@ impl Engine {
     /// before the first good `/sync`: the report answers the parent's policy.
     fn report_if_changed(&mut self, force: bool, info: &DeviceInfo, now_ms: i64) {
         let Some(sync) = self.data.agent.as_ref().and_then(|a| a.last_sync.as_ref()) else { return };
-        let protections = report::protections(sync, &self.caps);
+        let protections = report::protections(sync, &self.caps_now());
         if !force && self.data.last_reported.as_ref() == Some(&protections) {
             return;
         }
@@ -381,6 +414,16 @@ impl Engine {
         body.accounts.clone_from(&self.data.accounts_reported);
         self.data.queue.push_report(body, now_ms);
         self.data.last_reported = Some(protections);
+    }
+
+    /// What this computer can do now: the platform's capabilities, except that removal protection never holds while
+    /// one of the child's accounts is an administrator (spec principle 2), and the parent is told why.
+    fn caps_now(&self) -> Capabilities {
+        let mut caps = self.caps.clone();
+        if !self.child_admins.is_empty() {
+            caps.uninstall_protection = Err(admin_reason(&self.child_admins));
+        }
+        caps
     }
 
     /// Whether web filtering holds now (`Capabilities::web`; the platform sets up the browsers after each tick). A
@@ -503,11 +546,29 @@ impl Engine {
     /// The computer's Windows accounts, looked at again (at start and every few minutes). An account not seen
     /// before is news once (`TAMPER` `NEW_ACCOUNT`) and isn't enforced; the list goes to `/report` when it changed.
     /// Returns true when `data` changed.
-    pub fn observe_accounts(&mut self, list: &[Account], now_ms: i64) -> bool {
+    ///
+    /// One of the child's accounts being an administrator is news too (`ADMIN_ACCOUNT`, again every day while it
+    /// lasts), and removal protection is reported off with why (spec principle 2).
+    pub fn observe_accounts(&mut self, list: &[Account], info: &DeviceInfo, now_ms: i64) -> bool {
         if !self.enforces() || list.is_empty() {
             return false;
         }
         let mut changed = false;
+        let admins: Vec<String> =
+            list.iter().filter(|a| a.admin && accounts::applies(self.data.accounts.as_ref(), &a.sid)).map(|a| a.name.clone()).collect();
+        if admins.is_empty() {
+            changed |= self.data.admin_alert_ms.take().is_some();
+        } else if self.data.admin_alert_ms.is_none_or(|t| !(0..ADMIN_ALERT_EVERY_MS).contains(&(now_ms - t))) {
+            self.notes.push(Note::Warn(format!("the child's account is an administrator: {}", admins.join(", "))));
+            self.data.queue.push_event(EventEnvelope::new(DeviceEvent::Tamper { kind: TamperKind::AdminAccount }), now_ms);
+            self.data.admin_alert_ms = Some(now_ms);
+            changed = true;
+        }
+        if admins != self.child_admins {
+            self.child_admins = admins;
+            self.report_if_changed(false, info, now_ms);
+            changed = true;
+        }
         if let Some(choice) = self.data.accounts.as_mut() {
             let new: Vec<String> = choice.take_new(list).into_iter().map(|a| a.name.clone()).collect();
             if !new.is_empty() {
@@ -552,6 +613,101 @@ impl Engine {
             self.data.queue.push_event(EventEnvelope::new(DeviceEvent::Tamper { kind: TamperKind::RemovalCodeGuessed }), now_ms);
         }
         Some(result)
+    }
+
+    /// Queues a `TAMPER` the platform saw (spec section 11), at most one of each kind per `TAMPER_EVERY_MS`. Nothing
+    /// before pairing. True when it was queued.
+    pub fn tamper(&mut self, kind: TamperKind, now_ms: i64) -> bool {
+        if !self.enforces() || self.data.tamper_sent.get(&kind).is_some_and(|&t| (0..TAMPER_EVERY_MS).contains(&(now_ms - t))) {
+            return false;
+        }
+        self.data.tamper_sent.insert(kind, now_ms);
+        self.data.queue.push_event(EventEnvelope::new(DeviceEvent::Tamper { kind }), now_ms);
+        true
+    }
+
+    /// eGuard's signed command or a right code authorized removal. A code given while a command waits for the server
+    /// is kept, so the server hears it.
+    fn authorize_removal(&mut self, code: Option<String>, now_ms: i64) {
+        if let Some(r) = self.data.removing.as_mut() {
+            if r.code.is_none() {
+                r.code = code;
+            }
+            return;
+        }
+        self.notes.push(Note::Warn(format!(
+            "removal authorized by {}",
+            if code.is_some() { "a removal code" } else { "eGuard's signed command" }
+        )));
+        self.data.removing = Some(Removing { code, since_ms: now_ms, ready: false });
+    }
+
+    /// Where eGuard's own removal stands. While it waits for the server, this tells it (`UNINSTALL_ACK`, with the
+    /// code when a code authorized it) before anything is removed (spec section 10):
+    /// - delivered, or 401 (the device is already gone from eGuard): remove;
+    /// - 409: no removal waits, the parent kept the computer: nothing is removed, and the authorization is dropped;
+    /// - anything else: a code decides alone (the computer is offline, which is what codes are for); eGuard's command
+    ///   waits for the server up to `ACK_WAIT_MS`, then removes anyway.
+    ///
+    /// Call it after a tick; `Remove` stays `Remove` across restarts.
+    pub fn removal(&mut self, now_ms: i64) -> Removal {
+        let Some(r) = self.data.removing.clone() else { return Removal::None };
+        if r.ready {
+            return Removal::Remove;
+        }
+        let ack = Outbound::Event(EventEnvelope::new(DeviceEvent::UninstallAck { code: r.code.clone() }));
+        let outcome = self.secrets.as_ref().map_or(SendOutcome::Unreachable, |s| self.api.send(&s.token, &ack));
+        let ready = match outcome {
+            SendOutcome::Delivered | SendOutcome::Unauthorized => true,
+            SendOutcome::Conflict => {
+                self.notes.push(Note::Warn("eGuard says no removal waits (the parent kept this computer); eGuard stays".into()));
+                self.data.removing = None;
+                return Removal::Kept;
+            }
+            _ if r.code.is_some() => true,
+            _ => now_ms - r.since_ms >= ACK_WAIT_MS,
+        };
+        if !ready {
+            self.notes.push(Note::Warn(format!("eGuard didn't take the removal's acknowledgement ({outcome:?}); trying again")));
+            return Removal::Wait;
+        }
+        self.notes.push(Note::Warn(format!("removing eGuard from this computer (acknowledgement: {outcome:?})")));
+        if let Some(r) = self.data.removing.as_mut() {
+            r.ready = true;
+        }
+        Removal::Remove
+    }
+
+    /// "Remove with a code" (spec section 10): checks the code (counting wrong ones toward the lockout) and, when it's
+    /// right, tells the server before anything is removed. `Ok`: eGuard is being removed. The words are for the
+    /// person at the computer.
+    pub fn remove_with_code(&mut self, input: &str, now_ms: i64) -> Result<String, String> {
+        const REMOVING: &str = "The code is right. eGuard is removing itself from this computer.";
+        if self.data.removing.as_ref().is_some_and(|r| r.ready) {
+            return Ok(REMOVING.into());
+        }
+        match self.try_removal_code(input, now_ms) {
+            None => Err("This computer has no removal code. Remove it from the parent dashboard instead.".into()),
+            Some(AttemptResult::Accepted) => {
+                self.authorize_removal(Some(crate::removal::normalize(input)), now_ms);
+                match self.removal(now_ms) {
+                    Removal::Kept => Err("The code is right, but your parent chose to keep eGuard on this computer, so it stays. \
+                                          Your parent was told."
+                        .into()),
+                    _ => Ok(REMOVING.into()),
+                }
+            }
+            Some(AttemptResult::Rejected { remaining }) => {
+                Err(format!("That code isn't right. {remaining} more {} before it locks.", if remaining == 1 { "try" } else { "tries" }))
+            }
+            Some(AttemptResult::LockedOut { until_ms, .. }) => {
+                let minutes = ((until_ms - now_ms).max(0) as u64).div_ceil(60_000);
+                Err(format!(
+                    "Too many wrong codes. Try again in {minutes} {}. Your parent was told.",
+                    if minutes == 1 { "minute" } else { "minutes" }
+                ))
+            }
+        }
     }
 
     /// Queues what enforcement has to tell the server.
@@ -861,7 +1017,7 @@ mod tests {
         let queued = lost.data.queue.len();
         lost.queue_enforcement(vec![DeviceEvent::AppBlocked { app: "Counter-Strike 2".into() }], vec![], t0);
         assert_eq!(lost.data.queue.len(), queued + 1);
-        assert!(lost.observe_accounts(&win_accounts(), t0));
+        assert!(lost.observe_accounts(&win_accounts(), &info(), t0));
         // Shown as paired but not authorized
         let status = lost.status();
         assert!(status.paired && !status.authorized);
@@ -961,16 +1117,16 @@ mod tests {
         let p = e.pair("7jx8-7r2f", &info()).unwrap();
         e.adopt(p, Some(AccountChoice::standard(&win_accounts())));
         assert!(e.account_applies("S-1-5-21-9-1002") && !e.account_applies("S-1-5-21-9-1001"));
-        assert!(e.observe_accounts(&win_accounts(), 0));
-        assert!(!e.observe_accounts(&win_accounts(), 1));
+        assert!(e.observe_accounts(&win_accounts(), &info(), 0));
+        assert!(!e.observe_accounts(&win_accounts(), &info(), 1));
         let sent = reported_accounts(&e);
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].iter().map(|a| (a.name.as_str(), a.enforced)).collect::<Vec<_>>(), [("Carla", false), ("Mia", true)]);
 
         let mut later = win_accounts();
         later.push(Account { sid: "S-1-5-21-9-1003".into(), name: "Sneaky".into(), admin: false });
-        assert!(e.observe_accounts(&later, 2));
-        e.observe_accounts(&later, 3);
+        assert!(e.observe_accounts(&later, &info(), 2));
+        e.observe_accounts(&later, &info(), 3);
         assert_eq!(tampers(&e), [TamperKind::NewAccount]);
         assert!(!e.account_applies("S-1-5-21-9-1003"));
         assert_eq!(e.enforce_inputs().accounts.map(|s| s.len()), Some(1));
@@ -979,7 +1135,7 @@ mod tests {
         e.set_accounts(&later, &["mia".into(), "Sneaky".into()]).unwrap();
         assert!(e.account_applies("S-1-5-21-9-1003"));
         assert!(e.set_accounts(&later, &["Nobody".into()]).is_err());
-        e.observe_accounts(&later, 4);
+        e.observe_accounts(&later, &info(), 4);
         assert!(reported_accounts(&e).last().unwrap().iter().all(|a| a.enforced == (a.name != "Carla")));
     }
 
@@ -988,9 +1144,170 @@ mod tests {
         let t = Scripted::new(vec![]);
         let (mut e, _) = paired(&t);
         assert!(e.account_applies("S-1-5-21-9-1001"));
-        e.observe_accounts(&win_accounts(), 0);
-        assert_eq!(tampers(&e), Vec::<TamperKind>::new());
+        e.observe_accounts(&win_accounts(), &info(), 0);
+        // Carla is an administrator, and every account is the child's
+        assert_eq!(tampers(&e), [TamperKind::AdminAccount]);
         assert!(reported_accounts(&e)[0].iter().all(|a| a.enforced));
+    }
+
+    #[test]
+    fn a_childs_administrator_account_is_news_daily_and_turns_removal_protection_off() {
+        let t = Scripted::new(vec![json(201, &fixture("pair-response.json"))]);
+        let mut e = engine(&t);
+        let p = e.pair("7jx8-7r2f", &info()).unwrap();
+        let mut list = win_accounts();
+        e.adopt(p, Some(AccountChoice::standard(&list)));
+        // Only Carla is an administrator, and she isn't the child
+        e.observe_accounts(&list, &info(), 0);
+        assert_eq!(tampers(&e), []);
+        assert_eq!(e.caps_now().uninstall_protection, caps().uninstall_protection);
+
+        // Mia is made an administrator
+        list[1].admin = true;
+        assert!(e.observe_accounts(&list, &info(), 1_000));
+        e.observe_accounts(&list, &info(), 1_000 + TAMPER_EVERY_MS);
+        assert_eq!(tampers(&e), [TamperKind::AdminAccount]);
+        let why = e.caps_now().uninstall_protection.unwrap_err();
+        assert!(why.starts_with("Mia is an administrator on this computer"), "{why}");
+        e.observe_accounts(&list, &info(), 1_000 + ADMIN_ALERT_EVERY_MS);
+        assert_eq!(tampers(&e), [TamperKind::AdminAccount, TamperKind::AdminAccount]);
+
+        // Standard again: the platform's own answer comes back, and a later change is news at once
+        list[1].admin = false;
+        assert!(e.observe_accounts(&list, &info(), 2 * ADMIN_ALERT_EVERY_MS));
+        assert_eq!(e.caps_now().uninstall_protection, caps().uninstall_protection);
+        list[1].admin = true;
+        e.observe_accounts(&list, &info(), 2 * ADMIN_ALERT_EVERY_MS + 1);
+        assert_eq!(tampers(&e).len(), 3);
+        assert_eq!(
+            admin_reason(&["Mia".into(), "Sam".into(), "Leo".into()]).split(" on ").next(),
+            Some("Mia, Sam and Leo are administrators")
+        );
+    }
+
+    #[test]
+    fn tamper_is_queued_once_per_kind_and_hour_and_never_before_pairing() {
+        let t = Scripted::new(vec![]);
+        assert!(!engine(&t).tamper(TamperKind::SafeMode, 0));
+        let (mut e, _) = paired(&t);
+        assert!(e.tamper(TamperKind::SafeMode, 0));
+        assert!(!e.tamper(TamperKind::SafeMode, TAMPER_EVERY_MS - 1));
+        assert!(e.tamper(TamperKind::FilesChanged, 1));
+        assert!(e.tamper(TamperKind::SafeMode, TAMPER_EVERY_MS));
+        assert_eq!(tampers(&e), [TamperKind::SafeMode, TamperKind::FilesChanged, TamperKind::SafeMode]);
+    }
+
+    /// A paired engine that synced once, then got eGuard's signed uninstall command. Returns eGuard's time then.
+    fn asked_to_remove(t: &Arc<Scripted>) -> (Engine, i64) {
+        let (mut e, _) = paired(t);
+        let mut first = fixture("sync-computer.json");
+        first["deviceId"] = j!(e.secrets.as_ref().unwrap().device_id);
+        let first_at = first["serverTime"].as_str().unwrap().to_owned();
+        t.answers.lock().unwrap().push(json(200, &first));
+        e.tick(at(1_000, &first_at), &info());
+        let removal = fixture("sync-removal.json");
+        let removal_at = removal["serverTime"].as_str().unwrap().to_owned();
+        let mono = 1_000 + (crate::clock::parse_iso_ms(&removal_at).unwrap() - crate::clock::parse_iso_ms(&first_at).unwrap()) as u64;
+        *t.answers.lock().unwrap() = vec![json(200, &removal)];
+        e.sync_soon();
+        e.tick(at(mono, &removal_at), &info());
+        assert!(e.data.removing.as_ref().is_some_and(|r| r.code.is_none() && !r.ready), "{:?}", e.take_notes());
+        (e, crate::clock::parse_iso_ms(&removal_at).unwrap())
+    }
+
+    /// The body of the last request sent.
+    fn last_body(t: &Arc<Scripted>) -> Value {
+        serde_json::from_slice(t.seen.lock().unwrap().last().unwrap().body.as_ref().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn eguards_command_is_acknowledged_before_anything_is_removed() {
+        let t = Scripted::new(vec![]);
+        let (mut e, now) = asked_to_remove(&t);
+        t.answers.lock().unwrap().push(json(200, &j!({ "ok": true })));
+        assert_eq!(e.removal(now), Removal::Remove);
+        let ack = last_body(&t);
+        assert_eq!(ack["type"], "UNINSTALL_ACK");
+        assert!(ack.get("code").is_none());
+        // Decided: a restart part way carries on without asking the server again
+        let asked = t.seen.lock().unwrap().len();
+        let data = e.data.clone();
+        let api = Api::new(ServerUrl::parse("http://localhost:3000", true).unwrap(), Box::new(t.clone()));
+        let mut again = Engine::new(data, e.secrets.clone(), api, TrustedKeys::builtin().unwrap(), caps());
+        assert_eq!(again.removal(now), Removal::Remove);
+        assert_eq!(t.seen.lock().unwrap().len(), asked);
+    }
+
+    #[test]
+    fn a_kept_computer_removes_nothing() {
+        let t = Scripted::new(vec![]);
+        let (mut e, now) = asked_to_remove(&t);
+        t.answers.lock().unwrap().push(json(409, &fixture("events-uninstall-ack-409.json")));
+        assert_eq!(e.removal(now), Removal::Kept);
+        assert_eq!(e.data.removing, None);
+        assert_eq!(e.removal(now), Removal::None);
+    }
+
+    #[test]
+    fn eguards_command_waits_for_the_server_then_removes_anyway() {
+        let t = Scripted::new(vec![]);
+        let (mut e, now) = asked_to_remove(&t);
+        assert_eq!(e.removal(now), Removal::Wait);
+        t.answers.lock().unwrap().push(json(500, &j!({ "error": "boom" })));
+        assert_eq!(e.removal(now + ACK_WAIT_MS - 1), Removal::Wait);
+        assert_eq!(e.removal(now + ACK_WAIT_MS), Removal::Remove);
+        // A device already deleted (401) is removed at once
+        let t = Scripted::new(vec![]);
+        let (mut e, now) = asked_to_remove(&t);
+        t.answers.lock().unwrap().push(json(401, &j!({ "error": "Unauthorized" })));
+        assert_eq!(e.removal(now), Removal::Remove);
+    }
+
+    fn code_now(e: &Engine, now: i64) -> String {
+        let s = e.secrets.as_ref().unwrap();
+        let secret = RemovalSecret::from_base64url(s.removal_secret.as_deref().unwrap()).unwrap();
+        crate::removal::code_for_window(&secret, &s.device_id, crate::removal::window_of(now))
+    }
+
+    #[test]
+    fn remove_with_a_code_online_offline_and_kept() {
+        let t = Scripted::new(vec![]);
+        let (mut e, _) = paired(&t);
+        let now = 1_792_768_673_160;
+        assert_eq!(e.remove_with_code("AAAA-AAAA", now).unwrap_err(), "That code isn't right. 4 more tries before it locks.");
+        assert_eq!(e.removal(now), Removal::None);
+
+        // Kept by the parent after they saw the code: the server says so, and eGuard stays
+        t.answers.lock().unwrap().push(json(409, &fixture("events-uninstall-ack-code-kept-409.json")));
+        let code = code_now(&e, now);
+        let typed = format!("{} {}", &code[..4], code[4..].to_lowercase());
+        assert!(e.remove_with_code(&typed, now).unwrap_err().contains("chose to keep"));
+        assert_eq!(last_body(&t)["code"], j!(code));
+        assert_eq!(e.data.removing, None);
+
+        // Online: the server hears the code first
+        t.answers.lock().unwrap().push(json(200, &fixture("events-uninstall-ack-code-response.json")));
+        assert!(e.remove_with_code(&code, now).is_ok());
+        assert_eq!(e.removal(now), Removal::Remove);
+
+        // Offline: the code decides alone
+        let t = Scripted::new(vec![]);
+        let (mut e, _) = paired(&t);
+        let code = code_now(&e, now);
+        assert!(e.remove_with_code(&code, now).is_ok());
+        assert_eq!(e.removal(now), Removal::Remove);
+
+        // Locked out after five wrong ones, in minutes
+        let t = Scripted::new(vec![]);
+        let (mut e, _) = paired(&t);
+        for _ in 0..4 {
+            let _ = e.remove_with_code("AAAAAAAA", now);
+        }
+        assert_eq!(
+            e.remove_with_code("AAAAAAAA", now).unwrap_err(),
+            "Too many wrong codes. Try again in 15 minutes. Your parent was told."
+        );
+        assert!(e.remove_with_code(&code_now(&e, now), now).unwrap_err().starts_with("Too many wrong codes"));
     }
 
     #[test]

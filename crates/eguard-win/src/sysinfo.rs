@@ -81,6 +81,13 @@ pub fn battery() -> Option<u8> {
     (s.BatteryFlag != 128 && s.BatteryFlag != 255 && s.BatteryLifePercent <= 100).then_some(s.BatteryLifePercent)
 }
 
+/// Windows started in Safe Mode (spec section 10: `SAFE_MODE`). `SM_CLEANBOOT` is 1 for Safe Mode and 2 for Safe
+/// Mode with networking.
+pub fn safe_mode() -> bool {
+    // SAFETY: a plain metric read.
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows_sys::Win32::UI::WindowsAndMessaging::SM_CLEANBOOT) != 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

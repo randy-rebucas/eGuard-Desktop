@@ -1,6 +1,7 @@
 # Status
 
-Updated 2026-10-24: Phase 5 (web), below. Before it: Phase 4, the owner's decisions, a full audit and its fixes.
+Updated 2026-10-24: Phase 6, part 1 (the removal flow and tamper reporting), below. Before it: Phase 5 (web),
+Phase 4, the owner's decisions, a full audit and its fixes.
 
 | Phase | What | Status |
 |---|---|---|
@@ -9,10 +10,65 @@ Updated 2026-10-24: Phase 5 (web), below. Before it: Phase 4, the owner's decisi
 | 3 | Scanning and identification (spec 5, 6) | Done: the last two the gate left (the XPrinter driver, Discord's leftover updater) are left out since 2026-10-23 (`scan::left_out`) |
 | 4 | Enforcement and time (spec 7, 8) | **Built and checked on this PC with stand-ins.** Tests 3–5 pass in console mode; the gate waits for the VM: test 6, everything as SYSTEM, real games (Q3) |
 | 5 | Web (spec 9) | **Built and checked on this PC** with a stand-in browser and an inert copy of the policies. The prompt gives no "Done when"; real browsers wait for the VM and for the extension's store ids, and 6 items wait for the owner (below) |
-| 6 | Removal protection and tamper (spec 10, 11) | Next. Needs a VM |
+| 6 | Removal protection and tamper (spec 10, 11) | **Part 1 built and checked on this PC** (the removal flow, "Remove with a code", tamper reporting, `ADMIN_ACCOUNT`). Part 2 (installer, service lock, guard, Safe Mode registration) waits for the VM and two decisions (below) |
 | 7 | Hardening and release readiness | Needs the code-signing certificate |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## Phase 6, part 1: what was built (2026-10-24)
+
+The owner agreed (2026-10-24) to split Phase 6. Part 1 is what can be built and checked on this PC: the removal flow
+and tamper reporting. Part 2 is everything that locks eGuard in place: the WiX MSI, the service's permissions, the
+guard task and its file cache, and Safe Mode registration. Those are security changes to a PC, so per the prompt's
+"ask me first" list they're built and tried on a VM. Part 2 hasn't been started (no WiX/.NET SDK here either).
+
+| Crate / module | What it does |
+|---|---|
+| core `removal`, `store` | `Removing { code, since_ms, ready }` in `Persisted`, so a restart part way carries on removing. `tamper_sent` (one per kind per hour, `TAMPER_EVERY_MS`) and `admin_alert_ms` |
+| core `engine` | A verified uninstall command (or a right code) authorizes removal. `removal(now)` sends `UNINSTALL_ACK` (with the code when a code authorized it) **before** anything is removed. Delivered or 401 (device already gone): remove. 409 (the parent kept it): nothing removed, the authorization is dropped. Anything else: a code decides alone (offline is what codes are for). eGuard's command waits up to `ACK_WAIT_MS` (10 min) for the server, then removes anyway. `remove_with_code` gives words for the person at the PC: wrong ("4 more tries"), locked ("Try again in 15 minutes. Your parent was told."), kept, removing. `tamper(kind)`. `observe_accounts` now also flags a child's account that's an administrator: `ADMIN_ACCOUNT` at once and daily while it lasts, and UNINSTALL_PROTECTION reported off with "Mia is an administrator on this computer, and an administrator can remove eGuard. Make the account a standard one: Settings › Accounts › Other users › Change account type." |
+| core `ipc` | `removeWithCode { code }` (either pipe), `removing { message }`, `removed` (the answer to a heartbeat after removal: the agent closes its screens and exits). Optional additions, protocol still 1 |
+| `eguard-service` `runner`, `sessions`, `store`, `web`, `svc` | After each tick: `removal`. Removing: save, tell the agents (`Removed`), take out the browser policies (`Browsers::remove`, the place this runner writes), mark the service for deletion (service mode, `svc::delete_self`), delete the data folder but `logs` (`Store::remove_all`), stop. Nothing is saved after. Console mode installed no service, so it removes its dev data and dev policies only. `SAFE_MODE` is queued at start when `GetSystemMetrics(SM_CLEANBOOT)` says so |
+| `eguard-win` `codebox`, `sysinfo` | The "Remove eGuard" window (Win32: an edit box, Remove/Close; Enter, Tab, Esc work; the service's words under the box). `safe_mode()` |
+| `eguard-agent` | `remove [CODE] [--dev]`: on the admin pipe if allowed (an administrator, console mode), else this session's pipe (a child's account: the service answers only `eguard-agent.exe` beside it). Without a code, the window |
+| `tools/dev-family.mjs` | `remove [now]` (prints the offline code), `keep` |
+
+**Verified (2026-10-24, on this PC, console mode, `--sandbox`, paired with `--accounts CodexSandboxOnline`, against
+the dev server; family deleted after):**
+- `cargo test --workspace`: 214 passed, 1 ignored (core 160 + 14 fixture, win 34, service 6). Clippy (pedantic) and
+  fmt clean. New tests: the command acknowledged before removal (and still decided after a restart, without asking
+  again), kept (409), the server failing then 10 minutes passing, 401, codes online/offline/kept/locked, the tamper
+  limit, `ADMIN_ACCOUNT` daily and the report's reason, `Store::remove_all` keeping only `logs`.
+- **Test 9:** "remove" on the dashboard → the computer removed itself **44 s** later ("acknowledgement: Delivered"),
+  and the parent got "Device removed: LocalPro confirmed it uninstalled eGuard". The data folder was left with `logs`
+  only, and the agent closed.
+- **Test 10 (offline):** paired, then console mode restarted against `http://localhost:3999` (nothing listening),
+  removal asked on the dashboard, the code typed in the window → "acknowledgement: Unreachable", removed.
+- **Online code:** typed in the window before the next sync picked up the command → acknowledged with the code,
+  device deleted, removed. A wrong code first showed "That code isn't right. 4 more tries before it locks."
+- **Kept:** removal asked, then "Keep this computer", then the code typed → "The code is right, but your parent chose
+  to keep eGuard on this computer, so it stays." and the parent got "A removal code was used after you kept the
+  computer". Nothing was removed.
+- **Not tried live:** `ADMIN_ACCOUNT` (making the child's account `corew`, an administrator, would put the bedtime
+  overlay on the owner's screen: it was past midnight); covered by the core's tests. `SAFE_MODE` and service-mode
+  removal (`delete_self`, HKLM policies) need the VM.
+
+**For the owner (Phase 6):**
+1. **An offline code removal never reaches the server.** Spec 10 says "When it's back online it sends
+   `UNINSTALL_ACK` with `code`", but by then eGuard is gone. The device stays "Removing" on the dashboard until the
+   parent picks "Remove without waiting" (seen live). Options: the spec says so and the device page suggests it
+   after the code's window, or the server deletes a waiting removal whose computer hasn't synced since its code was
+   shown, after N days. Server/spec, so yours to decide.
+2. **eGuard's signed command removes even without the server hearing it,** after 10 minutes of failed
+   acknowledgements (the command is eGuard's signed word; a 409 still stops it). Say if you'd rather it wait for an
+   answer however long that takes.
+3. **Part 2's two decisions** (asked 2026-10-24, not answered yet): (a) Settings › Uninstall: the spec says both
+   `NoRemove=1` and "the visible Uninstall opens Ask your parent", which Windows 11 can't do together. Recommended: a
+   visible entry whose Uninstall opens `eguard-agent remove` (the window above) and sends `UNINSTALL_BLOCKED` when it's
+   closed without a code. (b) Stop attempts: if the service's permissions refuse `SERVICE_STOP` outright, the service
+   never hears of it and can't send `SERVICE_STOP_DENIED`. Recommended: let the stop request reach the service, which
+   refuses it (outside an authorized removal) and reports it.
+4. `UNINSTALL_BLOCKED`, `SERVICE_STOP_DENIED` and `FILES_CHANGED` aren't sent by anything yet: they come with
+   part 2's installer, service lock and guard. `Engine::tamper` is ready for them.
 
 ## Phase 5: what was built (2026-10-24)
 
@@ -489,12 +545,14 @@ From `~/eguard/docs/desktop-agent-open-questions.md`. Q2, Q4 and Q5 are settled 
 | Q6 Offline clock | **Built** (`clock`), and now fed by the service: samples from `GetTickCount64` + BootId every tick (≤ 60 s), persisted with the state. Stated limit: a forward jump while offline across a reboot can end bedtime early or start a new day until the PC is back online | Done |
 | Q1, Q7, Q8, Q9 | Not decided here; they need the owner (admin-account test 8, self-update design, end-of-life recovery, exclusive fullscreen) | Open |
 
-## Next: Phase 6 (removal protection and tamper, spec 10, 11)
+## Next: Phase 6, part 2 (on the VM)
 
-The WiX MSI, service DACL, guard task, SafeBoot, every TAMPER kind, `ADMIN_ACCOUNT`, the signed uninstall flow with
-`UNINSTALL_ACK` (online: send it with the code and stop on 409) and "Remove with a code" (`Engine::try_removal_code`
-is ready). Removal must take out the browser policies too: `web::remove_machine` (already called by
-`eguard-service uninstall`). It needs a VM.
+The WiX MSI (per machine, `NoModify`, the abort-unless-authorized custom action that asks the running service, the
+ARP entry per decision 3a above), the service's permissions (decision 3b), the guard task and its protected file
+cache (`FILES_CHANGED`), `SafeBoot\Minimal` and `\Network` registration, and removal of all of it from
+`Runner::remove_self` (today it removes the browser policies, the service registration and the data). Then prove
+nothing is left (prompt: "list what you remove"), and acceptance tests 7–10 on the VM. Needs WiX (a .NET SDK isn't
+installed here) and the owner's answers to decisions 3a and 3b.
 
 On the VM before or alongside it: Phase 4's open items (install the service, ETW, agents in a child's session, the
 disconnect and lock backstops, test 6, the Q3 anti-cheat spike) and Phase 5's (above; real browsers need the

@@ -14,11 +14,11 @@
 use crate::accounts::AccountChoice;
 use crate::enforce::Memo;
 use crate::queue::OutboundQueue;
-use crate::removal::CodeAttempts;
+use crate::removal::{CodeAttempts, Removing};
 use crate::scan::{ExeCache, Place};
 use crate::state::AgentState;
 use crate::usage::UsageLedger;
-use crate::wire::{FoundApp, ReportedAccount, ReportedProtection};
+use crate::wire::{FoundApp, ReportedAccount, ReportedProtection, TamperKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -65,6 +65,16 @@ pub struct Persisted {
     /// The accounts as last queued for `/report`, so an unchanged list isn't sent again.
     #[serde(default)]
     pub accounts_reported: Option<Vec<ReportedAccount>>,
+    /// eGuard's own removal, once authorized.
+    #[serde(default)]
+    pub removing: Option<Removing>,
+    /// When each kind of `TAMPER` was last queued (eGuard's time), so a repeated attempt isn't queued again within
+    /// the hour the server would fold it into anyway.
+    #[serde(default)]
+    pub tamper_sent: BTreeMap<TamperKind, i64>,
+    /// When `ADMIN_ACCOUNT` was last queued while one of the child's accounts is an administrator; `None` while none is.
+    #[serde(default)]
+    pub admin_alert_ms: Option<i64>,
 }
 
 impl Default for Persisted {
@@ -84,6 +94,9 @@ impl Default for Persisted {
             enforce: Memo::default(),
             accounts: None,
             accounts_reported: None,
+            removing: None,
+            tamper_sent: BTreeMap::new(),
+            admin_alert_ms: None,
         }
     }
 }

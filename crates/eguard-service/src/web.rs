@@ -68,12 +68,22 @@ impl Browsers {
     }
 }
 
+impl Browsers {
+    /// eGuard is being removed: its policies come out of the place this runner writes (others' entries stay).
+    pub fn remove(&self) -> Result<(), String> {
+        remove_from(&self.place)
+    }
+}
+
 /// Takes eGuard's policies out of the real place (`eguard-service uninstall`).
 pub fn remove_machine() -> Result<(), String> {
-    let place = Place::machine();
+    remove_from(&Place::machine())
+}
+
+fn remove_from(place: &Place) -> Result<(), String> {
     for b in Browser::ALL {
         if let Some(ext) = web::extension(b) {
-            browsers::remove(&place, b, &ext).map_err(|e| format!("taking eGuard's policies out of {}: {e}", b.name()))?;
+            browsers::remove(place, b, &ext).map_err(|e| format!("taking eGuard's policies out of {}: {e}", b.name()))?;
         }
     }
     Ok(())

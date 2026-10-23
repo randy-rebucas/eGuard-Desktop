@@ -133,6 +133,19 @@ impl CodeAttempts {
     }
 }
 
+/// eGuard's own removal, once eGuard's signed command or a right code authorized it (spec section 10). Persisted, so a
+/// restart part way carries on with it rather than asking again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Removing {
+    /// The code typed, as sent with `UNINSTALL_ACK`; `None` when eGuard's signed command authorized it.
+    pub code: Option<String>,
+    /// eGuard's time when it was authorized.
+    pub since_ms: i64,
+    /// The server has heard (or can't be asked): nothing is left but removing.
+    pub ready: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

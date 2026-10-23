@@ -137,3 +137,11 @@ pub fn uninstall() -> Result<(), String> {
     }
     service.delete().map_err(|e| e.to_string())
 }
+
+/// eGuard is removing itself (spec section 10): the service is marked for deletion, which Windows carries out once it
+/// has stopped. Called from inside the running service, as `LocalSystem`.
+pub fn delete_self() -> Result<(), String> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(|e| e.to_string())?;
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE).map_err(|e| e.to_string())?;
+    service.delete().map_err(|e| e.to_string())
+}

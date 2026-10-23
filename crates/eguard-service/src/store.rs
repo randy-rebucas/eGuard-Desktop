@@ -112,6 +112,27 @@ impl Store {
     pub fn save_secrets(&self, secrets: &DeviceSecrets) -> std::io::Result<()> {
         files::write_atomic(&self.secrets_path(), &dpapi::protect(&secrets.to_json())?)
     }
+
+    /// eGuard is being removed: everything in the folder goes (secrets, state, the copies set aside) except `logs`,
+    /// which this process is still writing to. Returns what couldn't be removed, in words.
+    pub fn remove_all(&self) -> Vec<String> {
+        let mut left = Vec::new();
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(e) => e,
+            Err(e) => return vec![format!("{}: {e}", self.dir.display())],
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_name().eq_ignore_ascii_case("logs") {
+                continue;
+            }
+            let removed = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+            if let Err(e) = removed {
+                left.push(format!("{}: {e}", path.display()));
+            }
+        }
+        left
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +188,24 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("state.json"));
         std::fs::remove_file(dir.join("state.prev.json")).unwrap();
         assert_eq!(store.load().0, Persisted::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn removal_takes_everything_but_the_log() {
+        let dir = std::env::temp_dir().join(format!("eguard-store-remove-{}", std::process::id()));
+        let store = Store::open(&dir, None).unwrap();
+        let secrets = DeviceSecrets { device_id: "dev_1".into(), token: "tok".into(), removal_secret: None };
+        store.save_secrets(&secrets).unwrap();
+        store.save_state(&Persisted::recover(&secrets)).unwrap();
+        store.save_state(&Persisted::recover(&secrets)).unwrap();
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::write(dir.join("logs").join("service.log"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("eGuard.untrusted-1")).unwrap();
+        assert_eq!(store.remove_all(), Vec::<String>::new());
+        let left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, ["logs"]);
+        assert_eq!(store.load().1, None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -626,7 +626,7 @@ pub struct FoundApp {
 }
 
 /// What the agent saw someone try (spec section 11). Each raises one alert per hour per computer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TamperKind {
     UninstallBlocked,

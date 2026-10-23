@@ -9,6 +9,8 @@
 //! eguard-agent accounts [--set NAME,NAME]  the Windows accounts and which are the child's; --set changes that
 //! eguard-agent status
 //! eguard-agent scan                        look for installed apps now (at most every 2 minutes)
+//! eguard-agent remove [CODE] [--dev]       "Remove with a code": the offline removal code from the parent's
+//!                                          dashboard (a window asks for it if left out; --dev: console mode)
 //! eguard-agent preview [block|overlay|warning]
 //!                                          show a screen with sample words for a few seconds (development)
 //! ```
@@ -227,11 +229,49 @@ fn session(args: &[String]) -> Result<(), String> {
                 last_answer = Instant::now();
                 ui.show(view);
             }
+            // eGuard removed itself: nothing left to show
+            Ok(Response::Removed) => return Ok(()),
             // Keep showing what was shown: a service that's away doesn't lift a pause
             _ if last_answer.elapsed() > GIVE_UP_AFTER => return Ok(()),
             _ => {}
         }
     }
+}
+
+/// One "Remove with a code" request. An administrator (or console mode) reaches the service's own pipe; anyone else,
+/// the child's account included, goes through this session's pipe, which the service answers only for this exe.
+fn send_code(code: &str, dev: bool) -> Result<String, String> {
+    let request = Request::RemoveWithCode { code: code.to_owned() };
+    let answer = if let Ok(a) = ask(&request) {
+        a
+    } else {
+        let id = process::session_of(process::current_pid()).ok_or("couldn't tell which session this is")?;
+        ask_session(&ipc::session_pipe_name(id), &service_exe(), dev, &request)
+            .map_err(|_| "eGuard's service couldn't be reached. Try again in a minute.".to_owned())?
+    };
+    match answer {
+        Response::Removing { message } => Ok(message),
+        Response::Error { message } => Err(message),
+        _ => Err("unexpected answer from the service".into()),
+    }
+}
+
+/// `eguard-agent remove [CODE]`: with a code, in this console; without, in a window (Settings' "Uninstall" will open
+/// it once the installer exists).
+fn remove(args: &[String]) -> Result<(), String> {
+    let dev = args.iter().any(|a| a == "--dev");
+    let code = args.iter().find(|a| !a.starts_with("--"));
+    if let Some(code) = code {
+        let message = send_code(code, dev)?;
+        println!("{message}");
+        return Ok(());
+    }
+    match eguard_win::codebox::remove_with_code(move |typed| send_code(typed, dev)) {
+        Ok(Some(message)) => println!("{message}"),
+        Ok(None) => println!("eGuard wasn't removed."),
+        Err(e) => return Err(format!("couldn't open the window: {e}")),
+    }
+    Ok(())
 }
 
 /// Shows one screen with sample words, to check how it looks.
@@ -295,8 +335,9 @@ fn main() {
         Some("status") | None => status(),
         Some("scan") => scan(),
         Some("preview") => preview(&args[1..]),
+        Some("remove") => remove(&args[1..]),
         Some(_) => Err(
-            "usage: eguard-agent session [--dev] | pair [CODE] [--name NAME] [--accounts NAME,NAME] | accounts [--set NAME,NAME] | status | scan | preview [block|overlay|warning]"
+            "usage: eguard-agent session [--dev] | pair [CODE] [--name NAME] [--accounts NAME,NAME] | accounts [--set NAME,NAME] | status | scan | remove [CODE] [--dev] | preview [block|overlay|warning]"
                 .into(),
         ),
     };

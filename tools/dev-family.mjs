@@ -8,6 +8,8 @@
 //   node tools/dev-family.mjs limit CATEGORY MINUTES  a category's daily limit (GAMES 1), or `none`
 //   node tools/dev-family.mjs protect KEY JSON        change a protection, e.g. APP_APPROVAL '{"enabled":false}'
 //   node tools/dev-family.mjs screen-time             today's minutes, as the parent's app shows them
+//   node tools/dev-family.mjs remove [now]            remove the paired computer, as the device page does (Phase 6)
+//   node tools/dev-family.mjs keep                    "Keep this computer" while a removal waits
 //   node tools/dev-family.mjs delete    delete the test family and everything in it
 //
 // Like capture-fixtures.mjs it needs ~/eguard's dev database and a dev server (mail goes to Mailpit). The family's
@@ -53,6 +55,15 @@ async function signupCode(to, after) {
 
 async function pairingCode({ token, childId }) {
   return expect(await call("POST", `/children/${childId}/pairing-code`, { token }), 201, "pairing code").code;
+}
+
+/** The family's Windows computer whose removal waits (`removing`), or doesn't. One removed with an offline code
+ * stays "Removing" on the server (its acknowledgement never came), so there can be two. */
+async function computerId(token, removing) {
+  const list = expect(await call("GET", "/devices", { token }), 200, "devices");
+  const d = (list.devices ?? list).find((d) => d.platform === "WINDOWS" && !!d.removalRequestedAt === removing);
+  if (!d) throw new Error(removing ? "no Windows computer waiting for removal" : "no Windows computer paired");
+  return d.id;
 }
 
 const commands = {
@@ -108,6 +119,19 @@ const commands = {
     const { token, childId } = load();
     console.log(JSON.stringify(expect(await call("GET", `/children/${childId}/screen-time`, { token }), 200, "screen time"), null, 2));
   },
+  async remove(_db, now) {
+    const { token } = load();
+    const id = await computerId(token, false);
+    const r = expect(await call("DELETE", `/devices/${id}`, { token, body: { password: PASSWORD, now: now === "now" } }), 200, "remove");
+    const d = r.pending ? expect(await call("GET", `/devices/${id}`, { token }), 200, "device") : null;
+    console.log(r.pending ? `removal waits; offline code ${d.removalCode?.code} (until ${d.removalCode?.expiresAt})` : "removed now");
+  },
+  async keep() {
+    const { token } = load();
+    const id = await computerId(token, true);
+    const d = expect(await call("POST", `/devices/${id}/keep`, { token }), 200, "keep");
+    console.log(`kept; removalRequestedAt ${d.removalRequestedAt ?? "none"}`);
+  },
   async alerts() {
     const { token } = load();
     const r = expect(await call("GET", "/alerts", { token }), 200, "alerts");
@@ -124,7 +148,7 @@ const commands = {
 
 const run = commands[process.argv[2]];
 if (!run) {
-  console.error("usage: node tools/dev-family.mjs create | code | show | apps | app NAME APPROVAL | limit CATEGORY MINUTES | protect KEY JSON | screen-time | alerts | delete");
+  console.error("usage: node tools/dev-family.mjs create | code | show | apps | app NAME APPROVAL | limit CATEGORY MINUTES | protect KEY JSON | screen-time | remove [now] | keep | alerts | delete");
   process.exit(1);
 }
 const db = new PrismaClient();

@@ -27,6 +27,7 @@ use eguard_win::{clock, security, session};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,10 @@ pub struct Shared {
     pub session_sids: SessionSids,
     /// Called after the child asks for something, so the sync loop sends it now.
     wake: Box<dyn Fn() + Send + Sync>,
+    /// "Remove with a code", answered by the runner (it holds the engine).
+    remove_with_code: Box<dyn Fn(&str) -> Response + Send + Sync>,
+    /// eGuard removed itself: agents are told to close, and none is started again.
+    removed: AtomicBool,
 }
 
 impl std::fmt::Debug for Shared {
@@ -77,6 +82,7 @@ impl Shared {
         session_sids: SessionSids,
         console: bool,
         wake: Box<dyn Fn() + Send + Sync>,
+        remove_with_code: Box<dyn Fn(&str) -> Response + Send + Sync>,
     ) -> Self {
         let agent_exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("eguard-agent.exe"))).unwrap_or_default();
         Self {
@@ -88,7 +94,18 @@ impl Shared {
             disconnected: Mutex::new(HashSet::new()),
             session_sids,
             wake,
+            remove_with_code,
+            removed: AtomicBool::new(false),
         }
+    }
+
+    /// eGuard has removed itself: each agent closes at its next heartbeat, and none is started again.
+    pub fn set_removed(&self) {
+        self.removed.store(true, Ordering::SeqCst);
+    }
+
+    fn is_removed(&self) -> bool {
+        self.removed.load(Ordering::SeqCst)
     }
 
     fn is_disconnected(&self, id: u32) -> bool {
@@ -205,8 +222,9 @@ pub fn supervise(shared: &Arc<Shared>) {
                 // time counted (silent agent), which is the stricter way to be wrong
                 Err(e) => log::warn(&format!("session {}: couldn't read its logon ({e})", s.id)),
             }
-            // Not one of the child's accounts (a parent's own on a family PC): no agent, nothing counted or ended
-            if !shared.applies(s.id) {
+            // Not one of the child's accounts (a parent's own on a family PC): no agent, nothing counted or ended.
+            // After removal, nothing at all
+            if !shared.applies(s.id) || shared.is_removed() {
                 continue;
             }
 
@@ -373,6 +391,7 @@ fn genuine_agent(shared: &Shared, id: u32, conn: &std::fs::File) -> Option<u32> 
 fn handle(shared: &Shared, id: u32, client: u32, req: &Request) -> Response {
     let sample = clock::sample();
     match req {
+        Request::Heartbeat { .. } if shared.is_removed() => Response::Removed,
         &Request::Heartbeat { .. } if !shared.applies(id) => Response::Session(SessionView::default()),
         // Switched away from: the agent is alive (so it isn't silent), but nobody is there to see a screen or use time
         &Request::Heartbeat { .. } if shared.is_disconnected(id) => {
@@ -401,6 +420,8 @@ fn handle(shared: &Shared, id: u32, client: u32, req: &Request) -> Response {
             let result = shared.enforcer().ask(id, Ask::Time { notice }, sample);
             asked(shared, result)
         }
+        // The parent may type the code in the child's session; the engine counts wrong ones toward the lockout
+        Request::RemoveWithCode { code } => (shared.remove_with_code)(code),
         Request::Pair { .. } | Request::Status | Request::Scan | Request::Accounts { .. } => {
             Response::Error { message: "That isn't asked on this pipe.".into() }
         }

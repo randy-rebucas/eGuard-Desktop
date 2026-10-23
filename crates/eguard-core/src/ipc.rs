@@ -65,6 +65,11 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notice: Option<u64>,
     },
+    /// "Remove with a code" (spec section 10): the offline removal code from the parent's dashboard, as typed. On
+    /// either pipe: the parent may type it in the child's session.
+    RemoveWithCode {
+        code: String,
+    },
 }
 
 /// One of the agent's screens, in words for the child. The service writes the words; the agent only shows them.
@@ -175,6 +180,12 @@ pub enum Response {
     Asked {
         message: String,
     },
+    /// The removal code was right: eGuard is removing itself. In words for the person at the computer.
+    Removing {
+        message: String,
+    },
+    /// The answer to a heartbeat once eGuard has removed itself: the agent closes its screens and exits.
+    Removed,
     /// In words for the person at the computer.
     Error {
         message: String,
@@ -260,6 +271,11 @@ mod tests {
         let line = encode(&Response::Session(view.clone()));
         assert_eq!(decode::<Response>(&line[..line.len() - 1]).unwrap(), Response::Session(view));
         assert_eq!(session_pipe_name(2), r"\\.\pipe\eguard-session-2");
+        assert_eq!(
+            encode(&Request::RemoveWithCode { code: "MH3N-AL9P".into() }),
+            b"{\"v\":1,\"type\":\"removeWithCode\",\"code\":\"MH3N-AL9P\"}\n"
+        );
+        assert_eq!(encode(&Response::Removed), b"{\"v\":1,\"type\":\"removed\"}\n");
     }
 
     #[test]

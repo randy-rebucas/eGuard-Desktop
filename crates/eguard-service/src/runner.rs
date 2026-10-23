@@ -5,7 +5,8 @@
 //! - scans, on a thread of their own when due;
 //! - the process monitor (`monitor`): ending what the rules say to end;
 //! - the session supervisor (`sessions`): an agent and a pipe per signed-in session;
-//! - the browsers' policies (`web`), after every tick.
+//! - the browsers' policies (`web`), after every tick;
+//! - eGuard's own removal (spec section 10), once eGuard's signed command or a right code authorized it.
 //!
 //! The engine (sync state) and the enforcer (rules in force, usage) each sit behind their own lock, so ending a
 //! program never waits for a network call. After each tick the loop hands the enforcer the newest rules, and takes
@@ -19,18 +20,19 @@ use crate::web::Browsers;
 use eguard_core::accounts::AccountChoice;
 use eguard_core::api::{Api, ServerUrl};
 use eguard_core::enforce::{Enforcer, Memo};
-use eguard_core::engine::{DeviceInfo, Engine, Note};
+use eguard_core::engine::{DeviceInfo, Engine, Note, Removal};
 use eguard_core::ipc::{self, AccountInfo, Request, Response};
 use eguard_core::report::{AVAILABLE, Capabilities};
 use eguard_core::scan::{self, Classifier, ExeCache};
 use eguard_core::signature::TrustedKeys;
 use eguard_core::usage::UsageLedger;
+use eguard_core::wire::TamperKind;
 use eguard_win::apps;
 use eguard_win::{clock, http::WinHttp, pipe::PipeServer, sysinfo};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -129,6 +131,10 @@ pub struct Runner {
     /// Launcher folders the last scan found, for the watcher.
     watch_dirs: Arc<Mutex<Vec<PathBuf>>>,
     browsers: Browsers,
+    /// What the session pipes share, once enforcement has started (removal tells the agents through it).
+    shared: OnceLock<Arc<Shared>>,
+    /// eGuard has removed itself: nothing is saved again.
+    removed: AtomicBool,
 }
 
 fn log_notes(engine: &mut Engine) {
@@ -175,6 +181,8 @@ impl Runner {
             scanning: AtomicBool::new(false),
             watch_dirs: Arc::new(Mutex::new(Vec::new())),
             browsers,
+            shared: OnceLock::new(),
+            removed: AtomicBool::new(false),
         }))
     }
 
@@ -199,6 +207,10 @@ impl Runner {
     }
 
     fn save(&self, inner: &mut Inner) {
+        // Removed: a state written now would be a paired computer's again
+        if self.removed.load(Ordering::SeqCst) {
+            return;
+        }
         {
             let e = self.enforcer();
             inner.engine.data.usage = e.ledger().clone();
@@ -246,6 +258,15 @@ impl Runner {
             if inner.engine.on_start(clock::sample()) {
                 self.save(&mut inner);
             }
+            // Safe Mode is a way around eGuard (spec section 10); the parent hears of it when the computer is back
+            // online
+            if eguard_win::sysinfo::safe_mode() {
+                log::warn("Windows was started in Safe Mode");
+                let now = inner.engine.now_ms(clock::sample());
+                if inner.engine.tamper(TamperKind::SafeMode, now) {
+                    self.save(&mut inner);
+                }
+            }
             log_notes(&mut inner.engine);
             // Before the first sync, so its report already says whether web filtering holds
             self.apply_web(&mut inner);
@@ -263,8 +284,11 @@ impl Runner {
                 let tick = inner.engine.tick(clock::sample(), &info);
                 // The Windows accounts: a new one is news, and the list goes to /report when it changed
                 let now = inner.engine.now_ms(clock::sample());
-                inner.engine.observe_accounts(&eguard_win::accounts::list(), now);
+                inner.engine.observe_accounts(&eguard_win::accounts::list(), &info, now);
                 log_notes(&mut inner.engine);
+                if self.removal(&mut inner) {
+                    break;
+                }
                 self.enforcer().update(inner.engine.enforce_inputs());
                 let web_changed = self.apply_web(&mut inner);
                 if tick.changed || web_changed {
@@ -284,6 +308,79 @@ impl Runner {
         self.save(&mut inner);
         log::info("stopped");
         Ok(())
+    }
+
+    /// Acts on an authorized removal: the server is told first (`Engine::removal`), then eGuard removes itself. True
+    /// when it did, and the loop ends.
+    fn removal(&self, inner: &mut Inner) -> bool {
+        let now = inner.engine.now_ms(clock::sample());
+        let step = inner.engine.removal(now);
+        log_notes(&mut inner.engine);
+        match step {
+            Removal::Remove => {
+                self.remove_self(inner);
+                true
+            }
+            Removal::Kept => {
+                self.save(inner);
+                false
+            }
+            Removal::Wait | Removal::None => false,
+        }
+    }
+
+    /// Removes what this runner put on the computer: the agents' screens, the browser policies, the service's
+    /// registration (service mode) and the data folder (secrets, state; the log stays while it's being written).
+    /// The program files are the installer's to remove. Console mode installed no service, so it removes its own
+    /// development data and its copy of the browser policies only.
+    fn remove_self(&self, inner: &mut Inner) {
+        log::warn("eGuard is removing itself from this computer");
+        // Saved first: if anything below stops the process, the next start carries on removing
+        self.save(inner);
+        if let Some(shared) = self.shared.get() {
+            shared.set_removed();
+            // Each agent hears it at its next heartbeat (every second) and closes its screens
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        match self.browsers.remove() {
+            Ok(()) => log::info("eGuard's browser policies removed"),
+            Err(e) => log::error(&format!("removing the browser policies: {e}")),
+        }
+        match self.mode {
+            Mode::Service => match crate::svc::delete_self() {
+                Ok(()) => log::info("the eGuard service is marked for deletion; Windows deletes it once it has stopped"),
+                Err(e) => log::error(&format!("couldn't mark the eGuard service for deletion: {e}")),
+            },
+            Mode::Console { .. } => log::info("development: console mode installed no service, so there's none to remove"),
+        }
+        self.removed.store(true, Ordering::SeqCst);
+        for left in self.store.remove_all() {
+            log::warn(&format!("couldn't remove {left}"));
+        }
+        log::info(&format!("eGuard's data removed from {}; stopping", self.store.dir().display()));
+        self.request_stop();
+    }
+
+    /// "Remove with a code", from either pipe: the engine checks it, and a right code wakes the loop to remove.
+    fn remove_with_code(&self, code: &str) -> Response {
+        let mut inner = self.lock();
+        let now = inner.engine.now_ms(clock::sample());
+        let result = inner.engine.remove_with_code(code, now);
+        log_notes(&mut inner.engine);
+        self.save(&mut inner);
+        match result {
+            Ok(message) => {
+                inner.woken = true;
+                self.wake.notify_all();
+                Response::Removing { message }
+            }
+            Err(message) => {
+                // Wrong codes and lockouts go to the parent: sent now, not at the next tick
+                inner.woken = true;
+                self.wake.notify_all();
+                Response::Error { message }
+            }
+        }
     }
 
     /// Forces eGuard's extension in each browser, with the link from the last sync, and tells the engine whether web
@@ -350,13 +447,16 @@ impl Runner {
         std::thread::Builder::new().name("monitor".into()).spawn(move || monitor.run(&rx)).map_err(|e| e.to_string())?;
 
         let me = Arc::clone(self);
+        let remover = Arc::clone(self);
         let shared = Arc::new(Shared::new(
             Arc::clone(&self.enforcer),
             Arc::clone(&self.facts),
             session_sids,
             matches!(self.mode, Mode::Console { .. }),
             Box::new(move || me.poke()),
+            Box::new(move |code| remover.remove_with_code(code)),
         ));
+        let _ = self.shared.set(Arc::clone(&shared));
         std::thread::Builder::new().name("sessions".into()).spawn(move || sessions::supervise(&shared)).map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -472,6 +572,7 @@ impl Runner {
             }
             Request::Pair { code, name, accounts } => self.pair(&code, name, accounts.as_deref()),
             Request::Accounts { set } => self.accounts(set),
+            Request::RemoveWithCode { code } => self.remove_with_code(&code),
             // A session's agent talks on its own session's pipe
             Request::Heartbeat { .. } | Request::AskParent { .. } | Request::AskTime { .. } => {
                 Response::Error { message: "That is asked on the session's own pipe.".into() }
@@ -495,7 +596,8 @@ impl Runner {
                 return Response::Error { message: e.to_string() };
             }
             let now = inner.engine.now_ms(clock::sample());
-            inner.engine.observe_accounts(&list, now);
+            let info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
+            inner.engine.observe_accounts(&list, &info, now);
             log_notes(&mut inner.engine);
             self.enforcer().update(inner.engine.enforce_inputs());
             self.save(&mut inner);
@@ -550,7 +652,7 @@ impl Runner {
         let child_name = paired.child_name.clone();
         inner.engine.adopt(paired, Some(choice));
         let now = inner.engine.now_ms(clock::sample());
-        inner.engine.observe_accounts(&list, now);
+        inner.engine.observe_accounts(&list, &info, now);
         log_notes(&mut inner.engine);
         // A new pairing starts its usage afresh, like the rest of the state
         {

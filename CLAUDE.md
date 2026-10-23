@@ -50,12 +50,14 @@ cargo fmt --all --check
 node tools/capture-fixtures.mjs        # refresh fixtures (EGUARD_URL defaults to http://localhost:3000)
 node tools/dev-family.mjs create|code|show|apps|alerts|delete   # a test family for pairing this PC by hand
 node tools/dev-family.mjs app NAME BLOCKED | limit GAMES 1 | protect KEY JSON | screen-time   # act as the parent
+node tools/dev-family.mjs remove [now] | keep                     # the device page's removal (prints the offline code)
 target\debug\eguard-service scan --catalog fixtures/server/catalog.json --verbose   # dry-run scan of this PC
 target\debug\eguard-service run --sandbox %TEMP%\eguard-sandbox   # console mode; ends programs only in the sandbox
 target\debug\eguard-service web                                   # the browser policies in place (reads only)
 target\debug\eguard-agent preview block|overlay|warning          # look at a screen with sample words
 target\debug\eguard-agent pair CODE --accounts corew              # pair; on this PC name corew (an administrator)
 target\debug\eguard-agent accounts [--set NAME,NAME]              # which Windows accounts are the child's
+target\debug\eguard-agent remove [CODE] --dev                     # "Remove with a code" (a window without CODE)
 ```
 
 ## Conventions

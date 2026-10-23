@@ -8,6 +8,7 @@ pub mod apps;
 pub mod authenticode;
 pub mod browsers;
 pub mod clock;
+pub mod codebox;
 pub mod dpapi;
 pub mod etw;
 pub mod files;
