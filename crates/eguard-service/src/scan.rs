@@ -45,14 +45,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let count = |s: AppSource| result.found.iter().filter(|a| a.source == Some(s)).count();
     eprintln!(
-        "\n{} apps to report ({} catalog, {} launcher, {} unknown publisher) from {} candidates; {} left out as trusted. \
-         {} files checked in {:.1} s.",
+        "\n{} apps to report ({} catalog, {} launcher, {} unknown publisher) from {} candidates; {} left out as trusted, \
+         {} as leftovers or drivers. {} files checked in {:.1} s.",
         result.found.len(),
         count(AppSource::Catalog),
         count(AppSource::Launcher),
         count(AppSource::UnknownPublisher),
         candidates.len(),
         result.skipped.len(),
+        result.left_out.len(),
         collected.exes_checked,
         started.elapsed().as_secs_f64()
     );
@@ -64,6 +65,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 Skip::TrustedPublisher(s) => eprintln!("  left out: {name} (signed by {s})"),
                 Skip::BlankName => eprintln!("  left out: a blank name"),
             }
+        }
+        for (name, why) in &result.left_out {
+            eprintln!("  left out: {name} ({why:?})");
         }
         for c in &candidates {
             eprintln!("  candidate: {:?} {:?} dir={:?} exe={:?} other={:?}", c.origin, c.name, c.dir, c.exe, c.other_signer);

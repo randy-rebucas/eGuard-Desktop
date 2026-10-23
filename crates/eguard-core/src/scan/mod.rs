@@ -8,6 +8,11 @@
 //!
 //! The platform has already left out what never counts: system components, updates, and anything under the
 //! Windows folder (drivers and Windows' own apps live there, and a standard account can't install into it).
+//!
+//! Between rules 3 and 4, two kinds of candidate are left out of the report (`left_out`): what an uninstall left
+//! behind (only its updater or uninstaller is there) and a driver package installed for the whole computer. Their
+//! folders still count for enforcement (`classify_all`), so leaving one out never lets what runs from it go
+//! unchecked.
 
 pub mod launchers;
 pub mod lnk;
@@ -62,6 +67,7 @@ pub type ExeCache = BTreeMap<String, CachedExe>;
 
 /// One app the platform found.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Separate facts the platform found, each read by its own rule, not a state
 pub struct Candidate {
     pub name: String,
     pub origin: Origin,
@@ -78,6 +84,19 @@ pub struct Candidate {
     pub other_signer: Option<String>,
     /// An engine or anti-cheat file next to the executable.
     pub game_files: bool,
+    /// Found where only an administrator can write (an Uninstall entry under HKLM). A standard account can make
+    /// Uninstall entries of its own (HKCU), so what it says there can't make a candidate less visible.
+    pub machine_wide: bool,
+    /// File names (lower case) of the exes in the install folder and the folders below it. `None`: not looked at, or
+    /// too many to be sure none is the app.
+    pub folder_exes: Option<Vec<String>>,
+    /// One of `folder_exes` imports DirectX, Vulkan or `XInput`. Only looked at when they're all installers or
+    /// updaters (`left_out` is the only reader, and it reads nothing else then).
+    pub folder_graphics: bool,
+    /// A driver's setup information (`.inf`) is in the install folder.
+    pub driver_files: bool,
+    /// Every file and folder the Uninstall entry names is gone: nothing of it is installed any more.
+    pub gone: bool,
 }
 
 impl Candidate {
@@ -91,6 +110,11 @@ impl Candidate {
             exe: None,
             other_signer: None,
             game_files: false,
+            machine_wide: false,
+            folder_exes: None,
+            folder_graphics: false,
+            driver_files: false,
+            gone: false,
         }
     }
 
@@ -124,9 +148,66 @@ fn launcher_key(id: &AppId) -> String {
     format!("{kind}:{}", id.value.to_lowercase())
 }
 
+/// True when `name` has one of `words` as a word.
+fn says(name: &str, words: &[&str]) -> bool {
+    name.to_lowercase().split(|c: char| !c.is_alphanumeric()).any(|w| words.contains(&w))
+}
+
 /// True when `name` has "game" or "games" as a word.
 fn says_game(name: &str) -> bool {
-    name.to_lowercase().split(|c: char| !c.is_alphanumeric()).any(|w| w == "game" || w == "games")
+    says(name, &["game", "games"])
+}
+
+/// An installer, updater or uninstaller, by its file name (`unins000.exe`, `Uninstall.exe`, Squirrel's
+/// `Update.exe`, `setup.exe`). What's left of an app when only these remain can't be used, only reinstalled or
+/// removed. Narrower than "not the main exe": a crash reporter or a helper process is part of a working app.
+pub fn is_maintenance_exe(file_name: &str) -> bool {
+    let n = file_name.to_ascii_lowercase();
+    let stem = n.strip_suffix(".exe").unwrap_or(&n);
+    stem.starts_with("unins")
+        || stem.contains("uninstall")
+        || ["update", "updater", "setup", "install", "installer", "squirrel"].contains(&stem)
+        || ["-update", "_update", "-updater", "_updater", "-setup", "_setup", "-installer", "_installer"].iter().any(|s| stem.ends_with(s))
+}
+
+/// Why a candidate rule 4 would report is left out anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftOut {
+    /// What an uninstall left behind: its folder has only installers, updaters and uninstallers (Discord's
+    /// `Update.exe`, which can reinstall it).
+    Leftover,
+    /// A driver package installed for the whole computer (a printer's, a device's).
+    Driver,
+}
+
+/// Whether a candidate that rule 4 would report is left out, and why (module docs). Never anything that shows a
+/// game signal or came through a launcher: those stay reported whatever else is true.
+///
+/// A child controls some of these facts (an HKCU Uninstall entry's name and paths, what's in their own folders), so
+/// each rule needs something they can't fake cheaply, and `classify_all` keeps the folder for enforcement:
+/// - Leftover: no exe that isn't an installer or updater, down three folders, and no game signal in any of them. A
+///   game renamed `update.exe` to hide would still be an app where it runs, since its folder is kept.
+/// - Driver: only from HKLM (a standard account can't write there; drivers install for the whole computer anyway),
+///   named as one, and either with a driver's `.inf` in its folder or with nothing of it left on disk.
+pub fn left_out(c: &Candidate) -> Option<LeftOut> {
+    let game =
+        c.launcher.is_some() || c.game_files || c.folder_graphics || c.exe.as_ref().is_some_and(|e| e.graphics) || says_game(&c.name);
+    if game {
+        return None;
+    }
+    let only_maintenance = c.folder_exes.as_ref().is_some_and(|v| !v.is_empty() && v.iter().all(|n| is_maintenance_exe(n)));
+    if matches!(c.origin, Origin::Uninstall | Origin::Shortcut)
+        && only_maintenance
+        && c.exe.as_ref().is_none_or(|e| is_maintenance_exe(&e.file_name))
+    {
+        return Some(LeftOut::Leftover);
+    }
+    // Gone counts only when nothing else lent it an exe or a folder (a shortcut named like it, say)
+    let nothing_left = c.gone && c.exe.is_none() && c.dir.is_none();
+    if c.origin == Origin::Uninstall && c.machine_wide && says(&c.name, &["driver", "drivers"]) && (c.driver_files || nothing_left) {
+        return Some(LeftOut::Driver);
+    }
+    None
 }
 
 impl Classifier {
@@ -304,6 +385,14 @@ fn merge_by_dir(mut cands: Vec<Candidate>, admin_only: &impl Fn(&str) -> bool) -
             }
             o.other_signer = o.other_signer.take().or(c.other_signer);
             o.game_files |= c.game_files;
+            // Machine-wide only when both are: one found where a child can write is enough to lose it
+            o.machine_wide &= c.machine_wide;
+            o.folder_graphics |= c.folder_graphics;
+            o.driver_files |= c.driver_files;
+            o.gone &= c.gone;
+            if o.folder_exes.is_none() {
+                o.folder_exes = c.folder_exes;
+            }
         } else {
             if let Some(d) = c.dir.as_deref() {
                 by_dir.insert(norm(d), out.len());
@@ -331,15 +420,21 @@ pub struct ScanResult {
     pub found: Vec<FoundApp>,
     /// What was left out by rule 3, and why (for the log and `scan --dry-run`).
     pub skipped: Vec<(String, Skip)>,
+    /// What rule 4 would have reported but `left_out` leaves out, and why.
+    pub left_out: Vec<(String, LeftOut)>,
     /// Install folders of what was found and of what was left out as trusted.
     pub places: Vec<Place>,
 }
 
 /// Classifies merged candidates. Two apps reported under one name are one app on the parent's list, so they're
 /// sent as one, with both sets of ids.
+///
+/// A candidate `left_out` leaves out keeps its place under its name: a program running from its folder is still an
+/// app (one the parent hasn't listed, so App Approval holds it), not an unknown signed program that goes unchecked.
 pub fn classify_all(classifier: &Classifier, cands: &[Candidate]) -> ScanResult {
     let mut found: BTreeMap<String, FoundApp> = BTreeMap::new();
     let mut skipped = Vec::new();
+    let mut left = Vec::new();
     let mut places = Vec::new();
     for c in cands {
         let result = classifier.classify(c);
@@ -349,6 +444,12 @@ pub fn classify_all(classifier: &Classifier, cands: &[Candidate]) -> ScanResult 
                 Err(Skip::TrustedPublisher(_)) => places.push(Place { dir, app: None }),
                 Err(Skip::BlankName) => {}
             }
+        }
+        // Only rule 4's candidates: a catalog game, a launcher's app and a trusted one are decided already
+        let why = result.as_ref().ok().filter(|a| a.source == Some(AppSource::UnknownPublisher)).and_then(|_| left_out(c));
+        if let Some(why) = why {
+            left.push((c.name.clone(), why));
+            continue;
         }
         match result {
             Ok(app) => match found.get_mut(&app.app) {
@@ -371,7 +472,7 @@ pub fn classify_all(classifier: &Classifier, cands: &[Candidate]) -> ScanResult 
             Err(why) => skipped.push((c.name.clone(), why)),
         }
     }
-    ScanResult { found: found.into_values().collect(), skipped, places }
+    ScanResult { found: found.into_values().collect(), skipped, left_out: left, places }
 }
 
 /// More new apps than this in one scan are sent as one `APPS_FOUND` (one alert) rather than an `APP_INSTALLED` each.
@@ -593,5 +694,162 @@ mod tests {
         x.dir = Some(r"C:\a".into());
         y.dir = Some(r"C:\b".into());
         assert_eq!(classify_all(&c, &[x, y]).found.len(), 1);
+    }
+
+    const DISCORD: &str = r"c:\users\mia\appdata\local\discord";
+
+    fn names(found: &[FoundApp]) -> Vec<&str> {
+        found.iter().map(|a| a.app.as_str()).collect()
+    }
+
+    #[test]
+    fn installers_and_updaters_by_name() {
+        for n in [
+            "Update.exe",
+            "updater.exe",
+            "unins000.exe",
+            "Uninstall.exe",
+            "uninst.exe",
+            "setup.exe",
+            "Foo-Uninstaller.exe",
+            "app_setup.exe",
+        ] {
+            assert!(is_maintenance_exe(n), "{n}");
+        }
+        for n in ["discord.exe", "crashpad_handler.exe", "setupapi-viewer.exe", "updatechecker.exe", "pixelquest.exe"] {
+            assert!(!is_maintenance_exe(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn a_squirrel_app_with_only_its_updater_left_is_left_out_but_its_folder_still_counts() {
+        let c = classifier();
+        // Discord uninstalled: Squirrel's Update.exe stays (it can reinstall it), the app-<version> folders are gone
+        let mut leftover = Candidate::new("Discord", Origin::Shortcut);
+        leftover.dir = Some(DISCORD.into());
+        leftover.exe = exe("update.exe", Some("discord inc."), None);
+        leftover.folder_exes = Some(vec!["update.exe".into()]);
+        assert_eq!(left_out(&leftover), Some(LeftOut::Leftover));
+        let r = classify_all(&c, std::slice::from_ref(&leftover));
+        assert_eq!(r.found, vec![]);
+        assert_eq!(r.left_out, vec![("Discord".into(), LeftOut::Leftover)]);
+        // Whatever runs from there is still the app "Discord" for enforcement, not an unknown signed program
+        assert_eq!(r.places, vec![Place { dir: DISCORD.into(), app: Some("Discord".into()) }]);
+
+        // Installed: the shortcut resolves to app-1.0.9\Discord.exe, and the Uninstall entry's folder has it
+        let mut lnk = Candidate::new("Discord", Origin::Shortcut);
+        lnk.dir = Some(format!(r"{DISCORD}\app-1.0.9"));
+        lnk.exe = exe("discord.exe", Some("discord inc."), Some("Discord"));
+        lnk.folder_exes = Some(vec!["discord.exe".into()]);
+        let mut un = Candidate::new("Discord", Origin::Uninstall);
+        un.dir = Some(DISCORD.into());
+        un.exe = exe("discord.exe", Some("discord inc."), Some("Discord"));
+        un.folder_exes = Some(vec!["update.exe".into(), "discord.exe".into()]);
+        assert_eq!(left_out(&lnk), None);
+        assert_eq!(left_out(&un), None);
+        assert_eq!(names(&classify_all(&c, &merge(vec![lnk, un])).found), ["Discord"]);
+        // Even with no exe chosen, an app exe anywhere below the folder keeps it reported
+        let mut no_exe = Candidate::new("Discord", Origin::Uninstall);
+        no_exe.dir = Some(DISCORD.into());
+        no_exe.folder_exes = Some(vec!["update.exe".into(), "discord.exe".into()]);
+        assert_eq!(left_out(&no_exe), None);
+    }
+
+    #[test]
+    fn a_leftover_needs_every_exe_to_be_maintenance_and_no_game_signal() {
+        let mut c = Candidate::new("Pixel Quest", Origin::Uninstall);
+        c.dir = Some(r"c:\users\mia\appdata\local\pq".into());
+        // Not looked at, too many to tell, or none at all: not a leftover
+        assert_eq!(left_out(&c), None);
+        c.folder_exes = Some(vec![]);
+        assert_eq!(left_out(&c), None);
+        // A game renamed update.exe: its engine files or graphics imports keep it reported
+        c.folder_exes = Some(vec!["update.exe".into()]);
+        assert_eq!(left_out(&c), Some(LeftOut::Leftover));
+        c.game_files = true;
+        assert_eq!(left_out(&c), None);
+        c.game_files = false;
+        c.folder_graphics = true;
+        assert_eq!(left_out(&c), None);
+        c.folder_graphics = false;
+        c.name = "Some Game".into();
+        assert_eq!(left_out(&c), None);
+        // A launcher's app or a loose exe never is
+        c.name = "Pixel Quest".into();
+        c.launcher = Some(Launcher::Steam);
+        assert_eq!(left_out(&c), None);
+        c.launcher = None;
+        c.origin = Origin::UserFolder;
+        assert_eq!(left_out(&c), None);
+    }
+
+    fn xprinter() -> Candidate {
+        let mut c = Candidate::new("XPrinter Driver version 8.2", Origin::Uninstall);
+        c.machine_wide = true;
+        c
+    }
+
+    #[test]
+    fn a_machine_wide_driver_package_is_left_out() {
+        let c = classifier();
+        // Its folder has the driver's .inf: left out, and the folder still counts as the app's
+        let mut with_files = xprinter();
+        with_files.dir = Some(r"c:\xinye pos printer driver\xprinter driver v8.2".into());
+        with_files.exe = exe("xprintertool.exe", None, None);
+        with_files.driver_files = true;
+        let r = classify_all(&c, &[with_files]);
+        assert_eq!(r.found, vec![]);
+        assert_eq!(r.left_out, vec![("XPrinter Driver version 8.2".into(), LeftOut::Driver)]);
+        assert_eq!(r.places[0].app.as_deref(), Some("XPrinter Driver version 8.2"));
+
+        // Everything it names is gone (this PC's XPrinter entry): nothing to report
+        let mut gone = xprinter();
+        gone.gone = true;
+        assert_eq!(left_out(&gone), Some(LeftOut::Driver));
+        // ... unless something lent it an exe after all
+        gone.exe = exe("xprinter.exe", None, None);
+        assert_eq!(left_out(&gone), None);
+
+        // Named a driver but nothing says it is one: reported
+        assert_eq!(left_out(&xprinter()), None);
+        // A trusted publisher's driver is still rule 3's (never blocked), not a left-out one
+        let mut realtek = Candidate::new("Realtek Audio Driver", Origin::Uninstall);
+        realtek.machine_wide = true;
+        realtek.driver_files = true;
+        realtek.exe = exe("rtkngui64.exe", Some("nvidia corporation"), None);
+        assert!(matches!(c.classify(&realtek), Err(Skip::TrustedPublisher(_))));
+    }
+
+    #[test]
+    fn a_child_cant_hide_a_game_by_calling_it_a_driver() {
+        let c = classifier();
+        // An HKCU entry (a standard account can write one) named like a driver, with an .inf beside the game
+        let mut hkcu = Candidate::new("Pixel Quest Driver", Origin::Uninstall);
+        hkcu.dir = Some(r"c:\users\mia\appdata\local\pq".into());
+        hkcu.exe = exe("pq.exe", None, None);
+        hkcu.driver_files = true;
+        assert_eq!(left_out(&hkcu), None);
+        // ... or one pointing at nothing
+        let mut hkcu_gone = Candidate::new("Fortnite Driver", Origin::Uninstall);
+        hkcu_gone.gone = true;
+        assert_eq!(left_out(&hkcu_gone), None);
+        // Machine-wide but with a game signal: reported, as a game
+        let mut game = Candidate::new("X Driver", Origin::Uninstall);
+        game.machine_wide = true;
+        game.driver_files = true;
+        game.exe = exe("x.exe", None, None);
+        game.game_files = true;
+        assert_eq!(left_out(&game), None);
+        let app = c.classify(&game).unwrap();
+        assert_eq!(classify_all(&c, &[hkcu, game]).found.len(), 2);
+        assert_eq!(app.category, Some(Category::Games));
+        // Merged with an HKCU entry for the same folder, it isn't machine-wide any more
+        let mut a = xprinter();
+        a.dir = Some(r"c:\d".into());
+        a.driver_files = true;
+        let mut b = Candidate::new("XPrinter Driver version 8.2", Origin::Uninstall);
+        b.dir = Some(r"c:\d".into());
+        let m = merge(vec![a, b]);
+        assert_eq!((m.len(), left_out(&m[0])), (1, None));
     }
 }

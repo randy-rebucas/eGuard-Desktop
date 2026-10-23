@@ -1,7 +1,8 @@
 //! Finding installed apps on this computer (spec section 5, "Where the agent looks"). Everything here only reads.
 //!
 //! - Uninstall keys: HKLM (both views) and each signed-in user's hive. System components, updates, and entries
-//!   living under the Windows folder (drivers, Windows' own) are left out.
+//!   living under the Windows folder (drivers, Windows' own) are left out. For the rest, the facts core's
+//!   `scan::left_out` decides on: what's left in the install folder, driver files, whether anything is left at all.
 //! - Launchers: Steam's libraries, Epic's manifests, GOG's registry, itch's apps folder; Riot, Battle.net,
 //!   Ubisoft and EA through their Uninstall entries.
 //! - Store packages of each signed-in user, read from their manifests.
@@ -13,7 +14,7 @@
 use crate::registry::{Key, Root, View};
 use crate::{authenticode, version};
 use eguard_core::scan::launchers::{self, Launcher};
-use eguard_core::scan::{CachedExe, Candidate, ExeCache, ExeFacts, Origin, pe};
+use eguard_core::scan::{CachedExe, Candidate, ExeCache, ExeFacts, Origin, is_maintenance_exe, pe};
 use eguard_core::wire::{AppId, AppIdKind};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -25,6 +26,10 @@ const STORE_REPO: &str = r"Local Settings\Software\Microsoft\Windows\CurrentVers
 const MAX_LOOSE_EXES: usize = 3_000;
 /// How much of an exe is read to find its imports: import tables sit near the start.
 const PE_READ_BYTES: u64 = 32 * 1024 * 1024;
+/// Most exes listed in one install folder. More than this, and it's not a leftover anyway: `None` (can't tell).
+const FOLDER_EXES_MAX: usize = 32;
+/// How deep an install folder is looked into: Squirrel apps keep theirs in `app-<version>\`, others in `bin\x64\`.
+const FOLDER_DEPTH: usize = 3;
 
 /// A Windows account with a profile.
 #[derive(Debug, Clone)]
@@ -248,6 +253,34 @@ pub fn file_identity(path: &Path) -> Option<FileIdentity> {
     Some(FileIdentity { volume, file_id, size: meta.len(), modified_ms })
 }
 
+/// A driver's setup information file (`.inf`) in `dir` or the folder below it: what Windows installs a driver from.
+fn has_driver_files(dir: &Path) -> bool {
+    let mut stack = vec![(dir.to_owned(), 0)];
+    while let Some((d, level)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.flatten().take(2_000) {
+            let Ok(t) = e.file_type() else { continue };
+            let p = e.path();
+            if t.is_dir() && !t.is_symlink() && level < 1 {
+                stack.push((p, level + 1));
+            } else if t.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("inf")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// What an Uninstall entry names on disk: its folder, its icon and its uninstaller (not the generic MSI or DLL
+/// hosts, which say nothing about it).
+fn named_paths(location: Option<&str>, icon: Option<&str>, uninstall: &str) -> Vec<PathBuf> {
+    [location.map(|l| PathBuf::from(l.trim().trim_matches('"'))), icon.and_then(clean_path), command_exe(uninstall).filter(|p| !is_host(p))]
+        .into_iter()
+        .flatten()
+        .filter(|p| p.is_absolute())
+        .collect()
+}
+
 /// Engine and anti-cheat files beside an exe (spec section 5, game signals).
 fn game_files(exe: &Path) -> bool {
     if exe.file_name().is_some_and(|f| f.to_string_lossy().to_ascii_lowercase().ends_with("-shipping.exe")) {
@@ -306,7 +339,28 @@ impl Collector<'_> {
         c.game_files = c.game_files || game_files(exe);
     }
 
-    fn uninstall_keys(&mut self, key: &Key, view: View, msi_sid: &str) {
+    /// What's in a candidate's install folder, for `scan::left_out`: its exes' names, and when they're all
+    /// installers or updaters, whether any of them shows a game signal (checked then only: it's few files).
+    fn look_in_folder(&mut self, c: &mut Candidate) {
+        let Some(dir) = c.dir.as_deref().map(PathBuf::from) else { return };
+        if c.machine_wide {
+            c.driver_files = has_driver_files(&dir);
+        }
+        let exes = exes_in(&dir, FOLDER_DEPTH, FOLDER_EXES_MAX);
+        if exes.len() >= FOLDER_EXES_MAX {
+            return;
+        }
+        let names: Vec<String> = exes.iter().filter_map(|p| p.file_name()).map(|f| f.to_string_lossy().to_lowercase()).collect();
+        if names.iter().all(|n| is_maintenance_exe(n)) {
+            for exe in &exes {
+                c.folder_graphics |= self.facts(exe).is_some_and(|f| f.graphics);
+                c.game_files |= game_files(exe);
+            }
+        }
+        c.folder_exes = Some(names);
+    }
+
+    fn uninstall_keys(&mut self, key: &Key, view: View, msi_sid: &str, machine_wide: bool) {
         for name in key.subkeys() {
             let Some(e) = key.sub(&name, view) else { continue };
             let Some(display) = e.string("DisplayName") else { continue };
@@ -324,6 +378,9 @@ impl Collector<'_> {
                 continue;
             }
             let mut c = Candidate::new(&display, Origin::Uninstall);
+            c.machine_wide = machine_wide;
+            let named = named_paths(e.string("InstallLocation").as_deref(), e.string("DisplayIcon").as_deref(), &uninstall);
+            c.gone = !named.is_empty() && named.iter().all(|p| !p.exists());
             if let Some((launcher, id)) = launchers::from_uninstall(&name, &uninstall, &e.string("Publisher").unwrap_or_default()) {
                 c.launcher = Some(launcher);
                 c.ids.extend(id);
@@ -356,6 +413,7 @@ impl Collector<'_> {
                 .and_then(|d| self.install_dir(d))
                 .or_else(|| exe.as_deref().and_then(Path::parent).and_then(|d| self.install_dir(d)))
                 .map(|d| lower(&d));
+            self.look_in_folder(&mut c);
             self.out.candidates.push(c);
         }
     }
@@ -522,6 +580,7 @@ impl Collector<'_> {
                     e.product = None;
                 }
                 c.dir = target.parent().and_then(|d| self.install_dir(d)).map(|d| lower(&d));
+                self.look_in_folder(&mut c);
                 self.out.candidates.push(c);
             }
         }
@@ -645,7 +704,7 @@ pub fn collect(cache: &mut ExeCache) -> Collected {
 
     for view in [View::Native, View::Wow32] {
         if let Some(k) = Key::open(Root::LocalMachine, UNINSTALL, view) {
-            c.uninstall_keys(&k, view, "S-1-5-18");
+            c.uninstall_keys(&k, view, "S-1-5-18", true);
         }
     }
     let mut steam_roots: Vec<PathBuf> = Key::open(Root::LocalMachine, r"SOFTWARE\Valve\Steam", View::Wow32)
@@ -656,7 +715,7 @@ pub fn collect(cache: &mut ExeCache) -> Collected {
     for u in &users {
         // Signed-in users' hives are loaded under HKEY_USERS; others' registry can't be read without loading it
         if let Some(k) = Key::open(Root::Users, &format!(r"{}\{UNINSTALL}", u.sid), View::Native) {
-            c.uninstall_keys(&k, View::Native, &u.sid);
+            c.uninstall_keys(&k, View::Native, &u.sid, false);
         }
         if let Some(p) =
             Key::open(Root::Users, &format!(r"{}\Software\Valve\Steam", u.sid), View::Native).and_then(|k| k.string("SteamPath"))
@@ -698,6 +757,83 @@ mod tests {
         assert_eq!(command_exe(r"C:\Program Files\Foo\uninstall.exe /S"), Some(PathBuf::from(r"C:\Program Files\Foo\uninstall.exe")));
         assert_eq!(command_exe("MsiExec.exe /X{1}"), Some(PathBuf::from("MsiExec.exe")));
         assert!(is_helper("unins000.exe") && is_helper("ChromeSetup.exe") && !is_helper("PixelQuest.exe"));
+    }
+
+    /// A folder in %TEMP% with `files` (relative paths) in it, empty.
+    fn folder(name: &str, files: &[&str]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("eguard-apps-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for f in files {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"").unwrap();
+        }
+        root
+    }
+
+    fn looked_at(dir: &Path, origin: Origin, machine_wide: bool) -> Candidate {
+        let mut cache = ExeCache::new();
+        let mut col = Collector {
+            cache: &mut cache,
+            used: HashSet::new(),
+            system_root: r"c:\windows".into(),
+            broad: HashSet::new(),
+            out: Collected::default(),
+            loose_exes: 0,
+        };
+        let mut c = Candidate::new("Discord", origin);
+        c.machine_wide = machine_wide;
+        c.dir = Some(lower(dir));
+        col.look_in_folder(&mut c);
+        c
+    }
+
+    #[test]
+    fn install_folders_tell_a_leftover_from_an_app() {
+        let leftover = folder("leftover", &["Update.exe", ".dead"]);
+        let full = folder("full", &["Update.exe", r"app-1.0.9\Discord.exe", r"app-1.0.9\resources\app.asar"]);
+        let game = folder("game", &["update.exe", "UnityPlayer.dll"]);
+        let c = looked_at(&leftover, Origin::Shortcut, false);
+        assert_eq!(c.folder_exes, Some(vec!["update.exe".to_owned()]));
+        assert_eq!(eguard_core::scan::left_out(&c), Some(eguard_core::scan::LeftOut::Leftover));
+        let c = looked_at(&full, Origin::Uninstall, false);
+        assert!(c.folder_exes.as_ref().unwrap().contains(&"discord.exe".to_owned()));
+        assert_eq!(eguard_core::scan::left_out(&c), None);
+        // A "leftover" with an engine file beside its only exe is a game in disguise
+        let c = looked_at(&game, Origin::Uninstall, false);
+        assert!(c.game_files);
+        assert_eq!(eguard_core::scan::left_out(&c), None);
+        // Too many exes to be sure: not looked at
+        let many: Vec<String> = (0..FOLDER_EXES_MAX).map(|i| format!("unins{i:03}.exe")).collect();
+        let crowded = folder("crowded", &many.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(looked_at(&crowded, Origin::Uninstall, false).folder_exes, None);
+        for d in [leftover, full, game, crowded] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn driver_files_and_entries_with_nothing_left() {
+        let driver = folder("driver", &[r"x64\xprinter.inf", r"x64\xprinter.cat", "unins000.exe"]);
+        assert!(has_driver_files(&driver));
+        // Only looked for in machine-wide entries: an HKCU entry's .inf counts for nothing
+        assert!(looked_at(&driver, Origin::Uninstall, true).driver_files);
+        assert!(!looked_at(&driver, Origin::Uninstall, false).driver_files);
+        let plain = folder("plain", &["app.exe"]);
+        assert!(!has_driver_files(&plain));
+
+        let named = named_paths(
+            Some(r#""C:\XINYE POS Printer Driver\XPrinter Driver V8.2\""#),
+            None,
+            r#""C:\XINYE POS Printer Driver\XPrinter Driver V8.2\unins000.exe""#,
+        );
+        assert_eq!(named.len(), 2);
+        assert!(named.iter().all(|p| !p.exists()));
+        // The MSI host names nothing of the app's
+        assert_eq!(named_paths(None, None, "MsiExec.exe /X{1}"), Vec::<PathBuf>::new());
+        for d in [driver, plain] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]
