@@ -15,6 +15,20 @@ Phase 4, the owner's decisions, a full audit and its fixes.
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
 
+## Phase 7, started: logs (2026-10-24)
+
+- core `logging`: one JSON object per line (`ts`, `level`, `component`, `pid`, `thread`, `msg`), the file cut at
+  1 MB with 5 older ones kept (`service.log.1` newest), console mode printing the same as text. Every line is
+  scrubbed first: a run of 32+ token characters becomes `[redacted]` (the device token and the removal secret are
+  43-character runs), except SIDs and GUIDs. `last_words` writes without waiting for the lock.
+- `eguard-service` `log`: now a thin wrapper (`logs\service.log` as before, now JSON). `eguard-agent session` logs to
+  `%LOCALAPPDATA%\eGuard\logs\agent.log` (that user's: the agent can't write eGuard's data folder): start, removal,
+  giving up on a silent service, errors.
+- Checked: 3 new tests (scrubbing incl. the fixture token's shape, the JSON line, rotation and reopening); console
+  mode for a few seconds wrote JSON lines that all parse. `tools/vm/collect.ps1` already takes the whole `logs` folder.
+- **Not built: a crash handler.** It wasn't finished in this session; the next one should pick it up (a panic hook
+  that logs through `logging::last_words` is the core of it).
+
 ## Phase 6, part 1: what was built (2026-10-24)
 
 The owner agreed (2026-10-24) to split Phase 6. Part 1 is what can be built and checked on this PC: the removal flow
