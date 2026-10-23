@@ -5,17 +5,23 @@ use crate::wide::{from_wide, wide};
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenLogonSid, TokenUser,
+    ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS,
+    TOKEN_QUERY, TOKEN_USER, TokenLogonSid, TokenUser,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-/// eGuard's data folder in a real install: SYSTEM and administrators only, nothing inherited from `ProgramData`
-/// (where every user can create files). Files inside inherit it.
-pub const DATA_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+/// eGuard's data folder in a real install (spec section 3): owned by SYSTEM, which alone writes it; administrators
+/// may read it. Nothing is inherited from `ProgramData` (where every user can create files). Files inside inherit it.
+pub const DATA_DIR_SDDL: &str = "O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FRFX;;;BA)";
+
+/// Owners a real install's data folder may already have: SYSTEM, or administrators (the default owner of objects
+/// SYSTEM creates). Anyone else made the folder first.
+const TRUSTED_OWNERS: [&str; 2] = ["S-1-5-18", "S-1-5-32-544"];
 
 /// A self-relative security descriptor made from SDDL, freed on drop.
 #[derive(Debug)]
@@ -42,6 +48,16 @@ impl SecurityDescriptor {
         SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: self.0, bInheritHandle: 0 }
     }
 
+    fn owner(&self) -> std::io::Result<PSID> {
+        let (mut owner, mut defaulted) = (null_mut(), 0);
+        // SAFETY: `self.0` is a valid descriptor; the out-pointers are live locals. The SID points into it.
+        let ok = unsafe { GetSecurityDescriptorOwner(self.0, &raw mut owner, &raw mut defaulted) };
+        if ok == 0 || owner.is_null() {
+            return Err(std::io::Error::other("the descriptor has no owner"));
+        }
+        Ok(owner)
+    }
+
     fn dacl(&self) -> std::io::Result<*mut ACL> {
         let (mut present, mut defaulted, mut dacl) = (0, 0, null_mut());
         // SAFETY: `self.0` is a valid descriptor; the out-pointers are live locals. The DACL points into it.
@@ -60,28 +76,58 @@ impl Drop for SecurityDescriptor {
     }
 }
 
-/// Replaces a folder's DACL with the one in `sddl`, protected from inheritance. Files and folders inside inherit it.
-/// Needs the right to change the folder's permissions (the service has it as SYSTEM).
-pub fn set_dir_dacl(path: &std::path::Path, sddl: &str) -> std::io::Result<()> {
+/// Replaces a folder's owner (when `sddl` names one) and DACL with those in `sddl`, the DACL protected from
+/// inheritance. Files and folders inside inherit it. Needs the right to change the folder's owner and permissions
+/// (the service has it as SYSTEM).
+pub fn set_dir_security(path: &std::path::Path, sddl: &str) -> std::io::Result<()> {
     let sd = SecurityDescriptor::from_sddl(sddl)?;
     let dacl = sd.dacl()?;
+    let owner = sd.owner().ok();
+    let mut what = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    if owner.is_some() {
+        what |= OWNER_SECURITY_INFORMATION;
+    }
     let p = wide(&path.to_string_lossy());
-    // SAFETY: `p` is zero-terminated; `dacl` points into `sd`, alive for the call. Owner, group and SACL untouched.
+    // SAFETY: `p` is zero-terminated; `owner` and `dacl` point into `sd`, alive for the call. Group and SACL
+    // untouched.
+    let rc = unsafe { SetNamedSecurityInfoW(p.as_ptr(), SE_FILE_OBJECT, what, owner.unwrap_or(null_mut()), null_mut(), dacl, null()) };
+    if rc != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(rc as i32));
+    }
+    Ok(())
+}
+
+/// The SID of a file's or folder's owner, as a string.
+pub fn owner_of(path: &std::path::Path) -> std::io::Result<String> {
+    let p = wide(&path.to_string_lossy());
+    let (mut owner, mut sd): (PSID, PSECURITY_DESCRIPTOR) = (null_mut(), null_mut());
+    // SAFETY: `p` is zero-terminated; on success `sd` is a LocalAlloc'd descriptor (freed below) that `owner`
+    // points into.
     let rc = unsafe {
-        SetNamedSecurityInfoW(
+        GetNamedSecurityInfoW(
             p.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION,
+            &raw mut owner,
             null_mut(),
             null_mut(),
-            dacl,
-            null(),
+            null_mut(),
+            &raw mut sd,
         )
     };
     if rc != ERROR_SUCCESS {
         return Err(std::io::Error::from_raw_os_error(rc as i32));
     }
-    Ok(())
+    // SAFETY: `owner` points into `sd`, which is freed once below, after the SID is read.
+    let out = unsafe { sid_string(owner) };
+    // SAFETY: allocated by GetNamedSecurityInfoW, freed once.
+    unsafe { LocalFree(sd as HLOCAL) };
+    out
+}
+
+/// Whether `sid` may own a real install's data folder (`DATA_DIR_SDDL`): SYSTEM or administrators.
+pub fn is_trusted_owner(sid: &str) -> bool {
+    TRUSTED_OWNERS.contains(&sid)
 }
 
 /// The SID of the user this process runs as, as a string (`S-1-5-21-…`), for SDDL.
@@ -164,6 +210,10 @@ mod tests {
         let sid = current_user_sid().unwrap();
         assert!(sid.starts_with("S-1-5-"), "{sid}");
         assert!(SecurityDescriptor::from_sddl(&format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})")).is_ok());
+        assert!(SecurityDescriptor::from_sddl(DATA_DIR_SDDL).unwrap().owner().is_ok());
+        let owner = owner_of(&std::env::temp_dir()).unwrap();
+        assert!(owner.starts_with("S-1-5-"), "{owner}");
+        assert!(is_trusted_owner("S-1-5-18") && is_trusted_owner("S-1-5-32-544") && !is_trusted_owner(&sid));
         let logon = current_logon_sid().unwrap();
         assert!(logon.starts_with("S-1-5-5-"), "{logon}");
     }

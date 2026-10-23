@@ -5,11 +5,12 @@
 //! starts the agent in its own session instead.
 #![allow(unsafe_code)]
 
+use crate::security::SecurityDescriptor;
 use crate::wide::{from_wide, wide};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::Security::{DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenLogonSid, TokenPrimary};
+use windows_sys::Win32::Security::{DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenLogonSid, TokenPrimary, TokenUser};
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::RemoteDesktop::{
     WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTS_SESSIONSTATE_LOCK, WTSActive, WTSDisconnectSession, WTSDisconnected,
@@ -24,6 +25,18 @@ use windows_sys::Win32::System::Threading::{
 /// Anyone who can end the agent can also choose this code, so it only spares the parent a false alert; the service
 /// still starts the agent again if the session is still there.
 pub const AGENT_EXIT_SESSION_ENDING: u32 = 0x6547_5345; // "eGSE"
+
+/// What the child may do to the agent's process: wait on it (`SYNCHRONIZE`) and read its name and session
+/// (`PROCESS_QUERY_LIMITED_INFORMATION`). Not end it, read or write its memory, or start threads in it.
+const AGENT_PROCESS_RIGHTS: u32 = 0x0010_1000;
+/// The same for its threads: `SYNCHRONIZE` and `THREAD_QUERY_LIMITED_INFORMATION`.
+const AGENT_THREAD_RIGHTS: u32 = 0x0010_0800;
+
+/// SDDL for the agent's process or thread: SYSTEM has everything, the child's account and the object's owner
+/// (`OW`, OWNER RIGHTS: without it the owner could still change the permissions) only `rights`.
+fn agent_object_sddl(user_sid: &str, rights: u32) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;{rights:#x};;;{user_sid})(A;;{rights:#x};;;OW)")
+}
 
 /// A session someone is signed in to: in use, or switched away from (fast user switching, a closed Remote Desktop
 /// window) and still signed in.
@@ -130,6 +143,13 @@ pub fn logon_sid(session: u32) -> std::io::Result<String> {
 /// Needs SYSTEM.
 pub fn launch(session: u32, exe: &Path, args: &str) -> std::io::Result<crate::process::Child> {
     let token = user_token(session)?;
+    // The agent runs as the child, whose programs would otherwise get full access to it (read and write its memory,
+    // send its heartbeats). The child keeps only waiting on it and reading its name; OWNER RIGHTS takes away the
+    // owner's implicit right to change these permissions back.
+    let user = crate::security::token_sid(token.0, TokenUser)?;
+    let process_sd = SecurityDescriptor::from_sddl(&agent_object_sddl(&user, AGENT_PROCESS_RIGHTS))?;
+    let thread_sd = SecurityDescriptor::from_sddl(&agent_object_sddl(&user, AGENT_THREAD_RIGHTS))?;
+    let (for_process, for_thread) = (process_sd.attributes(), thread_sd.attributes());
     let mut env = null_mut();
     // SAFETY: `token` is a valid primary token; `env` is freed below.
     if unsafe { CreateEnvironmentBlock(&raw mut env, token.0, 0) } == 0 {
@@ -140,15 +160,15 @@ pub fn launch(session: u32, exe: &Path, args: &str) -> std::io::Result<crate::pr
     let mut desktop = wide(r"winsta0\default");
     let si = STARTUPINFOW { cb: size_of::<STARTUPINFOW>() as u32, lpDesktop: desktop.as_mut_ptr(), ..Default::default() };
     let mut pi = PROCESS_INFORMATION::default();
-    // SAFETY: every pointer is to a live local (`cmd` is writable, as CreateProcess requires); `env` is the block
-    // made above. The process and thread handles it returns are closed below.
+    // SAFETY: every pointer is to a live local (`cmd` is writable, as CreateProcess requires; the attributes point
+    // into `process_sd`/`thread_sd`); `env` is the block made above. The handles it returns are closed below.
     let ok = unsafe {
         CreateProcessAsUserW(
             token.0,
             app.as_ptr(),
             cmd.as_mut_ptr(),
-            null(),
-            null(),
+            &raw const for_process,
+            &raw const for_thread,
             0,
             CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             env,
@@ -195,6 +215,10 @@ mod tests {
             assert!(signed_in().iter().any(|t| t.id == me));
             assert_ne!(s.user, "");
             assert_eq!(s.sid, Some(crate::security::current_user_sid().unwrap()));
+        }
+        let sid = crate::security::current_user_sid().unwrap();
+        for rights in [AGENT_PROCESS_RIGHTS, AGENT_THREAD_RIGHTS] {
+            assert!(SecurityDescriptor::from_sddl(&agent_object_sddl(&sid, rights)).is_ok());
         }
         // Without SYSTEM's rights, another session's token isn't ours to have
         assert!(launch(me, Path::new(r"C:\Windows\System32\cmd.exe"), "/c exit").is_err());

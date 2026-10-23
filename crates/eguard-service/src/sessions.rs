@@ -333,9 +333,18 @@ fn serve(shared: &Arc<Shared>, id: u32, sddl: &Mutex<Option<String>>) {
 }
 
 fn client(shared: &Shared, id: u32, mut conn: std::fs::File) {
+    // Who's at the other end is known on connecting: anyone else is let go before anything is read, and nobody is
+    // waited on for long, so connections can't be held open to keep the agent out
+    let Some(agent) = genuine_agent(shared, id, &conn) else {
+        let _ = conn.write_all(&ipc::encode(&Response::Error { message: "Only eGuard's own app can use this.".into() }));
+        return;
+    };
+    if !pipe::wait_for_line(&conn, pipe::READ_TIMEOUT) {
+        return;
+    }
     let response = match ipc::read_line(&mut conn) {
         Ok(Some(line)) => match ipc::decode::<Request>(&line) {
-            Ok(req) => handle(shared, id, &conn, &req),
+            Ok(req) => handle(shared, id, agent, &req),
             Err(e) => Response::Error { message: e.to_string() },
         },
         // The supervisor waking the pipe, or an agent that went away
@@ -350,15 +359,14 @@ fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
 }
 
-fn handle(shared: &Shared, id: u32, conn: &std::fs::File, req: &Request) -> Response {
-    // Only eGuard's agent, in this session
-    let client = pipe::client_pid(conn);
-    let genuine = client.is_some_and(|pid| {
-        process::session_of(pid) == Some(id) && process::image_path(pid).is_some_and(|p| same_file(&p, &shared.agent_exe))
-    });
-    let Some(client) = client.filter(|_| genuine) else {
-        return Response::Error { message: "Only eGuard's own app can use this.".into() };
-    };
+/// The pid of the client on `conn` when it's eGuard's agent, in session `id`.
+fn genuine_agent(shared: &Shared, id: u32, conn: &std::fs::File) -> Option<u32> {
+    pipe::client_pid(conn)
+        .filter(|&pid| process::session_of(pid) == Some(id) && process::image_path(pid).is_some_and(|p| same_file(&p, &shared.agent_exe)))
+}
+
+/// Answers `req` from the agent `client` (checked by `genuine_agent`).
+fn handle(shared: &Shared, id: u32, client: u32, req: &Request) -> Response {
     let sample = clock::sample();
     match req {
         &Request::Heartbeat { .. } if !shared.applies(id) => Response::Session(SessionView::default()),

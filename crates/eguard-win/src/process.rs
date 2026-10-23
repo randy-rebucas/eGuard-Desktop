@@ -5,8 +5,10 @@
 
 use crate::wide::from_wide;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+use std::path::{Path, PathBuf};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SHARING_VIOLATION, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -137,6 +139,40 @@ pub fn start_time(pid: u32) -> Option<u64> {
     created(&Handle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?)
 }
 
+/// Whether the file at `path` is still the one a process that started at `started` (FILETIME ticks) runs.
+///
+/// A running program's file can be renamed and another file put at its path, which would then be judged instead
+/// (a game swapped for a trusted publisher's exe right after it started). Two things only the running file has:
+/// - Windows refuses to open it for writing while it runs (a sharing violation; nobody can choose that answer,
+///   unlike "access denied", which a file's owner can arrange). It's only opened, never written.
+/// - It wasn't created, written or changed (renamed or moved into place) after the process started.
+///
+/// `false` when either fails: the program is then judged as an unknown one, the stricter reading.
+pub fn still_its_file(path: &Path, started: u64) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FILE_READ_ATTRIBUTES, FILE_WRITE_DATA, FileBasicInfo, GetFileInformationByHandleEx,
+    };
+    let refused = std::fs::OpenOptions::new().access_mode(FILE_WRITE_DATA).open(path).err();
+    if refused.and_then(|e| e.raw_os_error()) != Some(ERROR_SHARING_VIOLATION as i32) {
+        return false;
+    }
+    let Ok(f) = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(path) else { return false };
+    let mut info = FILE_BASIC_INFO::default();
+    // SAFETY: `f` is an open file; `info` is a live FILE_BASIC_INFO and its size is passed.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            f.as_raw_handle() as HANDLE,
+            FileBasicInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } != 0;
+    let started = i64::try_from(started).unwrap_or(i64::MAX);
+    ok && [info.CreationTime, info.LastWriteTime, info.ChangeTime].iter().all(|&t| t <= started)
+}
+
 /// When the process behind `h` started (FILETIME ticks). Read on the handle that will be used, so the answer is
 /// about that very process and not a later one with the same id.
 fn created(h: &Handle) -> Option<u64> {
@@ -234,6 +270,20 @@ pub fn alive(pid: u32, started: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_programs_file_is_its_own_and_a_copy_is_not() {
+        let me = current_pid();
+        let exe = image_path(me).unwrap();
+        let started = start_time(me).unwrap();
+        assert!(still_its_file(&exe, started));
+        // The same bytes at another path, put there after this process started: not what it runs
+        let copy = std::env::temp_dir().join(format!("eguard-image-{me}.exe"));
+        std::fs::copy(&exe, &copy).unwrap();
+        assert!(!still_its_file(&copy, started));
+        std::fs::remove_file(&copy).unwrap();
+        assert!(!still_its_file(&copy, started));
+    }
 
     #[test]
     fn this_process_is_listed_with_its_path_and_session() {

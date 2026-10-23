@@ -402,9 +402,9 @@ impl Runner {
     }
 
     fn serve_pipe(self: Arc<Self>, mut server: PipeServer, first: eguard_win::pipe::Pending) {
-        let mut pending = Some(first);
+        server.keep(first);
         loop {
-            let conn = match pending.take().map_or_else(|| server.accept(), eguard_win::pipe::Pending::connect) {
+            let conn = match server.accept() {
                 Ok(c) => c,
                 Err(e) => {
                     log::warn(&format!("pipe: {e}"));
@@ -419,6 +419,10 @@ impl Runner {
     }
 
     fn serve_client(&self, mut conn: std::fs::File) {
+        // A client that connects and never sends a whole request is let go, not waited on forever
+        if !eguard_win::pipe::wait_for_line(&conn, eguard_win::pipe::READ_TIMEOUT) {
+            return;
+        }
         let response = match ipc::read_line(&mut conn) {
             Ok(Some(line)) => match ipc::decode::<Request>(&line) {
                 Ok(req) => self.handle(req),

@@ -197,6 +197,20 @@ fn unreadable(path: Option<&Path>, exe: Option<&str>) -> Program {
     }
 }
 
+/// `p` as the process that started at `start` runs it. A signature read from a file someone could have put at
+/// the path after the process started (anywhere outside Program Files and Windows' own folders) counts only if
+/// that file is still the running one (`process::still_its_file`); otherwise the program is an unknown one.
+fn its_own(p: Arc<Program>, start: u64) -> Arc<Program> {
+    if p.windows || p.ours || p.program_files || p.exe.signer.is_none() {
+        return p;
+    }
+    if process::still_its_file(Path::new(&p.path), start) {
+        return p;
+    }
+    log::warn(&format!("{} isn't the file that started; checking it as an unknown program", p.path));
+    Arc::new(unreadable(Some(Path::new(&p.path)), None))
+}
+
 /// The monitor's state; runs on its own thread (`run`).
 #[derive(Debug)]
 pub struct Monitor {
@@ -274,7 +288,7 @@ impl Monitor {
         if path.is_some() && process::start_time(pid) != Some(start) {
             return;
         }
-        match path.as_deref().and_then(|p| self.facts.program(p)) {
+        match path.as_deref().and_then(|p| self.facts.program(p)).map(|p| its_own(p, start)) {
             Some(p) => {
                 t.program = Some(p);
                 t.stand_in = false;
