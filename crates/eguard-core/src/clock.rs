@@ -67,6 +67,10 @@ pub struct TrustedClock {
     high_water_ms: i64,
     /// The last wall/monotonic pair checked for changes, in the current boot.
     last_check: Option<(u64, u64, i64)>,
+    /// The latest eGuard time handed out while anchored to `/sync`, never an estimate. Nothing lowers it: `serverTime`
+    /// isn't signed, so a forged answer mustn't be able to turn the clock back to before what eGuard already said.
+    #[serde(default)]
+    verified_high_ms: i64,
 }
 
 impl TrustedClock {
@@ -85,8 +89,10 @@ impl TrustedClock {
         self.anchor = Some(Anchor { trusted_ms: server_ms, mono_ms: s.mono_ms, boot_id: s.boot_id, wall_ms: s.wall_ms, verified: true });
         self.offset_ms = server_ms - s.wall_ms;
         // A high-water mark set by an estimate may be ahead of eGuard (a clock pushed forward before an offline
-        // reboot): eGuard's word replaces it. Otherwise the clock never steps back for a late response.
-        self.high_water_ms = if estimated { server_ms } else { self.high_water_ms.max(server_ms) };
+        // reboot): eGuard's word replaces it, but never below what was verified before. Otherwise the clock never
+        // steps back for a late response.
+        self.high_water_ms = if estimated { server_ms.max(self.verified_high_ms) } else { self.high_water_ms.max(server_ms) };
+        self.verified_high_ms = self.verified_high_ms.max(server_ms);
         self.last_check = Some((s.boot_id, s.mono_ms, s.wall_ms));
         change
     }
@@ -100,6 +106,9 @@ impl TrustedClock {
         };
         let ms = Self::reckon(anchor, s).max(self.high_water_ms);
         self.high_water_ms = ms;
+        if anchor.verified {
+            self.verified_high_ms = self.verified_high_ms.max(ms);
+        }
         Some(TrustedNow { ms, verified: anchor.verified })
     }
 
@@ -229,6 +238,18 @@ mod tests {
         c.now(at(1, 10 * MIN as u64, T0 + 10 * MIN));
         c.on_server_time(T0 + 5 * MIN, at(1, 10 * MIN as u64, T0 + 10 * MIN));
         assert_eq!(c.now(at(1, 10 * MIN as u64, T0 + 10 * MIN)).unwrap().ms, T0 + 10 * MIN);
+    }
+
+    #[test]
+    fn a_forged_server_time_after_an_offline_reboot_cant_turn_the_clock_back_past_what_was_verified() {
+        let mut c = TrustedClock::default();
+        c.on_server_time(T0, at(1, 0, T0));
+        assert_eq!(c.now(at(1, 120 * MIN as u64, T0 + 120 * MIN)).unwrap().ms, T0 + 120 * MIN);
+        // Rebooted offline with the clock set back; then an answer claims it's T0 (serverTime isn't signed)
+        let boot2 = at(2, 1_000, T0 - 300 * MIN);
+        c.now(boot2);
+        c.on_server_time(T0, at(2, 2_000, T0 - 300 * MIN));
+        assert!(c.now(at(2, 2_000, T0 - 300 * MIN)).unwrap().ms >= T0 + 120 * MIN);
     }
 
     #[test]

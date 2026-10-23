@@ -258,6 +258,69 @@ fn applying_syncs_keeps_the_last_good_policy() {
     assert!(state.rules().policy.approval_required);
 }
 
+fn iso(ms: i64) -> String {
+    jiff::Timestamp::from_millisecond(ms).unwrap().to_string()
+}
+
+#[test]
+fn a_recorded_removal_answer_cant_be_played_back_after_an_offline_reboot() {
+    const HOUR: i64 = 60 * 60_000;
+    let removal = fixture!("sync-removal.json");
+    let device = removal["deviceId"].as_str().unwrap();
+    let signed_at = parse_iso_ms(removal["uninstall"]["command"]["at"].as_str().unwrap()).unwrap();
+
+    // The computer last synced two hours after the command was signed (the parent kept it in between)
+    let mut state = AgentState::paired(device, "Mia");
+    let mut kept = fixture!("sync-computer.json");
+    kept["deviceId"] = json!(device);
+    kept["serverTime"] = json!(iso(signed_at + 2 * HOUR));
+    state.apply_sync(&kept, &keys(), ClockSample { mono_ms: 1_000, boot_id: 1, wall_ms: signed_at + 2 * HOUR }, "0.1.0").unwrap();
+
+    // Rebooted offline, the PC's clock set back, and the recorded answer played back, its own serverTime and all.
+    // Judged by that serverTime the command would look fresh; by the clock as it stood, it's two hours old.
+    let replay = ClockSample { mono_ms: 5_000, boot_id: 2, wall_ms: signed_at };
+    // The service ran offline for a while first, so eGuard's clock is an estimate when the answer arrives
+    state.clock.now(ClockSample { mono_ms: 2_000, ..replay });
+    let r = state.apply_sync(&removal, &keys(), replay, "0.1.0").unwrap();
+    assert_eq!((r.uninstall, r.uninstall_rejected), (None, Some(VerifyError::Stale)));
+    // Nor did the forged serverTime turn eGuard's clock back
+    assert!(state.clock.now(replay).unwrap().ms >= signed_at + 2 * HOUR);
+
+    // A command accepted once isn't accepted again
+    let mut state = AgentState::paired(device, "Mia");
+    let mut before = fixture!("sync-computer.json");
+    before["deviceId"] = json!(device);
+    state.apply_sync(&before, &keys(), sample_at(before["serverTime"].as_str().unwrap()), "0.1.0").unwrap();
+    let now = sample_at(removal["serverTime"].as_str().unwrap());
+    assert!(state.apply_sync(&removal, &keys(), now, "0.1.0").unwrap().uninstall.is_some());
+    let again = state.apply_sync(&removal, &keys(), now, "0.1.0").unwrap();
+    assert_eq!((again.uninstall, again.uninstall_rejected), (None, Some(VerifyError::Replayed)));
+    // It survives a restart
+    let restored: AgentState = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert_eq!(restored.last_uninstall_at_ms, Some(signed_at));
+
+    // Before the first sync ever there's no clock to judge by but the PC's: it waits for the next sync
+    let mut fresh = AgentState::paired(device, "Mia");
+    let r = fresh.apply_sync(&removal, &keys(), now, "0.1.0").unwrap();
+    assert_eq!((r.uninstall, r.uninstall_rejected), (None, Some(VerifyError::Stale)));
+}
+
+#[test]
+fn a_screen_time_without_weekend_minutes_doesnt_sink_the_sync() {
+    let mut s = fixture!("sync-computer.json");
+    for p in s["policy"].as_array_mut().unwrap() {
+        if p["key"] == "SCREEN_TIME" {
+            p["config"].as_object_mut().unwrap().remove("weekendMinutes");
+        }
+    }
+    let mut state = AgentState::paired(s["deviceId"].as_str().unwrap(), "Mia");
+    let outcome = state.apply_sync(&s, &keys(), sample_at("2026-10-23T07:24:00Z"), "0.1.0").unwrap();
+    assert_eq!(outcome.notes, Vec::<String>::new());
+    let rules = state.rules();
+    assert_eq!(rules.policy.screen_time, Some((180, 180)));
+    assert!(rules.app("Counter-Strike 2").is_some());
+}
+
 #[test]
 fn the_server_time_sets_the_clock() {
     let s = fixture!("sync-computer.json");

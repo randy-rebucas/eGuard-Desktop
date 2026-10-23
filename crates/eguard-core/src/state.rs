@@ -1,6 +1,7 @@
 //! What the agent enforces between syncs, and how a `/sync` answer changes it (spec principle 5: fail closed).
 //!
 //! - A `/sync` that doesn't parse, or names another device, changes nothing: the last good policy stays in force.
+//!   One protection that doesn't parse keeps its last good settings; the rest of the answer still applies.
 //! - A `401` changes nothing either. The device may have been removed ("Remove without waiting"), or someone may be
 //!   in the way; only eGuard's signed command or a parent's code removes eGuard, so the agent keeps enforcing.
 //! - An uninstall command is acted on only once verified (`signature::verify_uninstall`).
@@ -52,6 +53,10 @@ pub struct AgentState {
     /// `minAppVersion` is above this build: the update screen shows, and enforcement goes on.
     pub update_required: bool,
     pub clock: TrustedClock,
+    /// `at` of the last uninstall command accepted (Unix ms). One not newer is refused, so an answer recorded once
+    /// can't be played back later.
+    #[serde(default)]
+    pub last_uninstall_at_ms: Option<i64>,
 }
 
 /// What a good `/sync` asks of the agent.
@@ -68,6 +73,8 @@ pub struct SyncOutcome {
     pub uninstall_rejected: Option<VerifyError>,
     /// The clock estimate was off when the server's time arrived: send `TAMPER` `CLOCK_CHANGED`.
     pub clock_change: Option<ClockChange>,
+    /// Parts of the answer that didn't parse and what was done instead (`SyncResponse::parse`), for the log.
+    pub notes: Vec<String>,
 }
 
 impl AgentState {
@@ -81,6 +88,7 @@ impl AgentState {
             auth: AuthState::Ok,
             update_required: false,
             clock: TrustedClock::default(),
+            last_uninstall_at_ms: None,
         }
     }
 
@@ -92,23 +100,35 @@ impl AgentState {
         sample: ClockSample,
         app_version: &str,
     ) -> Result<SyncOutcome, SyncError> {
-        let sync: SyncResponse = serde_json::from_value(raw.clone()).map_err(|e| SyncError::Malformed(e.to_string()))?;
+        let (sync, notes) = SyncResponse::parse(raw, self.last_sync.as_ref()).map_err(|e| SyncError::Malformed(e.to_string()))?;
         if sync.device_id != self.device_id {
             return Err(SyncError::WrongDevice(sync.device_id));
         }
+        // The command's freshness is judged by eGuard's clock as it stood before this answer: the answer's own
+        // serverTime isn't signed, so a replayed answer could otherwise bring its own matching time. Before the first
+        // sync ever there's no clock to judge by (only the PC's, which anyone can set), so a command then waits for
+        // the next sync; the server sends a fresh one every time while a removal waits.
+        let before_ms = self.clock.now(sample).map(|n| n.ms);
         let clock_change =
             sync.server_time.as_deref().and_then(crate::clock::parse_iso_ms).and_then(|t| self.clock.on_server_time(t, sample));
         let now_ms = self.clock.now(sample).map_or(sample.wall_ms, |n| n.ms);
 
-        let (uninstall, uninstall_rejected) = match raw.get("uninstall") {
-            Some(envelope) if !envelope.is_null() => match verify_uninstall(keys, envelope, &self.device_id, now_ms) {
-                Ok(cmd) => (Some(cmd), None),
+        let (uninstall, uninstall_rejected) = match (raw.get("uninstall"), before_ms) {
+            (Some(envelope), _) if envelope.is_null() => (None, None),
+            (Some(_), None) => (None, Some(VerifyError::Stale)),
+            (Some(envelope), Some(before_ms)) => match verify_uninstall(keys, envelope, &self.device_id, before_ms) {
+                Ok(cmd) if self.last_uninstall_at_ms.is_some_and(|last| cmd.at_ms <= last) => (None, Some(VerifyError::Replayed)),
+                Ok(cmd) => {
+                    self.last_uninstall_at_ms = Some(cmd.at_ms);
+                    (Some(cmd), None)
+                }
                 Err(e) => (None, Some(e)),
             },
-            _ => (None, None),
+            (None, _) => (None, None),
         };
 
         let outcome = SyncOutcome {
+            notes,
             requests: sync.requests.clone(),
             full_report_requested: sync.full_report_requested,
             next_sync_secs: sync.next_sync_seconds.clamp(MIN_SYNC_SECS, MAX_SYNC_SECS),

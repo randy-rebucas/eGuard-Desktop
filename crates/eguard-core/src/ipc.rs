@@ -103,6 +103,7 @@ pub struct SessionView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusInfo {
+    /// Paired, so the rules apply. Also true when the secrets were lost (then `authorized` is false).
     pub paired: bool,
     pub device_id: Option<String>,
     pub child_name: Option<String>,

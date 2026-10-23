@@ -30,9 +30,16 @@ impl Store {
         self.dir.join("secrets.bin")
     }
 
-    /// The state and secrets as they are on disk. A state file that doesn't parse is set aside (renamed, for a
-    /// look later) and the engine rebuilds it from the secrets. Secrets that exist but don't decrypt are an error
-    /// worth shouting about: the computer stays as paired, without a token, until someone looks.
+    /// The copy of the state from before the last save.
+    fn prev_path(&self) -> PathBuf {
+        self.dir.join("state.prev.json")
+    }
+
+    /// The state and secrets as they are on disk. A state file that's missing, doesn't parse or is too new is set
+    /// aside (renamed, for a look later) and the copy from before the last save is used instead, so the day's usage,
+    /// the code lockout, eGuard's clock and the queue survive; only when both are gone does the engine rebuild the
+    /// state from the secrets. Secrets that exist but don't decrypt are an error worth shouting about: the computer
+    /// stays paired and enforcing, without a token, until someone looks.
     pub fn load(&self) -> (Persisted, Option<DeviceSecrets>) {
         let secrets = match files::read_optional(&self.secrets_path()) {
             Ok(None) => None,
@@ -51,23 +58,54 @@ impl Store {
                 None
             }
         };
-        let state = match files::read_optional(&self.state_path()) {
-            Ok(None) => Persisted::default(),
-            Ok(Some(bytes)) => Persisted::from_json(&bytes).unwrap_or_else(|e| {
-                let aside = self.state_path().with_extension(format!("corrupt-{}", std::process::id()));
-                log::error(&format!("{e}; kept as {}", aside.display()));
-                let _ = std::fs::rename(self.state_path(), aside);
-                Persisted::default()
-            }),
-            Err(e) => {
-                log::error(&format!("state.json couldn't be read: {e}"));
-                Persisted::default()
-            }
+        let main = Self::read_state(&self.state_path());
+        let state = match main {
+            Ok(Some(s)) => s,
+            main => match (Self::read_state(&self.prev_path()), main.is_err()) {
+                (Ok(Some(s)), _) => {
+                    log::warn("state.json was missing or unreadable; carrying on from the copy before the last save (state.prev.json)");
+                    s
+                }
+                // A fresh install has neither
+                (_, false) if secrets.is_none() => Persisted::default(),
+                _ => {
+                    log::error("no usable state.json or state.prev.json; starting from what the secrets say");
+                    Persisted::default()
+                }
+            },
         };
         (state, secrets)
     }
 
+    /// One state file: `Ok(None)` when it isn't there, `Err` when it's there but unusable (set aside, logged).
+    fn read_state(path: &Path) -> Result<Option<Persisted>, ()> {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match files::read_optional(path) {
+            Ok(None) => Ok(None),
+            Ok(Some(bytes)) => match Persisted::from_json(&bytes) {
+                Ok(s) => Ok(Some(s)),
+                Err(e) => {
+                    let aside = path.with_extension(format!("corrupt-{}", std::process::id()));
+                    log::error(&format!("{name}: {e}; kept as {}", aside.display()));
+                    let _ = std::fs::rename(path, aside);
+                    Err(())
+                }
+            },
+            Err(e) => {
+                log::error(&format!("{name} couldn't be read: {e}"));
+                Err(())
+            }
+        }
+    }
+
+    /// Saves the state. The file it replaces becomes `state.prev.json` first: if the new one is ever lost or
+    /// corrupt, the next start carries on from the one before rather than from nothing. Neither holds a secret.
     pub fn save_state(&self, state: &Persisted) -> std::io::Result<()> {
+        match std::fs::rename(self.state_path(), self.prev_path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn(&format!("couldn't keep the previous state.json as state.prev.json: {e}")),
+        }
         files::write_atomic(&self.state_path(), &state.to_json())
     }
 
@@ -98,6 +136,37 @@ mod tests {
         assert_eq!(state, Persisted::default());
         assert!(loaded.is_some());
         assert!(std::fs::read_dir(&dir).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with("state.corrupt-")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_lost_or_corrupt_state_falls_back_to_the_one_before() {
+        let dir = std::env::temp_dir().join(format!("eguard-store-prev-{}", std::process::id()));
+        let store = Store::open(&dir, None).unwrap();
+        let secrets = DeviceSecrets { device_id: "dev_1".into(), token: "tok".into(), removal_secret: None };
+        let older = Persisted::recover(&secrets);
+        let mut newer = older.clone();
+        newer.last_scan_ms = Some(42);
+        store.save_state(&older).unwrap();
+        store.save_state(&newer).unwrap();
+        assert_eq!(store.load().0, newer);
+
+        // Corrupt: the copy before the last save, not nothing
+        std::fs::write(dir.join("state.json"), b"{half a fi").unwrap();
+        assert_eq!(store.load().0, older);
+        // Missing (a crash between keeping the old one and writing the new): the same
+        store.save_state(&newer).unwrap();
+        store.save_state(&newer).unwrap();
+        std::fs::remove_file(dir.join("state.json")).unwrap();
+        assert_eq!(store.load().0, newer);
+        // From a newer build: set aside, and the one before used
+        store.save_state(&older).unwrap();
+        std::fs::write(dir.join("state.json"), br#"{"version":99,"agent":null}"#).unwrap();
+        assert_eq!(store.load().0, newer);
+        // Neither left: the engine starts from the secrets
+        let _ = std::fs::remove_file(dir.join("state.json"));
+        std::fs::remove_file(dir.join("state.prev.json")).unwrap();
+        assert_eq!(store.load().0, Persisted::default());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

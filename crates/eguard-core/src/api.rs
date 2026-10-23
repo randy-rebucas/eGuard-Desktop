@@ -88,6 +88,35 @@ pub enum BadServerUrl {
     NotHttps,
     #[error("the server URL has no host")]
     NoHost,
+    #[error("the server URL's host or port isn't valid")]
+    BadHost,
+}
+
+/// The host of `authority` (`host[:port]`, an IPv6 host in brackets), checked. A user name or password is refused:
+/// `http://localhost@example.com` goes to example.com.
+fn host_of(authority: &str) -> Result<&str, BadServerUrl> {
+    if authority.contains('@') {
+        return Err(BadServerUrl::BadHost);
+    }
+    let (host, port) = if authority.starts_with('[') {
+        let end = authority.find(']').ok_or(BadServerUrl::BadHost)?;
+        (&authority[..=end], &authority[end + 1..])
+    } else {
+        match authority.find(':') {
+            Some(i) => (&authority[..i], &authority[i..]),
+            None => (authority, ""),
+        }
+    };
+    if !port.is_empty() {
+        let digits = port.strip_prefix(':').ok_or(BadServerUrl::BadHost)?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) || digits.parse::<u16>().is_err() {
+            return Err(BadServerUrl::BadHost);
+        }
+    }
+    if host.is_empty() {
+        return Err(BadServerUrl::NoHost);
+    }
+    Ok(host)
 }
 
 /// The eGuard server, checked: `https://` always, except `http://localhost` in a development build (the dev server).
@@ -97,19 +126,16 @@ pub struct ServerUrl(String);
 impl ServerUrl {
     pub fn parse(url: &str, dev_build: bool) -> Result<Self, BadServerUrl> {
         let url = url.trim();
-        let rest = if let Some(rest) = url.strip_prefix("https://") {
-            rest
-        } else if let Some(rest) = url.strip_prefix("http://") {
-            let host = rest.split(['/', ':']).next().unwrap_or("");
-            if !(dev_build && matches!(host, "localhost" | "127.0.0.1" | "[::1]")) {
-                return Err(BadServerUrl::NotHttps);
-            }
-            rest
-        } else {
-            return Err(BadServerUrl::NotHttps);
+        let (https, rest) = match (url.strip_prefix("https://"), url.strip_prefix("http://")) {
+            (Some(rest), _) => (true, rest),
+            (None, Some(rest)) => (false, rest),
+            (None, None) => return Err(BadServerUrl::NotHttps),
         };
-        if rest.split(['/', ':']).next().unwrap_or("").is_empty() {
-            return Err(BadServerUrl::NoHost);
+        let host = host_of(rest.split(['/', '?', '#']).next().unwrap_or(""))?;
+        let local = ["localhost", "127.0.0.1", "[::1]"].iter().any(|h| host.eq_ignore_ascii_case(h));
+        // Plain http only for the dev server on this machine, in a dev build
+        if !(https || dev_build && local) {
+            return Err(BadServerUrl::NotHttps);
         }
         Ok(Self(url.trim_end_matches('/').to_owned()))
     }
@@ -196,7 +222,7 @@ impl Api {
                 SendOutcome::RateLimited { .. } => SendOutcome::RateLimited { retry_after_secs: r.retry_after_secs },
                 o => o,
             },
-            Err(_) => SendOutcome::Failed,
+            Err(_) => SendOutcome::Unreachable,
         }
     }
 }
@@ -262,6 +288,22 @@ pub(crate) mod tests {
         assert_eq!(ServerUrl::parse("http://localhost.evil.example", true), Err(BadServerUrl::NotHttps));
         assert_eq!(ServerUrl::parse("https://", false), Err(BadServerUrl::NoHost));
         assert_eq!(ServerUrl::parse("ftp://x", true), Err(BadServerUrl::NotHttps));
+    }
+
+    #[test]
+    fn ipv6_hosts_are_read_whole_and_userinfo_is_refused() {
+        assert!(ServerUrl::parse("http://[::1]:3000", true).is_ok());
+        assert!(ServerUrl::parse("http://[::1]/", true).is_ok());
+        assert_eq!(ServerUrl::parse("http://[::1]:3000", false), Err(BadServerUrl::NotHttps));
+        assert!(ServerUrl::parse("https://[2001:db8::1]:8443", false).is_ok());
+        assert_eq!(ServerUrl::parse("http://[::2]:3000", true), Err(BadServerUrl::NotHttps));
+        assert_eq!(ServerUrl::parse("http://[::1", true), Err(BadServerUrl::BadHost));
+        assert_eq!(ServerUrl::parse("http://[::1]x", true), Err(BadServerUrl::BadHost));
+        assert_eq!(ServerUrl::parse("http://localhost:99999", true), Err(BadServerUrl::BadHost));
+        // "localhost" before an @ is a user name: the host is someone else's
+        assert_eq!(ServerUrl::parse("http://localhost@evil.example", true), Err(BadServerUrl::BadHost));
+        assert_eq!(ServerUrl::parse("https://:443", false), Err(BadServerUrl::NoHost));
+        assert!(ServerUrl::parse("http://LOCALHOST:3000", true).is_ok());
     }
 
     #[test]

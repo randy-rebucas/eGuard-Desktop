@@ -45,10 +45,12 @@ impl DayUsage {
     }
 
     fn add_ms(&mut self, app: Option<&UsageApp>, hour: usize, ms: u64) {
-        // A repeated hour (clocks going back) still holds at most an hour; a day at most 24 hours
+        // A repeated hour (clocks going back) still shows at most an hour in its bucket (the server takes 0–60), but
+        // the time was really used: the day and the app count all of it. A day holds at most 24 hours (the server
+        // takes up to 1440 minutes)
         let hour = hour.min(23);
-        let ms = ms.min(HOUR_MS - self.hourly_ms[hour]).min(DAY_MS - self.total_ms);
-        self.hourly_ms[hour] += ms;
+        let ms = ms.min(DAY_MS - self.total_ms);
+        self.hourly_ms[hour] += ms.min(HOUR_MS - self.hourly_ms[hour]);
         self.total_ms += ms;
         if let Some(a) = app {
             let entry = self.apps.entry(a.name.clone()).or_default();
@@ -191,14 +193,29 @@ mod tests {
     }
 
     #[test]
-    fn an_hour_holds_at_most_60_minutes_even_when_it_repeats() {
+    fn an_hour_holds_at_most_60_minutes_when_it_repeats_but_the_day_counts_it_all() {
         // 2026-11-01 in New York: 01:00–02:00 happens twice
         let ny = FamilyZone::new("America/New_York").unwrap();
         let mut l = UsageLedger::default();
         l.record(&ny, ms("2026-11-01T05:00:00Z"), ms("2026-11-01T07:00:00Z"), Some(&cs2()));
-        let r = l.day("2026-11-01").unwrap().report("2026-11-01");
+        let day = l.day("2026-11-01").unwrap();
+        let r = day.report("2026-11-01");
         assert_eq!(r.hourly.unwrap()[1], 60);
-        assert_eq!(r.total_minutes, 60);
+        // Two real hours were played: limits and the parent see both
+        assert_eq!(r.total_minutes, 120);
+        assert_eq!(r.apps[0].minutes, 120);
+        assert_eq!(day.app_secs("Counter-Strike 2"), 7_200);
+    }
+
+    #[test]
+    fn a_day_holds_at_most_24_hours() {
+        let mut d = DayUsage::default();
+        for h in 0..24 {
+            d.add(Some(&cs2()), h, 3_600);
+        }
+        d.add(Some(&cs2()), 1, 3_600);
+        let r = d.report("2026-11-01");
+        assert_eq!((r.total_minutes, r.apps[0].minutes), (1_440, 1_440));
     }
 
     #[test]

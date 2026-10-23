@@ -5,8 +5,11 @@
 //! - `DeviceSecrets`: the token and removal secret, encrypted by the platform (DPAPI, machine scope) in a file of its
 //!   own. Written first at pairing: the server sends them once.
 //!
-//! The device id is in both. A state file that is lost or corrupt is rebuilt from the secrets (`Persisted::recover`),
-//! so the computer stays paired and enforcing, with "approval for everything new" until the next `/sync`.
+//! The device id is in both. The platform keeps the state from before the last save too, and falls back to it when
+//! the state file is lost or corrupt, so the day's usage, the code lockout, eGuard's clock and the queue survive.
+//! Only when both are gone is the state rebuilt from the secrets (`Persisted::recover`), so the computer stays paired
+//! and enforcing, with "approval for everything new" until the next `/sync`. Lost secrets with the state kept: the
+//! computer keeps enforcing what it has (`Engine::enforces`) and can't sync.
 
 use crate::accounts::AccountChoice;
 use crate::enforce::Memo;
