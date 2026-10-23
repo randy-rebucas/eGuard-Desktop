@@ -7,8 +7,8 @@
 //! - Store packages of each signed-in user, read from their manifests.
 //! - Start Menu shortcuts, and exes in each user's Downloads, Desktop and `AppData`.
 //!
-//! Each candidate's main exe is checked once (signature, product name, imports) and cached by path, size and
-//! modification time. Users whose hive isn't loaded (not signed in) are seen through their folders only.
+//! Each candidate's main exe is checked once (signature, product name, imports) and cached by path, volume and file
+//! id, size and modification time. Users whose hive isn't loaded (not signed in) are seen through their folders only.
 
 use crate::registry::{Key, Root, View};
 use crate::{authenticode, version};
@@ -193,6 +193,61 @@ pub fn exe_facts(path: &Path) -> ExeFacts {
     }
 }
 
+/// Which file a path names right now, and its version: what a cached verdict about a file is kept against.
+///
+/// Size and modification time alone can be copied onto another file (`SetFileTime` and padding), which would hand a
+/// trusted file's verdict to a different one put at the same path. The volume and file id can't: a file put there
+/// in place of the old one has its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    /// The volume's serial number.
+    pub volume: u64,
+    /// The file's id on that volume (128-bit on `ReFS`; NTFS's 64-bit index otherwise).
+    pub file_id: u128,
+    pub size: u64,
+    /// Last written, in milliseconds since 1970.
+    pub modified_ms: i64,
+}
+
+impl FileIdentity {
+    /// The volume and file id as text, for caches keyed by strings.
+    pub fn tag(&self) -> String {
+        format!("{:016x}:{:032x}", self.volume, self.file_id)
+    }
+}
+
+/// The identity of the file at `path`, read from one open handle so all of it is about the same file. `None` for
+/// a folder, or a file that can't be opened.
+#[allow(unsafe_code)]
+pub fn file_identity(path: &Path) -> Option<FileIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FileIdInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx,
+    };
+    // Attributes only: enough for the id, and works on a file the caller may not read
+    let f = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(path).ok()?;
+    let meta = f.metadata().ok().filter(std::fs::Metadata::is_file)?;
+    let h = f.as_raw_handle() as HANDLE;
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: `h` is the open file; `info` is a live FILE_ID_INFO and its size is passed.
+    let ex = unsafe { GetFileInformationByHandleEx(h, FileIdInfo, (&raw mut info).cast(), size_of::<FILE_ID_INFO>() as u32) } != 0;
+    let (volume, file_id) = if ex {
+        (info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier))
+    } else {
+        let mut b = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `h` is the open file; `b` is a live out-parameter.
+        if unsafe { GetFileInformationByHandle(h, &raw mut b) } == 0 {
+            return None;
+        }
+        (u64::from(b.dwVolumeSerialNumber), (u128::from(b.nFileIndexHigh) << 32) | u128::from(b.nFileIndexLow))
+    };
+    let modified_ms = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as i64);
+    Some(FileIdentity { volume, file_id, size: meta.len(), modified_ms })
+}
+
 /// Engine and anti-cheat files beside an exe (spec section 5, game signals).
 fn game_files(exe: &Path) -> bool {
     if exe.file_name().is_some_and(|f| f.to_string_lossy().to_ascii_lowercase().ends_with("-shipping.exe")) {
@@ -227,20 +282,22 @@ impl Collector<'_> {
         (p.is_dir() && !self.broad.contains(&l) && l.len() > 3 && !self.under_windows(p)).then(|| p.to_owned())
     }
 
-    /// Signature, product name and imports of `path`, from the cache when the file hasn't changed.
+    /// Signature, product name and imports of `path`, from the cache when it's still the same file, unchanged.
     fn facts(&mut self, path: &Path) -> Option<ExeFacts> {
-        let meta = std::fs::metadata(path).ok().filter(std::fs::Metadata::is_file)?;
-        let modified_ms =
-            meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_millis() as i64);
-        let key = lower(path);
+        let id = file_identity(path)?;
+        // The file's identity is part of the key: another file put at this path is checked afresh
+        let key = format!("{}|{}", lower(path), id.tag());
         self.used.insert(key.clone());
-        if let Some(c) = self.cache.get(&key).filter(|c| c.size == meta.len() && c.modified_ms == modified_ms) {
+        if let Some(c) = self.cache.get(&key).filter(|c| c.size == id.size && c.modified_ms == id.modified_ms) {
             self.out.cache_hits += 1;
             return Some(c.facts.clone());
         }
         self.out.exes_checked += 1;
         let facts = exe_facts(path);
-        self.cache.insert(key, CachedExe { size: meta.len(), modified_ms, facts: facts.clone() });
+        // Kept only when the file checked is still the one identified before (not swapped while it was read)
+        if file_identity(path) == Some(id) {
+            self.cache.insert(key, CachedExe { size: id.size, modified_ms: id.modified_ms, facts: facts.clone() });
+        }
         Some(facts)
     }
 
@@ -641,6 +698,27 @@ mod tests {
         assert_eq!(command_exe(r"C:\Program Files\Foo\uninstall.exe /S"), Some(PathBuf::from(r"C:\Program Files\Foo\uninstall.exe")));
         assert_eq!(command_exe("MsiExec.exe /X{1}"), Some(PathBuf::from("MsiExec.exe")));
         assert!(is_helper("unins000.exe") && is_helper("ChromeSetup.exe") && !is_helper("PixelQuest.exe"));
+    }
+
+    #[test]
+    fn a_file_put_in_another_place_has_another_identity_even_with_the_same_size_and_time() {
+        let dir = std::env::temp_dir().join(format!("eguard-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.exe"), dir.join("b.exe"));
+        std::fs::write(&a, b"MZ one").unwrap();
+        std::fs::write(&b, b"MZ two").unwrap();
+        let first = file_identity(&a).unwrap();
+        assert_eq!(file_identity(&a), Some(first));
+        assert_eq!(first.size, 6);
+        // b gets a's modification time, then takes a's place
+        let t = std::fs::metadata(&a).unwrap().modified().unwrap();
+        std::fs::File::options().write(true).open(&b).unwrap().set_modified(t).unwrap();
+        std::fs::rename(&b, &a).unwrap();
+        let second = file_identity(&a).unwrap();
+        assert_eq!((second.size, second.modified_ms), (first.size, first.modified_ms));
+        assert_ne!(second.tag(), first.tag());
+        assert_eq!(file_identity(&dir), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

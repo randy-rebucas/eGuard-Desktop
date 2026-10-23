@@ -6,7 +6,7 @@
 use crate::wide::from_wide;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -111,19 +111,35 @@ pub fn list() -> Vec<ProcessEntry> {
 /// The full path of `pid`'s executable. Works for any process the caller can query, which as SYSTEM is all but the
 /// protected ones (and those are Windows' own).
 pub fn image_path(pid: u32) -> Option<PathBuf> {
-    let h = Handle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
-    let mut buf = vec![0u16; 1024];
-    let mut len = buf.len() as u32;
-    // SAFETY: `buf` holds `len` u16s; on success `len` is the length written.
-    if unsafe { QueryFullProcessImageNameW(h.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &raw mut len) } == 0 {
-        return None;
+    image_path_of(&Handle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?)
+}
+
+/// The executable's path of an open process. A path longer than the first buffer (deep folders) is
+/// read again with room for the longest path Windows allows, so it isn't mistaken for "can't be read".
+fn image_path_of(h: &Handle) -> Option<PathBuf> {
+    for size in [1024usize, 32_768] {
+        let mut buf = vec![0u16; size];
+        let mut len = buf.len() as u32;
+        // SAFETY: `buf` holds `len` u16s; on success `len` is the length written.
+        if unsafe { QueryFullProcessImageNameW(h.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &raw mut len) } != 0 {
+            return Some(PathBuf::from(from_wide(&buf[..(len as usize).min(buf.len())])));
+        }
+        // SAFETY: plain call, right after the failing one.
+        if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+            return None;
+        }
     }
-    Some(PathBuf::from(from_wide(&buf[..len as usize])))
+    None
 }
 
 /// When `pid` started (FILETIME ticks), to tell a process from a later one that reused its id.
 pub fn start_time(pid: u32) -> Option<u64> {
-    let h = Handle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    created(&Handle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?)
+}
+
+/// When the process behind `h` started (FILETIME ticks). Read on the handle that will be used, so the answer is
+/// about that very process and not a later one with the same id.
+fn created(h: &Handle) -> Option<u64> {
     let (mut created, mut exited, mut kernel, mut user) =
         (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
     // SAFETY: four live FILETIMEs for the four out-parameters.
@@ -144,29 +160,27 @@ pub fn current_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
 }
 
-/// `pid` and everything it started (and they started), from `procs`. A child must have started after its parent,
-/// so a process that only inherited a dead parent's reused id isn't taken along.
-pub fn tree(pid: u32, procs: &[ProcessEntry]) -> Vec<u32> {
+/// `pid` (which started at `start`) and everything it started (and they started), from `procs`, each with when
+/// it started. A child must have started after its parent, so a process that only inherited a dead parent's reused
+/// id isn't taken along; a process whose start can't be read is left out, and so are its children (nothing tells
+/// whether they are really its own).
+pub fn tree(pid: u32, start: u64, procs: &[ProcessEntry]) -> Vec<(u32, u64)> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for p in procs {
         if p.pid != p.parent {
             children.entry(p.parent).or_default().push(p.pid);
         }
     }
-    let mut out = vec![pid];
+    let mut out = vec![(pid, start)];
     let mut seen: HashSet<u32> = HashSet::from([pid]);
     let mut i = 0;
     while i < out.len() {
-        let parent = out[i];
-        let parent_start = start_time(parent);
+        let (parent, parent_start) = out[i];
         for &c in children.get(&parent).map_or(&[][..], Vec::as_slice) {
-            let younger = match (parent_start, start_time(c)) {
-                (Some(p), Some(c)) => c >= p,
-                // Can't tell (the parent is gone already): only follow from the process being ended
-                _ => parent == pid,
-            };
-            if younger && seen.insert(c) {
-                out.push(c);
+            if let Some(child_start) = start_time(c).filter(|&s| s >= parent_start)
+                && seen.insert(c)
+            {
+                out.push((c, child_start));
             }
         }
         i += 1;
@@ -174,20 +188,40 @@ pub fn tree(pid: u32, procs: &[ProcessEntry]) -> Vec<u32> {
     out
 }
 
-/// Ends `pid` and its tree, children first. Returns how many were ended. eGuard's own process is never touched.
-pub fn end_tree(pid: u32) -> usize {
+/// Ends `pid` and its tree, children first, when `pid` is still the process that started at `start`; otherwise
+/// (gone, or its id reused) ends nothing. Each process is checked again on the very handle that ends it, so one
+/// that took over a dead process's id between the listing and the end is left alone. `keep(pid)` decides for each
+/// one whether it may be ended (console mode's sandbox); it's asked while that process's handle is held open, so
+/// the id can't change hands meanwhile. Returns how many were ended. eGuard's own process is never touched.
+pub fn end_tree(pid: u32, start: u64, keep: impl Fn(u32) -> bool) -> usize {
     let me = current_pid();
-    if pid == me {
+    if pid == me || pid == 0 || pid == 4 {
         return 0;
     }
-    let mut pids = tree(pid, &list());
-    pids.reverse();
-    pids.into_iter().filter(|&p| p != me && p != 0 && p != 4 && end(p)).count()
+    let Some(root) = Handle::open(pid, PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION) else { return 0 };
+    if created(&root) != Some(start) {
+        return 0;
+    }
+    let mut ended = 0;
+    // Children first, deepest last-found first; the root (first in the tree) last, on the handle checked above
+    for (p, s) in tree(pid, start, &list()).into_iter().skip(1).rev() {
+        if p != me && p != 0 && p != 4 && end(p, s, &keep) {
+            ended += 1;
+        }
+    }
+    if keep(pid) && terminate(&root) {
+        ended += 1;
+    }
+    ended
 }
 
-/// Ends one process.
-pub fn end(pid: u32) -> bool {
-    let Some(h) = Handle::open(pid, PROCESS_TERMINATE) else { return false };
+/// Ends one process, when `pid` is still the one that started at `start` and `keep` lets it.
+fn end(pid: u32, start: u64, keep: &impl Fn(u32) -> bool) -> bool {
+    let Some(h) = Handle::open(pid, PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION) else { return false };
+    created(&h) == Some(start) && keep(pid) && terminate(&h)
+}
+
+fn terminate(h: &Handle) -> bool {
     // SAFETY: a handle with terminate rights; the process ends with eGuard's exit code.
     unsafe { TerminateProcess(h.0, ENDED_BY_EGUARD) != 0 }
 }
@@ -223,15 +257,22 @@ mod tests {
                 list().into_iter().find(|p| p.parent == pid && p.exe.eq_ignore_ascii_case("ping.exe"))
             })
             .expect("ping started");
-        assert_eq!(tree(pid, &list()), vec![pid, ping.pid]);
+        let cmd_start = start_time(pid).unwrap();
         let started = start_time(ping.pid).unwrap();
-        assert_eq!(end_tree(pid), 2);
+        assert_eq!(tree(pid, cmd_start, &list()), vec![(pid, cmd_start), (ping.pid, started)]);
+        // A start that isn't this cmd's (its id reused): nothing is ended
+        assert_eq!(end_tree(pid, cmd_start + 1, |_| true), 0);
+        // The filter is asked for each one, and what it refuses stays
+        assert_eq!(end_tree(pid, cmd_start, |p| p != ping.pid && p != pid), 0);
+        assert!(alive(ping.pid, started) && alive(pid, cmd_start));
+        assert_eq!(end_tree(pid, cmd_start, |_| true), 2);
         let cmd = Child::from_std(cmd);
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert_eq!(cmd.exit_code(), Some(ENDED_BY_EGUARD));
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(!alive(ping.pid, started));
         // Never this process
-        assert_eq!(end_tree(current_pid()), 0);
+        let me = current_pid();
+        assert_eq!(end_tree(me, start_time(me).unwrap(), |_| true), 0);
     }
 }
