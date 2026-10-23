@@ -13,13 +13,16 @@ if (-not $admin) { throw "run this from an administrator PowerShell" }
 
 netsh interface portproxy delete v4tov4 listenaddress=127.0.0.1 listenport=3000 2>$null | Out-Null
 netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=3000 connectaddress=$ServerHost connectport=3000 | Out-Null
+$status = 0
 try {
     Invoke-WebRequest -UseBasicParsing -Method Post http://localhost:3000/api/device/v1/sync | Out-Null
-    throw "the dev server answered without asking for a token"
-} catch [System.Net.WebException] {
-    $status = [int]$_.Exception.Response.StatusCode
-    if ($status -ne 401) { throw "the dev server isn't reachable through localhost:3000 ($($_.Exception.Message)); is it running on $ServerHost?" }
+} catch {
+    # Windows PowerShell and PowerShell 7 throw different types; both carry the response, when there was one
+    $response = $_.Exception.Response
+    if ($response) { $status = [int]$response.StatusCode }
+    $why = $_.Exception.Message
 }
+if ($status -ne 401) { throw "the dev server isn't reachable through localhost:3000 ($why); is it running on ${ServerHost}:3000?" }
 "dev server reachable through localhost:3000"
 
 $dest = Join-Path $env:ProgramFiles "eGuard"
