@@ -1,4 +1,9 @@
-//! Messages between the service and `eguard-agent` over the named pipe (spec section 3).
+//! Messages between the service and `eguard-agent` over the named pipes (spec section 3).
+//!
+//! - `\\.\pipe\eguard`: pairing, status and scans, for SYSTEM and administrators (the installer).
+//! - `\\.\pipe\eguard-session-<id>`: one per signed-in session, for SYSTEM and that session's logon. The agent
+//!   there sends heartbeats and the child's "Ask" buttons; the service knows the session from the pipe, never from
+//!   what the agent says.
 //!
 //! One JSON object per line, each with the protocol version `v`. The service treats everything the agent sends as
 //! untrusted: a line longer than `MAX_MESSAGE_BYTES`, a version it doesn't speak or a message that doesn't parse is
@@ -8,6 +13,12 @@ use serde::{Deserialize, Serialize};
 
 /// The service's pipe.
 pub const PIPE_NAME: &str = r"\\.\pipe\eguard";
+
+/// The pipe for one session's agent.
+pub fn session_pipe_name(session: u32) -> String {
+    format!(r"{PIPE_NAME}-session-{session}")
+}
+
 pub const PROTOCOL_VERSION: u32 = 1;
 /// The longest line either side reads.
 pub const MAX_MESSAGE_BYTES: usize = 8 * 1024;
@@ -26,6 +37,58 @@ pub enum Request {
     Status,
     /// Scan for apps now rather than at the next 6-hourly scan.
     Scan,
+    /// From a session's agent, about once a second: what has the focus, and how long since the last input.
+    #[serde(rename_all = "camelCase")]
+    Heartbeat {
+        /// The process owning the focused window; `None` when nothing has the focus.
+        foreground_pid: Option<u32>,
+        idle_ms: u64,
+    },
+    /// The child pressed "Ask parent" on a block screen.
+    AskParent {
+        notice: u64,
+    },
+    /// The child pressed "Ask for more time" on a block screen (`notice`) or the overlay (`None`).
+    AskTime {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notice: Option<u64>,
+    },
+}
+
+/// One of the agent's screens, in words for the child. The service writes the words; the agent only shows them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Screen {
+    /// Names this screen in `AskParent` / `AskTime` (0 for the overlay).
+    pub id: u64,
+    pub title: String,
+    pub body: String,
+    pub ask_parent: bool,
+    pub ask_time: bool,
+    /// The answer to the child's last ask, shown instead of the buttons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked: Option<String>,
+}
+
+/// A short notice ("5 minutes of gaming time left today"). Shown once: each has a new id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Warning {
+    pub id: u64,
+    pub text: String,
+}
+
+/// What a session's screen shows now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionView {
+    /// Full screen, over everything: bedtime, or the day's screen time used up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<Screen>,
+    /// The newest program eGuard ended in this session, and why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<Screen>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<Warning>,
 }
 
 /// What the agent may know about the service. No token, no removal secret.
@@ -59,6 +122,12 @@ pub enum Response {
         child_name: String,
     },
     Status(StatusInfo),
+    /// The answer to a heartbeat.
+    Session(SessionView),
+    /// The answer to an ask, in words for the child.
+    Asked {
+        message: String,
+    },
     /// In words for the person at the computer.
     Error {
         message: String,
@@ -138,6 +207,12 @@ mod tests {
         assert_eq!(back, Request::Pair { code: "ABCD-2345".into(), name: None });
         let status = encode(&Response::Paired { child_name: "Mia".into() });
         assert_eq!(status, b"{\"v\":1,\"type\":\"paired\",\"childName\":\"Mia\"}\n");
+        let hb = encode(&Request::Heartbeat { foreground_pid: Some(42), idle_ms: 1500 });
+        assert_eq!(hb, b"{\"v\":1,\"type\":\"heartbeat\",\"foregroundPid\":42,\"idleMs\":1500}\n");
+        let view = SessionView { warning: Some(Warning { id: 3, text: "1 minute left".into() }), ..SessionView::default() };
+        let line = encode(&Response::Session(view.clone()));
+        assert_eq!(decode::<Response>(&line[..line.len() - 1]).unwrap(), Response::Session(view));
+        assert_eq!(session_pipe_name(2), r"\\.\pipe\eguard-session-2");
     }
 
     #[test]

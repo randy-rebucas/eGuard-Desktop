@@ -7,6 +7,7 @@
 
 use crate::api::{Api, ApiError};
 use crate::clock::{ClockChange, ClockSample};
+use crate::enforce::{Inputs, Inventory};
 use crate::queue::{self, Settled};
 use crate::removal::RemovalSecret;
 use crate::report::{self, Capabilities};
@@ -14,7 +15,7 @@ use crate::scan::{self, Classifier, ExeCache, ScanResult};
 use crate::signature::{CatalogUpdate, TrustedKeys, verify_catalog};
 use crate::state::{AgentState, AuthState, UNAUTHORIZED_SYNC_SECS};
 use crate::store::{DeviceSecrets, Persisted};
-use crate::wire::{Catalog, DeviceEvent, EventEnvelope, PairRequest, Platform, SyncRequest, TamperKind};
+use crate::wire::{Catalog, DeviceEvent, EventEnvelope, PairRequest, Platform, SyncRequest, TamperKind, UsageReport};
 
 /// The longest the service sleeps: the wall clock is checked for changes about this often.
 pub const MAX_SLEEP_MS: u64 = 60_000;
@@ -421,9 +422,37 @@ impl Engine {
             if first { "APPS_FOUND events (first scan)" } else { "events for new apps" }
         )));
         self.data.apps_reported = Some(result.found.iter().map(|a| (a.app.clone(), a.clone())).collect());
+        self.data.places.clone_from(&result.places);
         self.data.exe_cache = cache;
         self.data.last_scan_ms = Some(now_ms);
         self.scan_requested = false;
+    }
+
+    /// What enforcement works from now: the rules in force, the family's zone, eGuard's clock, the catalog's
+    /// trusted publishers and games, and what the last scan found.
+    pub fn enforce_inputs(&self) -> Inputs {
+        let agent = self.data.agent.as_ref();
+        Inputs {
+            paired: self.is_paired(),
+            rules: agent.map(AgentState::rules).unwrap_or_default(),
+            zone: agent.map_or_else(crate::localtime::FamilyZone::utc, AgentState::zone),
+            clock: agent.map(|a| a.clock.clone()).unwrap_or_default(),
+            classifier: self.catalog.as_ref().map(Classifier::new),
+            inventory: Inventory::new(&self.data.places, self.data.apps_reported.as_ref()),
+        }
+    }
+
+    /// Queues what enforcement has to tell the server.
+    pub fn queue_enforcement(&mut self, events: Vec<DeviceEvent>, usage: Vec<UsageReport>, now_ms: i64) {
+        if !self.is_paired() {
+            return;
+        }
+        for e in events {
+            self.data.queue.push_event(EventEnvelope::new(e), now_ms);
+        }
+        for u in usage {
+            self.data.queue.push_usage(u, now_ms);
+        }
     }
 
     fn send_due(&mut self, token: &str, now_ms: i64) {

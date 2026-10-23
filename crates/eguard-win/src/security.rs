@@ -9,7 +9,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenLogonSid, TokenUser,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -86,39 +86,62 @@ pub fn set_dir_dacl(path: &std::path::Path, sddl: &str) -> std::io::Result<()> {
 
 /// The SID of the user this process runs as, as a string (`S-1-5-21-…`), for SDDL.
 pub fn current_user_sid() -> std::io::Result<String> {
+    with_own_token(|t| token_sid(t, TokenUser))
+}
+
+/// This process's logon SID (`S-1-5-5-…`): the one sign-in it belongs to, for a session pipe's DACL.
+pub fn current_logon_sid() -> std::io::Result<String> {
+    with_own_token(|t| token_sid(t, TokenLogonSid))
+}
+
+fn with_own_token<T>(f: impl FnOnce(HANDLE) -> std::io::Result<T>) -> std::io::Result<T> {
     let mut token: HANDLE = null_mut();
     // SAFETY: the pseudo-handle from GetCurrentProcess needs no closing; `token` is closed below.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) } == 0 {
         return Err(crate::last_error());
     }
-    let result = (|| {
-        // TOKEN_USER plus its SID: 256 bytes is ample (a SID is at most 68 bytes). u64s keep it aligned.
-        let mut buf = [0u64; 32];
-        let mut len = 0u32;
-        // SAFETY: `buf` is writable for its size in bytes; GetTokenInformation fails rather than overrun it.
-        if unsafe { GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), size_of_val(&buf) as u32, &raw mut len) } == 0 {
-            return Err(crate::last_error());
-        }
-        // SAFETY: on success the buffer starts with a TOKEN_USER whose SID points inside the buffer.
-        let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-        let mut s = null_mut();
-        // SAFETY: `sid` is valid while `buf` lives; `s` receives a LocalAlloc'd string freed below.
-        if unsafe { ConvertSidToStringSidW(sid, &raw mut s) } == 0 {
-            return Err(crate::last_error());
-        }
-        // SAFETY: `s` is a zero-terminated UTF-16 string from Windows; read up to the zero, then freed once.
-        let out = unsafe {
-            // A SID string is at most 184 characters
-            let len = (0..256).take_while(|&i| *s.add(i) != 0).count();
-            let v = from_wide(std::slice::from_raw_parts(s, len));
-            LocalFree(s as HLOCAL);
-            v
-        };
-        Ok(out)
-    })();
+    let result = f(token);
     // SAFETY: opened above, closed once.
     unsafe { CloseHandle(token) };
     result
+}
+
+/// A SID from `token` as a string: its user (`TokenUser`) or its logon SID (`TokenLogonSid`). Both answers start
+/// with a SID pointer (a `TOKEN_USER`, or a `TOKEN_GROUPS` whose first group is the logon SID).
+pub(crate) fn token_sid(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> std::io::Result<String> {
+    // TOKEN_USER or TOKEN_GROUPS plus a SID: 256 bytes is ample (a SID is at most 68 bytes). u64s keep it aligned.
+    let mut buf = [0u64; 32];
+    let mut len = 0u32;
+    // SAFETY: `buf` is writable for its size in bytes; GetTokenInformation fails rather than overrun it.
+    if unsafe { GetTokenInformation(token, class, buf.as_mut_ptr().cast(), size_of_val(&buf) as u32, &raw mut len) } == 0 {
+        return Err(crate::last_error());
+    }
+    // SAFETY: on success the buffer holds the answer for `class`, whose SIDs point inside the buffer.
+    let sid = unsafe {
+        if class == TokenLogonSid {
+            let groups = &*buf.as_ptr().cast::<TOKEN_GROUPS>();
+            if groups.GroupCount == 0 {
+                return Err(std::io::Error::other("the token has no logon SID"));
+            }
+            groups.Groups[0].Sid
+        } else {
+            (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid
+        }
+    };
+    let mut s = null_mut();
+    // SAFETY: `sid` is valid while `buf` lives; `s` receives a LocalAlloc'd string freed below.
+    if unsafe { ConvertSidToStringSidW(sid, &raw mut s) } == 0 {
+        return Err(crate::last_error());
+    }
+    // SAFETY: `s` is a zero-terminated UTF-16 string from Windows; read up to the zero, then freed once.
+    let out = unsafe {
+        // A SID string is at most 184 characters
+        let len = (0..256).take_while(|&i| *s.add(i) != 0).count();
+        let v = from_wide(std::slice::from_raw_parts(s, len));
+        LocalFree(s as HLOCAL);
+        v
+    };
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -132,5 +155,7 @@ mod tests {
         let sid = current_user_sid().unwrap();
         assert!(sid.starts_with("S-1-5-"), "{sid}");
         assert!(SecurityDescriptor::from_sddl(&format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})")).is_ok());
+        let logon = current_logon_sid().unwrap();
+        assert!(logon.starts_with("S-1-5-5-"), "{logon}");
     }
 }

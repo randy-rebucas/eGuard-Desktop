@@ -14,7 +14,8 @@ use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 
 /// Instances at once: one per signed-in session is plenty.
@@ -39,6 +40,12 @@ pub struct PipeServer {
 impl PipeServer {
     pub fn new(name: &str, sddl: &str) -> std::io::Result<Self> {
         Ok(Self { name: wide(name), security: SecurityDescriptor::from_sddl(sddl)?, first: true })
+    }
+
+    /// Who may connect to instances created from now on (a session's sign-in changed).
+    pub fn set_sddl(&mut self, sddl: &str) -> std::io::Result<()> {
+        self.security = SecurityDescriptor::from_sddl(sddl)?;
+        Ok(())
     }
 
     /// Waits for the next client and returns the connection. Reading and writing it is plain `Read`/`Write`.
@@ -111,6 +118,27 @@ pub fn connect(name: &str) -> std::io::Result<File> {
     std::fs::OpenOptions::new().read(true).write(true).open(name)
 }
 
+/// A session's pipe: SYSTEM, and the logon SID of the one sign-in it serves (spec section 3).
+pub fn session_pipe_sddl(logon_sid: &str) -> String {
+    format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{logon_sid})")
+}
+
+/// The process at the other end of a connection the server accepted.
+pub fn client_pid(conn: &File) -> Option<u32> {
+    use std::os::windows::io::AsRawHandle;
+    let mut pid = 0u32;
+    // SAFETY: `conn` is an open pipe handle; `pid` is a live out-parameter.
+    (unsafe { GetNamedPipeClientProcessId(conn.as_raw_handle() as HANDLE, &raw mut pid) } != 0).then_some(pid)
+}
+
+/// The process serving a pipe the client connected to (so an agent can check it's talking to eGuard's service).
+pub fn server_pid(conn: &File) -> Option<u32> {
+    use std::os::windows::io::AsRawHandle;
+    let mut pid = 0u32;
+    // SAFETY: `conn` is an open pipe handle; `pid` is a live out-parameter.
+    (unsafe { GetNamedPipeServerProcessId(conn.as_raw_handle() as HANDLE, &raw mut pid) } != 0).then_some(pid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,12 +157,14 @@ mod tests {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             };
+            assert_eq!(server_pid(&c), Some(crate::process::current_pid()));
             c.write_all(b"ping\n").unwrap();
             let mut s = String::new();
             c.read_to_string(&mut s).unwrap();
             s
         });
         let mut conn = server.accept().unwrap();
+        assert_eq!(client_pid(&conn), Some(crate::process::current_pid()));
         let mut buf = [0u8; 5];
         conn.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"ping\n");

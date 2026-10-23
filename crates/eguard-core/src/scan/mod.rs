@@ -189,12 +189,13 @@ impl Classifier {
     }
 }
 
-fn norm(path: &str) -> String {
+/// A path as places keep it: lower case, backslashes, no trailing separator.
+pub fn norm(path: &str) -> String {
     path.trim().trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase()
 }
 
 /// True when `path` is `dir` or inside it.
-fn inside(path: &str, dir: &str) -> bool {
+pub fn inside(path: &str, dir: &str) -> bool {
     let (p, d) = (norm(path), norm(dir));
     !d.is_empty() && (p == d || p.starts_with(&format!("{d}\\")))
 }
@@ -274,6 +275,16 @@ fn merge_by_dir(mut cands: Vec<Candidate>) -> Vec<Candidate> {
     out
 }
 
+/// An app's install folder, for matching a running program to its app (spec section 6: a renamed `cs2.exe` still
+/// lives in Steam's folder for appid 730).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Place {
+    /// Lower case, no trailing separator.
+    pub dir: String,
+    /// The reported app's name; `None` for a trusted publisher's app (never blocked).
+    pub app: Option<String>,
+}
+
 /// A scan's outcome.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanResult {
@@ -281,6 +292,8 @@ pub struct ScanResult {
     pub found: Vec<FoundApp>,
     /// What was left out by rule 3, and why (for the log and `scan --dry-run`).
     pub skipped: Vec<(String, Skip)>,
+    /// Install folders of what was found and of what was left out as trusted.
+    pub places: Vec<Place>,
 }
 
 /// Classifies merged candidates. Two apps reported under one name are one app on the parent's list, so they're
@@ -288,8 +301,17 @@ pub struct ScanResult {
 pub fn classify_all(classifier: &Classifier, cands: &[Candidate]) -> ScanResult {
     let mut found: BTreeMap<String, FoundApp> = BTreeMap::new();
     let mut skipped = Vec::new();
+    let mut places = Vec::new();
     for c in cands {
-        match classifier.classify(c) {
+        let result = classifier.classify(c);
+        if let Some(dir) = c.dir.as_deref().map(norm).filter(|d| !d.is_empty()) {
+            match &result {
+                Ok(app) => places.push(Place { dir, app: Some(app.app.clone()) }),
+                Err(Skip::TrustedPublisher(_)) => places.push(Place { dir, app: None }),
+                Err(Skip::BlankName) => {}
+            }
+        }
+        match result {
             Ok(app) => match found.get_mut(&app.app) {
                 Some(f) => {
                     for id in app.ids {
@@ -310,7 +332,7 @@ pub fn classify_all(classifier: &Classifier, cands: &[Candidate]) -> ScanResult 
             Err(why) => skipped.push((c.name.clone(), why)),
         }
     }
-    ScanResult { found: found.into_values().collect(), skipped }
+    ScanResult { found: found.into_values().collect(), skipped, places }
 }
 
 /// More new apps than this in one scan are sent as one `APPS_FOUND` (one alert) rather than an `APP_INSTALLED` each.

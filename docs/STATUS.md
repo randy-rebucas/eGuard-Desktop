@@ -1,18 +1,85 @@
 # Status
 
-Updated 2026-10-23, end of Phase 3.
+Updated 2026-10-23, end of Phase 4.
 
 | Phase | What | Status |
 |---|---|---|
 | 1 | Core crate, no Windows APIs | Done |
 | 2 | Pairing, sync and the service shell | Done |
-| 3 | Scanning and identification (spec 5, 6) | **Done** (this commit), with the catalog gaps below for the owner |
-| 4 | Enforcement and time (spec 7, 8) | Next. Needs a Windows 11 VM for acceptance tests 3–6 |
-| 5 | Web (spec 9) | |
+| 3 | Scanning and identification (spec 5, 6) | Done, with the catalog gaps below for the owner |
+| 4 | Enforcement and time (spec 7, 8) | **Built and checked on this PC with stand-ins** (this commit). Tests 3–5 pass in console mode; test 6 and everything that needs SYSTEM wait for the VM (below) |
+| 5 | Web (spec 9) | Next |
 | 6 | Removal protection and tamper (spec 10, 11) | Needs a VM |
 | 7 | Hardening and release readiness | Needs the code-signing certificate |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## Phase 4: what was built
+
+Owner's decisions (2026-10-23): **plain Win32 for the agent's screens** (block screen, warnings, overlay), not Tauri:
+they must work when WebView2 is broken or removed, and nothing new is pulled in. Tauri can come later for settings
+screens. And with no VM yet: **build all of Phase 4 and check it on this PC with stand-in programs**; real games,
+SYSTEM and a second account wait for the VM.
+
+| Crate / module | What it does |
+|---|---|
+| core `enforce` | `resolve`: a running program → an app. By the install folder the scan recorded (`scan::Place`: a renamed `cs2.exe` is still in Steam's folder for appid 730), then by id against `/sync` `apps[].ids`, then by name. Never ended: Microsoft-signed under `%SystemRoot%`, eGuard's own exes, accessibility tools (by file name and signer), a trusted publisher's non-game app (classifier rule 3; launcher games stay games). App Approval applies to scanned apps and unsigned exes outside Program Files only; anything else is untracked. `Enforcer`: `check` (what to end, `APP_BLOCKED` once per app per 10 min), `ended` (block screen per session), `heartbeat` (usage, warnings at 5 and 1 min, overlay, `LIMIT_REACHED` once per day and limit), `ask` (`APP_REQUESTED` / `TIME_REQUESTED`, once per app and reason per 10 min), `usage_due` (`/usage` every 5 min, at once after a limit). All the words on the screens are written here |
+| core `rules` | `upcoming` / `upcoming_screen`: what pauses next and when (for the warnings) |
+| core `ipc` | Session pipe `\\.\pipe\eguard-session-<id>`: `heartbeat` (foreground pid, idle ms), `askParent`, `askTime` → `SessionView` (overlay, block screen, warning) |
+| `eguard-win` `process`, `etw` | Process list (Toolhelp), image path, session, start time, ending a tree children-first with `TerminateProcess` (exit code `0x65477561`, "eGua"), a child must be younger than its parent. ETW real-time session on Microsoft-Windows-Kernel-Process (start events, pid only) |
+| `eguard-win` `authenticode` | Adds catalog signatures (`CryptCATAdmin*` + `WTD_CHOICE_CATALOG`, SHA-256 then SHA-1): most of System32 has no embedded signature |
+| `eguard-win` `session`, `input`, `ui` | WTS: sessions in use, lock state, the user's logon SID, `CreateProcessAsUserW` into a session, `WTSDisconnectSession`. Foreground pid, idle time incl. XInput controllers (a pad doesn't count as input to Windows). The three screens in GDI with standard buttons (Common Controls 6 via a linker-embedded manifest in `eguard-agent/build.rs`) |
+| `eguard-service` `monitor` | ETW when allowed + a sweep every second (2 s with ETW). Each program looked up once per file version; every tracked process re-checked each sweep (limits run out mid-game). New processes newest first with a 1 s budget per sweep, so a game opened at start-up isn't stuck behind 380 signature checks. A pid seen with another parent or exe name is looked up afresh (reuse) |
+| `eguard-service` `sessions` | One agent per session (service: as the user via WTS; console: in this session), started again when it dies; a non-zero exit sends `TAMPER` `AGENT_RESTARTED`. One pipe per session (SYSTEM + the logon SID), requests only from `eguard-agent.exe` beside the service, in that session. A session in use with a silent agent counts as used (fail closed). Backstop while paused: 3 agent restarts in a minute or 20 s of silence disconnects the session (service mode only) |
+| `eguard-service` `runner` | The enforcer has its own lock: ending a program never waits for a sync. Enforcement's events and usage go to the queue every 10 s; the state is saved on ticks (about a minute), not every 10 s. `run --sandbox DIR` |
+| `eguard-agent` | `session [--dev]`: heartbeat every second, screens, buttons; believes only a session pipe served by `eguard-service.exe` beside it. `preview block\|overlay\|warning` |
+| `tools/dev-family.mjs`, `tools/enforce/` | `app`, `limit`, `protect`, `screen-time` act as the parent. Stand-ins and scripts (see CLAUDE.md) |
+
+`Capabilities::enforced` now has SCREEN_TIME, BEDTIME, APP_APPROVAL, DOWNLOADS when programs are really ended (the
+service, or console mode with `--sandbox`); a console dry run still reports them as not applied.
+
+**The overlay** covers every monitor, takes the focus back every second and stays on top. While the day's screen
+time is up it steps aside when an always-allowed app that's still usable has the focus (Alt+Tab; it names those
+apps); bedtime covers everything. If something else keeps the focus for 15 s anyway, the agent locks the session
+(`LockWorkStation`); not in console mode, where the overlay also has a "Close (development build)" button.
+
+**Verified (2026-10-23, on this PC, console mode, `--sandbox`, against the dev server; family deleted after):**
+- `cargo test --workspace`: 142 passed, 1 ignored (core 104 unit + 12 fixture, win 24, service 2; the ignored one
+  draws on the screen and was checked by screenshot instead). Clippy (pedantic) and fmt clean. The Windows tests end
+  a real process tree, verify catalog signatures of notepad/cmd/taskmgr, read sessions and the logon SID, and check
+  both ends of a pipe.
+- **Test 3:** the stand-in `cs2.exe` in a fake Steam library (appid 730, BLOCKED by the parent) was ended in 0.26–0.92 s
+  (five runs, steady state), with eGuard's exit code; the block screen showed "Counter-Strike 2 is blocked". The
+  dashboard got "App blocked: Mia tried to open Counter-Strike 2, which is blocked" and, after "Ask parent", "App
+  approval requested: Mia asked again for Counter-Strike 2, which you blocked."
+- **Test 4:** `totally-not-cs2.exe` (a copy in the same folder) was ended in 0.80 s as Counter-Strike 2.
+- **Test 5:** Gaming time 1 minute, the unsigned "Pixel Quest" (found by the scan as GAMES) kept in front with input:
+  "1 minute of gaming time left today." showed at once, the game was ended after 53.5 s (52 s were left), the block
+  screen said "Gaming time used up", the dashboard got "Gaming time used up: Mia reached the 1m daily limit for
+  games", and "Ask for more time" gave "More time requested: Mia asked for more time on Pixel Quest, paused by a
+  category limit." The answer replaces the buttons on the screen.
+- **Overlay:** with daily screen time at 15 minutes (the server's minimum) and 15 used, the overlay came up within
+  2 s, "Ask for more time" on it went through (queue emptied; the server folds it into the open request), and the
+  dashboard got "Screen time limit reached: Mia reached the 15m daily limit."
+- **Test 7 (Phase 6's, partly):** killing `eguard-agent.exe` → a new one in under 4 s, and "eGuard was closed and
+  started again" on the dashboard.
+- **`/usage`:** the parent's screen time showed 13 minutes with hourly buckets in Manila hours.
+- **Accessibility:** the screens' buttons read as push buttons with a "Press" action through MSAA (what screen readers
+  use), and pressing them that way works.
+- **Never ended outside the sandbox:** the test family's App Approval left 44 of this PC's apps PENDING (Docker, Git,
+  Node.js, Postman, Claude Code…); console mode logged "would end" for them and ended nothing.
+- **Cost:** release build, 379 processes, no ETW: 1.2 % of one core steady; about 9 s of CPU once at start (looking up
+  every running program). Right after start a new game is ended in 0.2–2.3 s.
+
+**Not verified (needs the VM):**
+- **Test 6** (moving the clock forward an hour) needs an administrator to change the clock. Covered by the core's
+  tests (`moving_the_clock_forward_gains_nothing`, and Phase 2's `CLOCK_CHANGED` tests), not run live.
+- Anything as SYSTEM: ETW (this PC answers "access denied" to a normal user; the sweep did all the work above),
+  starting the agent with `WTSQueryUserToken` + `CreateProcessAsUserW`, the logon SID from another session's token,
+  the disconnect backstop, `LockWorkStation` (console mode never locks).
+- Real games and **Q3 (anti-cheat)**: `TerminateProcess` on CS2 (VAC), Fortnite (EAC) and Valorant (Vanguard) from
+  SYSTEM. Still the first thing to try on the VM.
+- A second (child) account, fast user switching, Remote Desktop, several monitors, a game controller.
 
 ## Phase 3: what was built
 
@@ -167,6 +234,17 @@ session over the service-mode pipe.
    display name can differ from the Uninstall name (Steam "Counter-Strike 2" vs an Uninstall "Steam App 730"
    both merge to the catalog's name here). If the server ever renames a catalog game, the child's list keeps the
    old name and the ids merge new reports into it, so nothing doubles; noted only so a rename isn't surprising.
+10. **New (Phase 4): "Ask parent" and "Ask for more time" take up to 5 minutes to come true.** The parent answers on
+    the dashboard, and the computer learns of it at its next `/sync` (`nextSyncSeconds` is 300). The same server
+    change as Q4 (60 s for computers, or a push) fixes it.
+11. **New (Phase 4): the desktop spec says Tauri for the agent (section 3).** The owner chose Win32 for the block
+    screen, warnings and overlay (above). Suggest the spec say so, with Tauri kept for later settings screens.
+12. **New (Phase 4): time in browsers and other trusted apps counts toward the day but isn't named in `/usage`.**
+    Naming it would put "Google Chrome" on the child's list as if it could be blocked, and it can't be (trusted
+    publisher, never ended). The parent sees the day's total, not "Chrome 2h". Owner's call; WEB (Phase 5) may change
+    the picture.
+13. **New (Phase 4): the overlay hides the taskbar.** A child reaches an always-allowed app with Alt+Tab (the overlay
+    names them). A launcher row on the overlay would be friendlier; worth a design pass.
 
 ## Open questions: recommendations
 
@@ -175,36 +253,21 @@ From `~/eguard/docs/desktop-agent-open-questions.md`. None is settled in the spe
 | # | Recommendation | State |
 |---|---|---|
 | Q2 Shared PCs | At pairing, the parent ticks which Windows accounts are the child's (default: the signed-in account, if standard). Only those sessions are enforced and counted. A new local account raises an alert (needs a new TAMPER kind or alert: server change) | Pairing UI (Tauri) still to come; server part needs the owner. **Until then the scan covers every account**, so a parent's own apps on a shared PC are reported too |
-| Q3 Anti-cheat | Spike at the start of Phase 4 on the VM: `TerminateProcess` on CS2, Fortnite (EAC) and Valorant (Vanguard) from SYSTEM. Fallbacks in order: IFEO `Debugger` stub for blocked exe names (paired with the id match), end the launcher, overlay + `LockWorkStation` | Phase 4 |
+| Q3 Anti-cheat | First thing on the VM: `TerminateProcess` on CS2, Fortnite (EAC) and Valorant (Vanguard) from SYSTEM. Fallbacks in order: IFEO `Debugger` stub for blocked exe names (paired with the id match), end the launcher, overlay + `LockWorkStation` | Enforcement built; the spike waits for the VM |
 | Q4 Waking for removal | Short term: the server answers `nextSyncSeconds: 60` to computers always (one-line change in `sync/route.ts`), which makes acceptance test 9 ("within a minute") possible. Later: a long-poll endpoint. Today the agent can't learn of a removal for up to 5 minutes | Needs the owner (server change) |
 | Q5 Guessing the code | **Built:** 5 wrong codes lock input for 15 min, doubling each lockout, capped at 24 h, persisted (`removal::CodeAttempts`, now saved in `state.json`). Telling the parent needs a new TAMPER kind `REMOVAL_CODE_GUESSED` (server change) | Core done; alert needs the owner |
 | Q6 Offline clock | **Built** (`clock`), and now fed by the service: samples from `GetTickCount64` + BootId every tick (≤ 60 s), persisted with the state. Stated limit: a forward jump while offline across a reboot can end bedtime early or start a new day until the PC is back online | Done |
 | Q1, Q7, Q8, Q9 | Not decided here; they need the owner (admin-account test 8, self-update design, end-of-life recovery, exclusive fullscreen) | Open |
 
-## Next: Phase 4 (enforcement and time, spec 7 and 8)
+## Next: Phase 5 (web, spec 9)
 
-Done when: spec acceptance tests 3 to 6 pass, each shown how it was checked. **Needs the Windows 11 VM** (a
-standard child account; Steam with CS2, Roblox): ending processes as SYSTEM, the per-session agent and the overlay
-can't be tested in console mode on this PC.
+Chrome/Edge `ExtensionInstallForcelist`, Firefox `policies.json`, the BROWSERS category for the rest. Writing browser
+policies changes this PC's security settings: that's on the "ask me first" list, so it's done on the VM (or the owner
+says otherwise). Inputs: `/sync` `browserLink` (finding 6), the extension's key mismatch (finding 2).
 
-1. **Spike first (Q3):** on the VM, `TerminateProcess` from SYSTEM on CS2, Fortnite (EAC) and Valorant (Vanguard).
-   Fallbacks in order: IFEO `Debugger` stub for blocked exe names, end the launcher, overlay + `LockWorkStation`.
-2. Process start detection: ETW Kernel-Process (`Microsoft-Windows-Kernel-Process`, start events with image path)
-   from the service; the 2-second `NtQuerySystemInformation`/Toolhelp sweep as fallback. Resolve a process to an app
-   **by id first** (`/sync` `apps[].ids`: the Steam appid from the exe's library folder, the `EXE` id from the cached
-   `ExeFacts`), then by name. The core's `rules::evaluate` decides; `scan::ExeCache` already holds signer + product.
-3. Never block: Microsoft-signed under `%SystemRoot%`, eGuard itself, accessibility tools, a trusted publisher's
-   non-game app (rule 3 of the classifier, already built).
-4. The per-session agent: the service starts `eguard-agent` in each session (`WTSQueryUserToken` +
-   `CreateProcessAsUser`), per-session pipe with the session's logon SID (replacing today's single pipe), foreground
-   window + idle time → `UsageLedger`, block screen, 5- and 1-minute warnings, time-up/bedtime overlay with
-   `LockWorkStation` as backstop. **Decide first:** the prompt says Tauri for the UI. Tauri's build pulls many crates
-   with build scripts and needs WebView2; that's near the "ask me first" line (crates that run code at build time).
-   Alternative with nothing new: a plain Win32 layered window from `eguard-win`. Recommend Win32 for the overlay and
-   block screen (they must work even when WebView2 is broken or removed), Tauri later for settings screens.
-5. `APP_BLOCKED`, `LIMIT_REACHED`, `TIME_REQUESTED`, `APP_REQUESTED` through the queue; `/usage` with `hourly[24]`
-   from the ledger.
-6. Then add the AVAILABLE keys to `Capabilities::enforced` in `runner.rs` as each is enforced, so `/report` says so.
+Before or alongside it, on the VM (Phase 4's open items): install the service, check ETW, agents in a child's
+session, the disconnect and lock backstops, test 6, and the Q3 anti-cheat spike with real games. `tools/enforce/`
+has the stand-ins.
 
 ## Gotchas
 
@@ -212,15 +275,24 @@ can't be tested in console mode on this PC.
   client in memory and answers 500 on anything that touches the new columns (pairing codes and `/pair` did).
   Restart it. On 2026-10-23 the owner asked Claude to restart it: it now runs from Claude's session in the
   background (`pnpm dev` in `~/eguard`) and stops when that session ends; start it again in your own terminal then.
-- The service holds the engine's lock during network calls, so a pipe request (status, pairing) can wait for a tick
-  in progress (seconds; up to the 30 s timeout per request with a server that doesn't answer). Fine for now; split
-  the lock if the agent UI ever feels it.
-- The pipe only checks who connects, not who serves: an agent doesn't yet verify the pipe belongs to the eGuard
-  service (`GetNamedPipeServerProcessId` + the service's SID). The service does refuse to share the name. Add the
-  client check with the real agent (Phase 4 or 6).
-- In a real install the pipe is one pipe for SYSTEM + Administrators. Per-session pipes (the logon SID of the session
-  the service starts the agent in) come when the service starts agents (Phase 4).
-- `AGENT_RESTARTED` isn't sent yet: that needs the guard (Phase 6) to tell a crash from a stop.
+- The service holds the engine's lock during network calls, so a request on `\\.\pipe\eguard` (status, pairing)
+  can wait for a tick in progress. Enforcement doesn't: the enforcer has its own lock, and the session pipes and
+  the monitor never take the engine's. Lock order where both are held: engine, then enforcer.
+- The session pipes check both ends (the agent believes only `eguard-service.exe` beside it; the service answers only
+  `eguard-agent.exe` beside it, in that session). `eguard-agent pair|status|scan` on `\\.\pipe\eguard` still don't
+  check who serves.
+- `AGENT_RESTARTED` is sent when an agent dies with a non-zero exit code while its session goes on. The service's own
+  restart still needs the guard (Phase 6) to tell a crash from a stop.
+- **Console mode and the owner's own programs.** A test family has App Approval on by default, so this PC's apps are
+  PENDING and would be ended. Console mode ends only inside `--sandbox` and logs the rest as "would end". Never add a
+  way around that. Also: the owner may be at the PC during a live check and close the screens by hand (it happened).
+- Usage counts the owner's own activity during a console run (the test family's 3-hour day and 21:30 bedtime would
+  put the overlay on the owner's screen): turn bedtime off or delete the family when done.
+- `GetLastInputInfo` counts injected input: `tools/enforce/play.ps1` nudges the mouse by a pixel to "play".
+- PowerShell's managed UI Automation sees Win32 buttons as panes (its Win32 proxies don't load); use MSAA
+  (`tools/enforce/press.ps1`), which is also what screen readers use.
+- Bash heredocs with nested quotes broke twice in this session (`unexpected EOF`); write edit scripts to the
+  scratchpad and run them instead.
 - A first scan on this PC takes about 35–50 s (it verifies ~160 signatures); later ones take a few seconds from the
   cache. Signature checks never use the network (no revocation, no URL retrieval).
 - The scan reads only what the account running it can read. In console mode that's this user; as SYSTEM it will see

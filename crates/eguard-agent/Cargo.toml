@@ -1,6 +1,6 @@
 [package]
 name = "eguard-agent"
-description = "eGuard in the signed-in session. For now a console: pair this computer and show its status"
+description = "eGuard in the signed-in session: the block screen, warnings and overlay, and a console to pair and check status"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

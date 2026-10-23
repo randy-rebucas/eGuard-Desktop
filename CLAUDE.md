@@ -21,12 +21,17 @@ on the owner, gotchas).
 
 - `crates/eguard-core`: platform-neutral (no Windows crate). Wire types, API client (`Transport` trait), rules, time
   accounting, trusted clock, signatures, removal codes, offline queue, sync state, `/report` contents, pipe messages,
-  the service's sync loop (`engine`). `#![forbid(unsafe_code)]` in its lib.rs.
+  the service's sync loop (`engine`), enforcement (`enforce`: which program is which app, what to end, usage, the
+  agent's screens and their words). `#![forbid(unsafe_code)]` in its lib.rs.
 - `crates/eguard-win`: `windows-sys` 0.61 (the same version `windows-service` uses). `WinHTTP`, DPAPI, atomic files,
-  named pipe + DACL, clocks, device details, app scan sources (`apps`), Authenticode, change notifications. The
-  workspace denies `unsafe`; only this crate's FFI modules allow it.
+  named pipe + DACL, clocks, device details, app scan sources (`apps`), Authenticode (embedded and catalog), change
+  notifications, processes (`process`, `etw`), sessions (`session`: WTS), input (`input`), the agent's Win32 screens
+  (`ui`). The workspace denies `unsafe`; only this crate's FFI modules allow it.
 - `crates/eguard-service`, `eguard-agent`, `eguard-guard`: the three binaries (spec section 3). On the owner's PC the
-  service runs in console mode (`eguard-service run`); `install` is for a VM.
+  service runs in console mode (`eguard-service run`); `install` is for a VM. Console mode ends programs only inside
+  `--sandbox DIR` (without it, it only logs what it would end): never run it so it can end the owner's own tools.
+- `tools/enforce/`: stand-ins and scripts for checking enforcement by hand (`setup.ps1` makes a fake Steam CS2 and an
+  unsigned "Pixel Quest"; `launch.ps1`, `play.ps1`, `press.ps1`, `waitoverlay.ps1`).
 - `fixtures/server/`: real server responses, captured by `node tools/capture-fixtures.mjs` (needs ~/eguard's dev DB
   and a dev server; it deletes its test family afterwards). `fixtures/canonical-vectors.json`: made by
   `node tools/canonical-vectors.mjs`. Never hand-edit either.
@@ -39,7 +44,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 node tools/capture-fixtures.mjs        # refresh fixtures (EGUARD_URL defaults to http://localhost:3000)
 node tools/dev-family.mjs create|code|show|apps|alerts|delete   # a test family for pairing this PC by hand
+node tools/dev-family.mjs app NAME BLOCKED | limit GAMES 1 | protect KEY JSON | screen-time   # act as the parent
 target\debug\eguard-service scan --catalog fixtures/server/catalog.json --verbose   # dry-run scan of this PC
+target\debug\eguard-service run --sandbox %TEMP%\eguard-sandbox   # console mode; ends programs only in the sandbox
+target\debug\eguard-agent preview block|overlay|warning          # look at a screen with sample words
 ```
 
 ## Conventions

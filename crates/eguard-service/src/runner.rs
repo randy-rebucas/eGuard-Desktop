@@ -1,29 +1,53 @@
-//! The service's work, the same in console mode and as a Windows service: the sync loop on one thread, the pipe on
-//! another, scans on a third (so syncing never waits for one), all sharing the engine behind a lock.
+//! The service's work, the same in console mode and as a Windows service:
+//!
+//! - the sync loop (this thread): `/sync`, the catalog, sending the queue;
+//! - the pipe (`\\.\pipe\eguard`): pairing, status, scans;
+//! - scans, on a thread of their own when due;
+//! - the process monitor (`monitor`): ending what the rules say to end;
+//! - the session supervisor (`sessions`): an agent and a pipe per signed-in session.
+//!
+//! The engine (sync state) and the enforcer (rules in force, usage) each sit behind their own lock, so ending a
+//! program never waits for a network call. After each tick the loop hands the enforcer the newest rules, and takes
+//! its events and usage into the queue. Lock order, where both are held: engine, then enforcer.
 
 use crate::log;
+use crate::monitor::{self, EndMode, Facts, Monitor};
+use crate::sessions::{self, Shared};
 use crate::store::Store;
 use eguard_core::api::{Api, ServerUrl};
+use eguard_core::enforce::{Enforcer, Memo};
 use eguard_core::engine::{DeviceInfo, Engine, Note};
 use eguard_core::ipc::{self, Request, Response};
-use eguard_core::report::Capabilities;
+use eguard_core::report::{AVAILABLE, Capabilities};
 use eguard_core::scan::{self, Classifier, ExeCache};
 use eguard_core::signature::TrustedKeys;
+use eguard_core::usage::UsageLedger;
 use eguard_win::apps;
 use eguard_win::{clock, http::WinHttp, pipe::PipeServer, sysinfo};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// What this build can do (spec section 11). Phase 2 enforces nothing yet, so the AVAILABLE protections are left
-/// out of `/report` and the server shows them as not applied; the guided ones are reported off, with why.
-fn capabilities() -> Capabilities {
+/// How the service runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// The Windows service, as SYSTEM: agents in every session, programs ended for real.
+    Service,
+    /// A console on a developer's PC: an agent in this session only; programs ended only inside `sandbox`, and with
+    /// none, only logged.
+    Console { sandbox: Option<PathBuf> },
+}
+
+/// What this build can do (spec section 11). The AVAILABLE protections are enforced when programs are really ended
+/// (the service, or console mode with a sandbox); a dry run reports them as not applied, which is the truth. The
+/// guided ones are reported off, with why, until Phases 5 and 6.
+fn capabilities(enforcing: bool) -> Capabilities {
     Capabilities {
-        enforced: std::collections::BTreeSet::new(),
+        enforced: if enforcing { AVAILABLE.into_iter().collect() } else { std::collections::BTreeSet::new() },
         uninstall_protection: Err("Removal protection isn't in this version of eGuard for Windows yet.".into()),
         web: Err("This version of eGuard for Windows doesn't set up the browser extension yet.".into()),
     }
@@ -35,6 +59,7 @@ pub struct Options {
     pub server: ServerUrl,
     /// SDDL for the pipe: who may connect.
     pub pipe_sddl: String,
+    pub mode: Mode,
 }
 
 #[derive(Debug)]
@@ -52,6 +77,11 @@ pub struct Runner {
     store: Store,
     info: DeviceInfo,
     pipe_sddl: String,
+    mode: Mode,
+    enforcer: Arc<Mutex<Enforcer>>,
+    facts: Arc<Facts>,
+    /// Something to send now (the child asked for something): set without the engine's lock, which a sync may hold.
+    poked: AtomicBool,
     /// A scan is running; the loop doesn't start another.
     scanning: AtomicBool,
     /// Launcher folders the last scan found, for the watcher.
@@ -73,8 +103,12 @@ impl Runner {
         let transport = WinHttp::new(&format!("eGuard-Windows/{APP_VERSION}")).map_err(|e| e.to_string())?;
         let api = Api::new(opts.server, Box::new(transport));
         let (state, secrets) = opts.store.load();
-        let mut engine = Engine::new(state, secrets, api, keys, capabilities());
+        let enforcing = matches!(opts.mode, Mode::Service | Mode::Console { sandbox: Some(_) });
+        let mut engine = Engine::new(state, secrets, api, keys, capabilities(enforcing));
         log_notes(&mut engine);
+        // Usage and what enforcement remembers move to the enforcer; they're copied back at every save
+        let mut enforcer = Enforcer::new(std::mem::take(&mut engine.data.usage), std::mem::take(&mut engine.data.enforce));
+        enforcer.update(engine.enforce_inputs());
         let info = DeviceInfo::new(
             &sysinfo::computer_name().unwrap_or_default(),
             &sysinfo::model(),
@@ -89,6 +123,10 @@ impl Runner {
             store: opts.store,
             info,
             pipe_sddl: opts.pipe_sddl,
+            mode: opts.mode,
+            enforcer: Arc::new(Mutex::new(enforcer)),
+            facts: Arc::new(Facts::new()),
+            poked: AtomicBool::new(false),
             scanning: AtomicBool::new(false),
             watch_dirs: Arc::new(Mutex::new(Vec::new())),
         }))
@@ -96,7 +134,11 @@ impl Runner {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // A panic elsewhere mustn't stop protection: the engine's state is still the last consistent one
-        self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn enforcer(&self) -> std::sync::MutexGuard<'_, Enforcer> {
+        self.enforcer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn request_stop(&self) {
@@ -104,10 +146,36 @@ impl Runner {
         self.wake.notify_all();
     }
 
-    fn save(&self, inner: &Inner) {
+    /// Wakes the loop now, without waiting for the engine's lock.
+    fn poke(&self) {
+        self.poked.store(true, Ordering::SeqCst);
+        self.wake.notify_all();
+    }
+
+    fn save(&self, inner: &mut Inner) {
+        {
+            let e = self.enforcer();
+            inner.engine.data.usage = e.ledger().clone();
+            inner.engine.data.enforce = e.memo().clone();
+        }
         if let Err(e) = self.store.save_state(&inner.engine.data) {
             log::error(&format!("saving state.json failed: {e}"));
         }
+    }
+
+    /// Moves enforcement's events and usage into the queue. True when there was something.
+    fn collect_enforcement(&self, inner: &mut Inner) -> bool {
+        let sample = clock::sample();
+        let (events, usage) = {
+            let mut e = self.enforcer();
+            (e.take_events(), e.usage_due(sample))
+        };
+        if events.is_empty() && usage.is_empty() {
+            return false;
+        }
+        let now = inner.engine.now_ms(sample);
+        inner.engine.queue_enforcement(events, usage, now);
+        true
     }
 
     /// Runs until `request_stop`.
@@ -118,20 +186,8 @@ impl Runner {
         let first = server.create().map_err(|e| format!("couldn't create {} ({e}); is another eGuard running?", ipc::PIPE_NAME))?;
         let me = Arc::clone(self);
         std::thread::Builder::new().name("pipe".into()).spawn(move || me.serve_pipe(server, first)).map_err(|e| e.to_string())?;
-        let me = Arc::clone(self);
-        let dirs = Arc::clone(&self.watch_dirs);
-        let watching = eguard_win::watch::spawn(
-            move || dirs.lock().map(|d| d.clone()).unwrap_or_default(),
-            move || {
-                let mut inner = me.lock();
-                inner.engine.request_scan();
-                inner.woken = true;
-                me.wake.notify_all();
-            },
-        );
-        if let Err(e) = watching {
-            log::warn(&format!("couldn't watch for installs ({e}); scans run every 6 hours only"));
-        }
+        self.start_watcher();
+        self.start_enforcement()?;
 
         {
             let mut inner = self.lock();
@@ -146,29 +202,98 @@ impl Runner {
                 log::info("not paired yet: run `eguard-agent pair` and type the code from the parent dashboard");
             }
             if inner.engine.on_start(clock::sample()) {
-                self.save(&inner);
+                self.save(&mut inner);
             }
             log_notes(&mut inner.engine);
         }
 
+        let mut next_tick = Instant::now();
         while !self.stop.load(Ordering::SeqCst) {
+            let poked = self.poked.swap(false, Ordering::SeqCst);
             let mut inner = self.lock();
-            let info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
-            let tick = inner.engine.tick(clock::sample(), &info);
-            log_notes(&mut inner.engine);
-            if tick.changed {
-                self.save(&inner);
+            // Enforcement's events and usage are looked at every 10 s; a tick (sync, send, save) runs when it's due,
+            // when woken, or when there's something to send
+            let queued = self.collect_enforcement(&mut inner);
+            if queued || poked || inner.woken || Instant::now() >= next_tick {
+                let info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
+                let tick = inner.engine.tick(clock::sample(), &info);
+                log_notes(&mut inner.engine);
+                self.enforcer().update(inner.engine.enforce_inputs());
+                if tick.changed {
+                    self.save(&mut inner);
+                }
+                self.start_scan_if_due(&mut inner);
+                next_tick = Instant::now() + Duration::from_millis(tick.sleep_ms);
             }
-            self.start_scan_if_due(&mut inner);
             inner.woken = false;
+            let sleep = next_tick.saturating_duration_since(Instant::now()).min(Duration::from_secs(10));
             let (_inner, _) = self
                 .wake
-                .wait_timeout_while(inner, Duration::from_millis(tick.sleep_ms), |i| !i.woken && !self.stop.load(Ordering::SeqCst))
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .wait_timeout_while(inner, sleep, |i| !i.woken && !self.poked.load(Ordering::SeqCst) && !self.stop.load(Ordering::SeqCst))
+                .unwrap_or_else(PoisonError::into_inner);
         }
-        let inner = self.lock();
-        self.save(&inner);
+        let mut inner = self.lock();
+        self.save(&mut inner);
         log::info("stopped");
+        Ok(())
+    }
+
+    fn start_watcher(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        let dirs = Arc::clone(&self.watch_dirs);
+        let watching = eguard_win::watch::spawn(
+            move || dirs.lock().map(|d| d.clone()).unwrap_or_default(),
+            move || {
+                let mut inner = me.lock();
+                inner.engine.request_scan();
+                inner.woken = true;
+                me.wake.notify_all();
+            },
+        );
+        if let Err(e) = watching {
+            log::warn(&format!("couldn't watch for installs ({e}); scans run every 6 hours only"));
+        }
+    }
+
+    /// The process monitor and the session supervisor.
+    fn start_enforcement(self: &Arc<Self>) -> Result<(), String> {
+        let mode = match &self.mode {
+            Mode::Service => EndMode::Real,
+            Mode::Console { sandbox: Some(dir) } => {
+                let dir = monitor::sandbox_dir(dir).map_err(|e| format!("--sandbox {}: {e}", dir.display()))?;
+                log::info(&format!("development: programs are ended only inside {dir}"));
+                EndMode::Sandbox(dir)
+            }
+            Mode::Console { sandbox: None } => {
+                log::info("development: no --sandbox, so nothing is ended; what would be is logged");
+                EndMode::DryRun
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        let etw = match eguard_win::etw::spawn(move |pid| {
+            let _ = tx.lock().map(|t| t.send(pid));
+        }) {
+            Ok(()) => {
+                log::info("watching process starts (ETW)");
+                true
+            }
+            Err(e) => {
+                log::info(&format!("no ETW process events ({e}); sweeping the process list every second"));
+                false
+            }
+        };
+        let monitor = Monitor::new(Arc::clone(&self.facts), Arc::clone(&self.enforcer), mode, etw);
+        std::thread::Builder::new().name("monitor".into()).spawn(move || monitor.run(&rx)).map_err(|e| e.to_string())?;
+
+        let me = Arc::clone(self);
+        let shared = Arc::new(Shared::new(
+            Arc::clone(&self.enforcer),
+            Arc::clone(&self.facts),
+            matches!(self.mode, Mode::Console { .. }),
+            Box::new(move || me.poke()),
+        ));
+        std::thread::Builder::new().name("sessions".into()).spawn(move || sessions::supervise(&shared)).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -207,7 +332,8 @@ impl Runner {
         let now = inner.engine.now_ms(clock::sample());
         inner.engine.apply_scan(&result, cache, now);
         log_notes(&mut inner.engine);
-        self.save(&inner);
+        self.enforcer().update(inner.engine.enforce_inputs());
+        self.save(&mut inner);
         self.scanning.store(false, Ordering::SeqCst);
         // Send what the scan found now, not at the next tick
         inner.woken = true;
@@ -255,35 +381,46 @@ impl Runner {
                 self.wake.notify_all();
                 Response::Status(inner.engine.status())
             }
-            Request::Pair { code, name } => {
-                let mut inner = self.lock();
-                let mut info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
-                if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
-                    info = DeviceInfo::new(&name, &info.model, &info.os_version, &info.app_version, info.battery);
-                }
-                let paired = match inner.engine.pair(&code, &info) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::warn(&format!("pairing refused: {e}"));
-                        return Response::Error { message: e.to_string() };
-                    }
-                };
-                // The server sends the secrets once: they're on disk before anything else happens
-                if let Err(e) = self.store.save_secrets(&paired.secrets) {
-                    log::error(&format!("pairing succeeded but saving the secrets failed: {e}"));
-                    return Response::Error {
-                        message: "eGuard paired, but this computer couldn't save its key. Remove it from the dashboard and pair again."
-                            .into(),
-                    };
-                }
-                let child_name = paired.child_name.clone();
-                inner.engine.adopt(paired);
-                log_notes(&mut inner.engine);
-                self.save(&inner);
-                inner.woken = true;
-                self.wake.notify_all();
-                Response::Paired { child_name }
+            Request::Pair { code, name } => self.pair(&code, name),
+            // A session's agent talks on its own session's pipe
+            Request::Heartbeat { .. } | Request::AskParent { .. } | Request::AskTime { .. } => {
+                Response::Error { message: "That is asked on the session's own pipe.".into() }
             }
         }
+    }
+
+    fn pair(&self, code: &str, name: Option<String>) -> Response {
+        let mut inner = self.lock();
+        let mut info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
+        if let Some(name) = name.filter(|n| !n.trim().is_empty()) {
+            info = DeviceInfo::new(&name, &info.model, &info.os_version, &info.app_version, info.battery);
+        }
+        let paired = match inner.engine.pair(code, &info) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn(&format!("pairing refused: {e}"));
+                return Response::Error { message: e.to_string() };
+            }
+        };
+        // The server sends the secrets once: they're on disk before anything else happens
+        if let Err(e) = self.store.save_secrets(&paired.secrets) {
+            log::error(&format!("pairing succeeded but saving the secrets failed: {e}"));
+            return Response::Error {
+                message: "eGuard paired, but this computer couldn't save its key. Remove it from the dashboard and pair again.".into(),
+            };
+        }
+        let child_name = paired.child_name.clone();
+        inner.engine.adopt(paired);
+        log_notes(&mut inner.engine);
+        // A new pairing starts its usage afresh, like the rest of the state
+        {
+            let mut e = self.enforcer();
+            *e = Enforcer::new(UsageLedger::default(), Memo::default());
+            e.update(inner.engine.enforce_inputs());
+        }
+        self.save(&mut inner);
+        inner.woken = true;
+        self.wake.notify_all();
+        Response::Paired { child_name }
     }
 }

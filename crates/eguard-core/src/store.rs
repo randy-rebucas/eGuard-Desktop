@@ -8,9 +8,10 @@
 //! The device id is in both. A state file that is lost or corrupt is rebuilt from the secrets (`Persisted::recover`),
 //! so the computer stays paired and enforcing, with "approval for everything new" until the next `/sync`.
 
+use crate::enforce::Memo;
 use crate::queue::OutboundQueue;
 use crate::removal::CodeAttempts;
-use crate::scan::ExeCache;
+use crate::scan::{ExeCache, Place};
 use crate::state::AgentState;
 use crate::usage::UsageLedger;
 use crate::wire::{FoundApp, ReportedProtection};
@@ -47,6 +48,12 @@ pub struct Persisted {
     /// Signatures and product names already checked (`scan::ExeCache`).
     #[serde(default)]
     pub exe_cache: ExeCache,
+    /// Where the last scan found each app installed, for matching running programs to apps.
+    #[serde(default)]
+    pub places: Vec<Place>,
+    /// What enforcement remembers across restarts (limits already reported today).
+    #[serde(default)]
+    pub enforce: Memo,
 }
 
 impl Default for Persisted {
@@ -62,6 +69,8 @@ impl Default for Persisted {
             apps_reported: None,
             last_scan_ms: None,
             exe_cache: ExeCache::new(),
+            places: Vec::new(),
+            enforce: Memo::default(),
         }
     }
 }

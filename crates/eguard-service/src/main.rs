@@ -2,8 +2,9 @@
 //!
 //! ```text
 //! eguard-service                      started by Windows as the eGuard service
-//! eguard-service run [--server URL] [--data-dir DIR]
-//!                                     the same work in this console (development; Ctrl+C stops it)
+//! eguard-service run [--server URL] [--data-dir DIR] [--sandbox DIR]
+//!                                     the same work in this console (development; Ctrl+C stops it). Programs are
+//!                                     ended only inside --sandbox; without it, what would be ended is logged
 //! eguard-service install | uninstall  register / remove the Windows service (administrator; use a VM)
 //! ```
 //!
@@ -13,14 +14,16 @@
 #![windows_subsystem = "console"]
 
 mod log;
+mod monitor;
 mod runner;
 mod scan;
+mod sessions;
 mod store;
 mod svc;
 
 use eguard_core::api::ServerUrl;
 use eguard_core::keys;
-use runner::{Options, Runner};
+use runner::{Mode, Options, Runner};
 use std::path::PathBuf;
 use std::sync::Arc;
 use store::Store;
@@ -46,17 +49,19 @@ pub(crate) fn service_runner() -> Result<Arc<Runner>, String> {
     let dir = eguard_win::files::program_data_dir();
     let store = Store::open(&dir, Some(eguard_win::security::DATA_DIR_SDDL)).map_err(|e| format!("{}: {e}", dir.display()))?;
     log::init(Some(&dir.join("logs")), false);
-    Runner::new(Options { store, server: server_url(None)?, pipe_sddl: eguard_win::pipe::SERVICE_PIPE_SDDL.into() })
+    Runner::new(Options { store, server: server_url(None)?, pipe_sddl: eguard_win::pipe::SERVICE_PIPE_SDDL.into(), mode: Mode::Service })
 }
 
 fn console(args: &[String]) -> Result<(), String> {
     let mut server = None;
     let mut data_dir = None;
+    let mut sandbox = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--server" => server = Some(it.next().ok_or("--server needs a URL")?.clone()),
             "--data-dir" => data_dir = Some(PathBuf::from(it.next().ok_or("--data-dir needs a folder")?)),
+            "--sandbox" => sandbox = Some(PathBuf::from(it.next().ok_or("--sandbox needs a folder")?)),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -67,13 +72,17 @@ fn console(args: &[String]) -> Result<(), String> {
     let store = Store::open(&dir, None).map_err(|e| format!("{}: {e}", dir.display()))?;
     log::init(Some(&dir.join("logs")), true);
     let sid = eguard_win::security::current_user_sid().map_err(|e| e.to_string())?;
-    let runner =
-        Runner::new(Options { store, server: server_url(server.as_deref())?, pipe_sddl: eguard_win::pipe::console_pipe_sddl(&sid) })?;
+    let runner = Runner::new(Options {
+        store,
+        server: server_url(server.as_deref())?,
+        pipe_sddl: eguard_win::pipe::console_pipe_sddl(&sid),
+        mode: Mode::Console { sandbox },
+    })?;
     runner.run()
 }
 
 fn usage() -> String {
-    "usage: eguard-service run [--server URL] [--data-dir DIR] | install | uninstall".into()
+    "usage: eguard-service run [--server URL] [--data-dir DIR] [--sandbox DIR] | install | uninstall".into()
 }
 
 fn main() {

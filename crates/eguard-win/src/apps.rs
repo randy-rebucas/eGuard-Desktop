@@ -180,6 +180,19 @@ fn main_exe(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
     named.or(exes.first()).map(|(p, _)| p.clone())
 }
 
+/// Signature, product name and imports of one file, checked now (callers cache it by path, size and time).
+pub fn exe_facts(path: &Path) -> ExeFacts {
+    let graphics = read_head(path).and_then(|b| pe::imports(&b)).is_some_and(|dlls| dlls.iter().any(|d| pe::is_graphics_import(d)));
+    let signer = authenticode::signer_names(path);
+    ExeFacts {
+        file_name: path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default(),
+        signer: signer.as_ref().and_then(|s| s.name().map(str::to_owned)),
+        signer_alt: signer.as_ref().and_then(|s| s.alternative().map(str::to_owned)),
+        product: if is_exe(path) { version::product_name(path) } else { None },
+        graphics,
+    }
+}
+
 /// Engine and anti-cheat files beside an exe (spec section 5, game signals).
 fn game_files(exe: &Path) -> bool {
     if exe.file_name().is_some_and(|f| f.to_string_lossy().to_ascii_lowercase().ends_with("-shipping.exe")) {
@@ -226,15 +239,7 @@ impl Collector<'_> {
             return Some(c.facts.clone());
         }
         self.out.exes_checked += 1;
-        let graphics = read_head(path).and_then(|b| pe::imports(&b)).is_some_and(|dlls| dlls.iter().any(|d| pe::is_graphics_import(d)));
-        let signer = authenticode::signer_names(path);
-        let facts = ExeFacts {
-            file_name: path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default(),
-            signer: signer.as_ref().and_then(|s| s.name().map(str::to_owned)),
-            signer_alt: signer.as_ref().and_then(|s| s.alternative().map(str::to_owned)),
-            product: if is_exe(path) { version::product_name(path) } else { None },
-            graphics,
-        };
+        let facts = exe_facts(path);
         self.cache.insert(key, CachedExe { size: meta.len(), modified_ms, facts: facts.clone() });
         Some(facts)
     }

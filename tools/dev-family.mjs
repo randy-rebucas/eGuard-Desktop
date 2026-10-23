@@ -4,6 +4,10 @@
 //   node tools/dev-family.mjs code      a fresh pairing code for the same child
 //   node tools/dev-family.mjs show      the paired computer as the parent's app sees it (device page data)
 //   node tools/dev-family.mjs apps      the child's Apps tab; alerts: the family's alerts
+//   node tools/dev-family.mjs app NAME APPROVAL       set an app to ALLOWED, ALWAYS_ALLOWED or BLOCKED (Phase 4's checks)
+//   node tools/dev-family.mjs limit CATEGORY MINUTES  a category's daily limit (GAMES 1), or `none`
+//   node tools/dev-family.mjs protect KEY JSON        change a protection, e.g. APP_APPROVAL '{"enabled":false}'
+//   node tools/dev-family.mjs screen-time             today's minutes, as the parent's app shows them
 //   node tools/dev-family.mjs delete    delete the test family and everything in it
 //
 // Like capture-fixtures.mjs it needs ~/eguard's dev database and a dev server (mail goes to Mailpit). The family's
@@ -80,6 +84,30 @@ const commands = {
     const r = expect(await call("GET", `/children/${childId}/apps`, { token }), 200, "apps");
     for (const a of r.apps ?? r) console.log([a.approval, a.category, a.source ?? "", a.name, a.sourceLabel ?? a.label ?? ""].join(" | "));
   },
+  async app(_db, name, approval) {
+    const { token, childId } = load();
+    const r = expect(await call("GET", `/children/${childId}/apps`, { token }), 200, "apps");
+    const app = (r.apps ?? r).find((a) => a.name === name);
+    if (!app) throw new Error(`no app named ${name} on the child's list`);
+    const done = expect(await call("PATCH", `/apps/${app.id}`, { token, body: { approval } }), 200, "app");
+    console.log(`${name}: ${done.approval ?? approval}`);
+  },
+  async limit(_db, category, minutes) {
+    const { token, childId } = load();
+    const dailyLimitMinutes = minutes === "none" ? null : Number(minutes);
+    expect(await call("PUT", `/children/${childId}/category-limits`, { token, body: { category, dailyLimitMinutes } }), 200, "category limit");
+    console.log(`${category}: ${dailyLimitMinutes ?? "no limit"}`);
+  },
+  async protect(_db, key, json) {
+    const { token, childId } = load();
+    const r = await call("PUT", `/children/${childId}/protections/${key}`, { token, body: JSON.parse(json) });
+    if (r.status >= 300) throw new Error(`${key}: ${r.status} ${JSON.stringify(r.data)}`);
+    console.log(`${key}: requested`);
+  },
+  async "screen-time"() {
+    const { token, childId } = load();
+    console.log(JSON.stringify(expect(await call("GET", `/children/${childId}/screen-time`, { token }), 200, "screen time"), null, 2));
+  },
   async alerts() {
     const { token } = load();
     const r = expect(await call("GET", "/alerts", { token }), 200, "alerts");
@@ -96,12 +124,12 @@ const commands = {
 
 const run = commands[process.argv[2]];
 if (!run) {
-  console.error("usage: node tools/dev-family.mjs create | code | show | apps | alerts | delete");
+  console.error("usage: node tools/dev-family.mjs create | code | show | apps | app NAME APPROVAL | limit CATEGORY MINUTES | protect KEY JSON | screen-time | alerts | delete");
   process.exit(1);
 }
 const db = new PrismaClient();
 try {
-  await run(db);
+  await run(db, ...process.argv.slice(3));
 } finally {
   await db.$disconnect();
 }

@@ -211,21 +211,9 @@ pub enum Verdict {
     Block(Block),
 }
 
-/// The verdict for one app at `at` (the family's local time) and `now_ms` (eGuard's clock), given today's usage.
-pub fn evaluate(rules: &Rules, subject: Subject<'_>, today: &DayUsage, at: &LocalMoment, now_ms: i64) -> Verdict {
-    let approval = match subject {
-        Subject::Listed(a) => a.approval,
-        Subject::Unlisted { .. } if rules.policy.approval_required => return Verdict::Block(Block::NeedsApproval),
-        Subject::Unlisted { .. } => Approval::Allowed,
-    };
-    match approval {
-        Approval::Blocked | Approval::Filtered | Approval::Unknown => return Verdict::Block(Block::Blocked),
-        Approval::Pending => return Verdict::Block(Block::Pending),
-        Approval::Allowed | Approval::AlwaysAllowed => {}
-    }
-    let always = approval == Approval::AlwaysAllowed;
-
-    // Each time rule as (seconds left, the block once it's 0)
+/// Each time rule that applies to `subject` now, as (seconds left, the block once it's 0). Bedtime first, then the
+/// narrowest limit: the order the block screen names them in.
+fn time_rules(rules: &Rules, subject: Subject<'_>, always: bool, today: &DayUsage, at: &LocalMoment) -> Vec<(u32, Block)> {
     let mut limits: Vec<(u32, Block)> = Vec::new();
     if let Some(b) = rules.policy.bedtime {
         let left = seconds_until_bedtime(b, at);
@@ -249,8 +237,31 @@ pub fn evaluate(rules: &Rules, subject: Subject<'_>, today: &DayUsage, at: &Loca
             limits.push((left(minutes, today.total_secs()), Block::DailyLimit { minutes }));
         }
     }
+    limits
+}
 
-    // Order matters for what the block screen says: bedtime first, then the narrowest limit
+/// The approval part of the verdict: `Err` when the app isn't allowed at all, else whether it's always allowed.
+fn approval_of(rules: &Rules, subject: Subject<'_>) -> Result<bool, Block> {
+    let approval = match subject {
+        Subject::Listed(a) => a.approval,
+        Subject::Unlisted { .. } if rules.policy.approval_required => return Err(Block::NeedsApproval),
+        Subject::Unlisted { .. } => Approval::Allowed,
+    };
+    match approval {
+        Approval::Blocked | Approval::Filtered | Approval::Unknown => Err(Block::Blocked),
+        Approval::Pending => Err(Block::Pending),
+        Approval::Allowed => Ok(false),
+        Approval::AlwaysAllowed => Ok(true),
+    }
+}
+
+/// The verdict for one app at `at` (the family's local time) and `now_ms` (eGuard's clock), given today's usage.
+pub fn evaluate(rules: &Rules, subject: Subject<'_>, today: &DayUsage, at: &LocalMoment, now_ms: i64) -> Verdict {
+    let always = match approval_of(rules, subject) {
+        Ok(always) => always,
+        Err(b) => return Verdict::Block(b),
+    };
+    let limits = time_rules(rules, subject, always, today, at);
     let blocked = limits.iter().find(|(secs, _)| *secs == 0).map(|(_, b)| *b);
     let soonest = limits.iter().map(|(secs, _)| *secs).min();
     let extra = rules.extra_time_until_ms.filter(|&until| now_ms < until);
@@ -259,6 +270,44 @@ pub fn evaluate(rules: &Rules, subject: Subject<'_>, today: &DayUsage, at: &Loca
         (Some(b), None) => Verdict::Block(b),
         (None, Some(until)) => Verdict::Allow { seconds_left: soonest.map(|s| s.max(secs_between(now_ms, until))) },
         (None, None) => Verdict::Allow { seconds_left: soonest },
+    }
+}
+
+/// What pauses a usable app next, and in how many seconds, for the 5- and 1-minute warnings. `None` when nothing
+/// does soon, or the app isn't usable now. While extra time runs, it's the end of extra time (as the block it lifts,
+/// or `None` when nothing would be paused then).
+pub fn upcoming(rules: &Rules, subject: Subject<'_>, today: &DayUsage, at: &LocalMoment, now_ms: i64) -> Option<(u32, Block)> {
+    let always = approval_of(rules, subject).ok()?;
+    let limits = time_rules(rules, subject, always, today, at);
+    upcoming_of(&limits, rules, now_ms)
+}
+
+/// `upcoming` for the screen as a whole (an app that isn't on the list, eGuard's own screens): daily screen time
+/// and bedtime.
+pub fn upcoming_screen(rules: &Rules, today: &DayUsage, at: &LocalMoment, now_ms: i64) -> Option<(u32, Block)> {
+    let mut limits = Vec::new();
+    if let Some(b) = rules.policy.bedtime {
+        let left = seconds_until_bedtime(b, at);
+        if left <= BEDTIME_LOOKAHEAD_SECS {
+            limits.push((left, Block::Bedtime));
+        }
+    }
+    if let Some(minutes) = rules.policy.daily_limit(at) {
+        limits.push((left(minutes, today.total_secs()), Block::DailyLimit { minutes }));
+    }
+    upcoming_of(&limits, rules, now_ms)
+}
+
+fn upcoming_of(limits: &[(u32, Block)], rules: &Rules, now_ms: i64) -> Option<(u32, Block)> {
+    match rules.extra_time_until_ms.filter(|&until| now_ms < until) {
+        // Extra time ends: what would be paused then is whatever is used up by then (or about to be)
+        Some(until) => {
+            let ends = secs_between(now_ms, until);
+            limits.iter().filter(|(secs, _)| *secs <= ends).min_by_key(|(secs, _)| *secs).map(|(_, b)| (ends, *b))
+        }
+        // Already paused: nothing to warn about
+        None if limits.iter().any(|(secs, _)| *secs == 0) => None,
+        None => limits.iter().min_by_key(|(secs, _)| *secs).copied(),
     }
 }
 
@@ -525,6 +574,43 @@ mod tests {
             verdict(&r, "Something New", &usage(&[("Browser", 900, Category::Other)]), &moment(THU, "15:00")),
             Verdict::Allow { seconds_left: None }
         );
+    }
+
+    #[test]
+    fn upcoming_names_the_next_pause_for_the_warnings() {
+        let r = rules();
+        let at = moment(THU, "15:00");
+        let roblox = Subject::Listed(r.app("Roblox").unwrap());
+        // Roblox: 55 of its 60 minutes used; the games category has 90, the day 120
+        let used = usage(&[("Roblox", 55, Category::Games)]);
+        assert_eq!(upcoming(&r, roblox, &used, &at, NOW), Some((5 * 60, Block::AppLimit { minutes: 60 })));
+        // Minecraft: the games category is the next pause (90 - 55)
+        let minecraft = Subject::Listed(r.app("Minecraft").unwrap());
+        assert_eq!(
+            upcoming(&r, minecraft, &used, &at, NOW),
+            Some((35 * 60, Block::CategoryLimit { category: Category::Games, minutes: 90 }))
+        );
+        // Bedtime at 21:00 on a school night
+        assert_eq!(upcoming_screen(&r, &usage(&[]), &moment(THU, "20:56"), NOW), Some((4 * 60, Block::Bedtime)));
+        assert_eq!(
+            upcoming_screen(&r, &usage(&[("Browser", 119, Category::Other)]), &at, NOW),
+            Some((60, Block::DailyLimit { minutes: 120 }))
+        );
+        // A blocked app has nothing coming; neither does an app already paused
+        let cs2 = Subject::Listed(r.app("Counter-Strike 2").unwrap());
+        assert_eq!(upcoming(&r, cs2, &used, &at, NOW), None);
+        assert_eq!(upcoming(&r, roblox, &usage(&[("Roblox", 60, Category::Games)]), &at, NOW), None);
+    }
+
+    #[test]
+    fn upcoming_during_extra_time_is_its_end() {
+        let mut r = rules();
+        r.extra_time_until_ms = Some(NOW + 4 * 60_000);
+        let roblox = Subject::Listed(r.app("Roblox").unwrap());
+        let gamed = usage(&[("Roblox", 60, Category::Games)]);
+        assert_eq!(upcoming(&r, roblox, &gamed, &moment(THU, "15:00"), NOW), Some((4 * 60, Block::AppLimit { minutes: 60 })));
+        // Nothing used up by then: no warning about extra time ending
+        assert_eq!(upcoming(&r, roblox, &usage(&[]), &moment(THU, "15:00"), NOW), None);
     }
 
     #[test]
