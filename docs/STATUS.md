@@ -6,7 +6,7 @@ Updated 2026-10-23: Phase 4, the owner's decisions, then a full audit and its fi
 |---|---|---|
 | 1 | Core crate, no Windows APIs | Done |
 | 2 | Pairing, sync and the service shell | Done |
-| 3 | Scanning and identification (spec 5, 6) | Built; gate not fully met: the XPrinter driver and Discord's leftover updater are still reported (catalog gaps below) |
+| 3 | Scanning and identification (spec 5, 6) | Done: the last two the gate left (the XPrinter driver, Discord's leftover updater) are left out since 2026-10-23 (`scan::left_out`) |
 | 4 | Enforcement and time (spec 7, 8) | **Built and checked on this PC with stand-ins.** Tests 3–5 pass in console mode; the gate waits for the VM: test 6, everything as SYSTEM, real games (Q3) |
 | 5 | Web (spec 9) | Next |
 | 6 | Removal protection and tamper (spec 10, 11) | Needs a VM |
@@ -19,7 +19,8 @@ Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md
 A full audit (five reviews: Windows FFI and security, core crypto/wire/state, enforcement logic, the binaries, spec
 and wire conformance) found 1 critical, 9 high and ~20 medium/low problems. The owner said fix them all; all are
 fixed (merged to `main`). Wire conformance was clean except the catalog's version (below).
-Checks: `cargo test --workspace` 181 passed, 1 ignored (core 133 + 14 fixture, win 29, service 5); clippy and fmt
+Checks (after the follow-ups below): `cargo test --workspace` 193 passed, 1 ignored (core 142 + 14 fixture, win 32,
+service 5); clippy and fmt
 clean; `eguard-service scan` dry run: 39 apps reported from 127 candidates. Nothing below was tried live; the VM
 items are at the end.
 
@@ -54,15 +55,19 @@ enforcement *less* strict. Now such facts may only tighten a verdict (`enforce::
   16-character hash of the entries, so a removed entry shows (spec 4, the `GET /catalog` row). **The agent didn't
   follow it**: it read `version` as a number and refused older ones, so against today's server it would refuse every
   catalog and never scan. Fixed: `Catalog.version` is a string (a number from a kept older copy or the fixture is
-  read as one), compared only for equality; "unchanged" counts only for the version kept. The fixtures still have
-  the old numeric version: re-capture them (`node tools/capture-fixtures.mjs`) when the dev server runs.
-- **Suggestion (server, owner's call):** a hash has no order, so a signed older catalog replayed by a proxy with its
-  own root certificate is accepted (it could re-trust a publisher removed since, until the next real catalog). A
-  signed `issuedAt` in the catalog would let the agent refuse older ones again.
-- **Spec 7 changed in `~/eguard/docs/desktop-agent-spec.md` (NOT committed: it's untracked, part of the owner's
-  work):** trusted publishers are exempt by their own signature or a Program Files folder only; runtimes never by
-  signer; App Approval covers any exe outside Program Files a trusted publisher didn't sign (and everything before
-  the first catalog); facts the child controls only tighten.
+  read as one), compared only for equality; "unchanged" counts only for the version kept. Fixtures re-captured.
+- **`issuedAt` (owner approved, done):** a hash has no order, so a signed older catalog could be replayed. The server
+  now signs `issuedAt` (ms) into the catalog (`~/eguard/src/app/api/device/v1/catalog/route.ts`, a test in
+  `tests/api/desktop-agent.test.ts`, the spec's `GET /catalog` row: NOT committed there). The agent refuses a catalog
+  issued before its kept copy, or one without `issuedAt` once the kept copy has it (`signature::older_catalog`).
+  Server: `tsc` clean, the three catalog tests pass; in the same run 6 other tests of that file failed, 5 on
+  browsers-on-the-computer and 1 on removal, from the pairing rate limit (20 per IP per 15 min, used up by repeated
+  runs) and the owner's browser-pairing work in progress (`expected 201 to be 409`): not from this change.
+- **Spec 7 and 8 changed in `~/eguard/docs/desktop-agent-spec.md` (NOT committed: it's untracked, part of the
+  owner's work):** trusted publishers are exempt by their own signature or a Program Files folder only; runtimes never
+  by signer; App Approval covers any exe outside Program Files a trusted publisher didn't sign (and everything before
+  the first catalog); facts the child controls only tighten. Finding 1 settled as the product has it: bedtime applies
+  to ALWAYS_ALLOWED apps too (sections 7 and 8); section 8 also names the overlay's app buttons.
 - **Known limits, documented in the code:** unsigned allowed apps outside Program Files (itch.io games) share their
   rule with any unsigned exe put in their folder; runtimes under Program Files outside a scanned app are untracked;
   a file overwritten in place (same file id) with forged times and the program started from it again isn't caught
@@ -233,6 +238,17 @@ scan as SYSTEM (other users' folders, their Store packages); game signals on a r
 
 ### What still shows that the "Done when" says shouldn't (for the owner)
 
+**Since 2026-10-23** (owner approved: rules in the scan, `scan::left_out`, only for what rule 4 would report and
+never with a game signal): "XPrinter Driver version 8.2" is left out as a driver (an HKLM entry named "driver" with
+`.inf` files, or with nothing it names left on disk; HKCU entries never, so a child can't hide a game that way) and
+"Discord" as a leftover (its folder holds only installers/updaters/uninstallers; a full Squirrel install with
+`app-*\Discord.exe` is still found). A left-out entry keeps its folder for enforcement: programs run from it are
+still an app the parent hasn't listed. Dry run: 37 apps reported from 127 candidates, 2 left out this way. Still
+reported: developer tools, "Mozilla Maintenance Service". Noticed, not fixed: "Google Cloud SDK" stores
+InstallLocation in quotes, which `apps.rs` doesn't strip, so its folder isn't found (fixing it would likely move it to
+trusted). Before that:
+
+
 The rules are the spec's: anything not signed by a catalog TRUSTED_PUBLISHER is reported. On this PC that leaves:
 
 - **OEM tools whose publisher isn't in the catalog:** Epson ×4 (`seiko epson corporation`), LG Monitor App
@@ -311,7 +327,8 @@ session over the service-mode pipe.
 
 ## Found in the spec and the repos (for the owner)
 
-1. **ALWAYS_ALLOWED during bedtime: the desktop spec contradicts the product.** Spec sections 7 and 8 say
+1. **ALWAYS_ALLOWED during bedtime: the desktop spec contradicts the product.** **Settled 2026-10-23: bedtime
+   applies, spec 7 and 8 fixed (uncommitted in `~/eguard`).** Spec sections 7 and 8 say
    always-allowed apps stay usable at bedtime. The Apps tab (`child-forms.tsx`: "bedtime and the app's own limit
    still apply"), mobile-api C2 and child-app-spec 7 say bedtime still applies. The core follows the product
    definition (same behaviour as phones). Suggest fixing the spec's wording in 7 and 8.
@@ -350,7 +367,7 @@ session over the service-mode pipe.
 12. **New (Phase 4): time in browsers and other trusted apps counts toward the day but isn't named in `/usage`.**
     Naming it would put "Google Chrome" on the child's list as if it could be blocked, and it can't be (trusted
     publisher, never ended). The parent sees the day's total, not "Chrome 2h". Owner's call; WEB (Phase 5) may change
-    the picture.
+    the picture. **Owner, 2026-10-23: decide it in Phase 5.**
 13. **New (Phase 4): the overlay hides the taskbar.** A child reaches an always-allowed app with Alt+Tab (the overlay
     names them). A launcher row on the overlay would be friendlier; worth a design pass. **Approved and built
     2026-10-23:** see "Overlay app buttons" below.

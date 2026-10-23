@@ -133,6 +133,9 @@ fn the_servers_catalog_verifies() {
     let v = fixture!("catalog.json");
     let CatalogUpdate::Changed(catalog) = verify_catalog(&keys(), &v, None).unwrap() else { panic!("expected a catalog") };
     assert_eq!(catalog.kind, "eguard.desktop.catalog");
+    // The server's version is a hash of the entries, and it says when it issued the catalog
+    assert!(catalog.version.len() == 16 && catalog.version.bytes().all(|b| b.is_ascii_hexdigit()), "{}", catalog.version);
+    assert!(catalog.issued_at.is_some());
     assert!(catalog.entries.len() > 100);
     let cs2 = catalog.entries.iter().find(|e| e.match_value == "steam:730").unwrap();
     assert_eq!(
@@ -165,7 +168,11 @@ fn a_tampered_catalog_is_refused() {
     v["signature"] = json!("AAAA");
     assert_eq!(verify_catalog(&keys(), &v, None), Err(VerifyError::BadSignature));
     let mut v = fixture!("catalog.json");
-    v["catalog"]["version"] = json!(v["catalog"]["version"].as_u64().unwrap() + 1);
+    v["catalog"]["version"] = json!("0123456789abcdef");
+    assert_eq!(verify_catalog(&keys(), &v, None), Err(VerifyError::BadSignature));
+    // When it was issued is signed too: an older catalog can't be made to look new
+    let mut v = fixture!("catalog.json");
+    v["catalog"]["issuedAt"] = json!(v["catalog"]["issuedAt"].as_u64().unwrap() + 1);
     assert_eq!(verify_catalog(&keys(), &v, None), Err(VerifyError::BadSignature));
 }
 

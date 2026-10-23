@@ -1,7 +1,8 @@
 {
   "catalog": {
     "type": "eguard.desktop.catalog",
-    "version": 1792758987201,
+    "version": "4c77a1593483c470",
+    "issuedAt": 1792768672806,
     "entries": [
       {
         "kind": "GAME",
@@ -981,6 +982,6 @@
       }
     ]
   },
-  "signature": "8RL6A0ZL15Jo2/4NIFcyBuVH6QlWDLrUMiaKAT57mPRdpoafqFGHiAFOR+6/b/DqNTSzsCjmGmp2a+KOKso6WA==",
+  "signature": "s1erpWNoPnOAIDOdsavRyVtKziCSvrOz0NYyS4jLMSIgcOlovt1s7gvovGT4zAc/Rfh2tPHbCDtd2OI8EepWuA==",
   "keyId": "60da38f4c654f71a"
 }
