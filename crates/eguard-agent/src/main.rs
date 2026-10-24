@@ -17,6 +17,7 @@
 
 use eguard_core::ipc::{self, AccountInfo, AppButton, Request, Response, Screen, SessionView, Warning};
 use eguard_core::logging;
+use eguard_core::wire::TamperKind;
 use eguard_win::input::{self, InputWatch};
 use eguard_win::process;
 use eguard_win::ui::{Ui, UiEvent};
@@ -251,24 +252,27 @@ fn session(args: &[String]) -> Result<(), String> {
 
 /// One "Remove with a code" request. An administrator (or console mode) reaches the service's own pipe; anyone else,
 /// the child's account included, goes through this session's pipe, which the service answers only for this exe.
+/// Asks on the admin pipe when this account may (an administrator), else on this session's pipe (a child's account).
+fn ask_either(request: &Request, dev: bool) -> Result<Response, String> {
+    if let Ok(a) = ask(request) {
+        return Ok(a);
+    }
+    let id = process::session_of(process::current_pid()).ok_or("couldn't tell which session this is")?;
+    ask_session(&ipc::session_pipe_name(id), &service_exe(), dev, request)
+        .map_err(|_| "eGuard's service couldn't be reached. Try again in a minute.".to_owned())
+}
+
 fn send_code(code: &str, dev: bool) -> Result<String, String> {
-    let request = Request::RemoveWithCode { code: code.to_owned() };
-    let answer = if let Ok(a) = ask(&request) {
-        a
-    } else {
-        let id = process::session_of(process::current_pid()).ok_or("couldn't tell which session this is")?;
-        ask_session(&ipc::session_pipe_name(id), &service_exe(), dev, &request)
-            .map_err(|_| "eGuard's service couldn't be reached. Try again in a minute.".to_owned())?
-    };
-    match answer {
+    match ask_either(&Request::RemoveWithCode { code: code.to_owned() }, dev)? {
         Response::Removing { message } => Ok(message),
         Response::Error { message } => Err(message),
         _ => Err("unexpected answer from the service".into()),
     }
 }
 
-/// `eguard-agent remove [CODE]`: with a code, in this console; without, in a window (Settings' "Uninstall" will open
-/// it once the installer exists).
+/// `eguard-agent remove [CODE]`: with a code, in this console; without, in a window, which is what Settings'
+/// "Uninstall" opens (owner's decision, 2026-10-24). The window closed without a code that removed eGuard is an
+/// attempt to uninstall it: the parent hears (`UNINSTALL_BLOCKED`, at most hourly).
 fn remove(args: &[String]) -> Result<(), String> {
     let dev = args.iter().any(|a| a == "--dev");
     let code = args.iter().find(|a| !a.starts_with("--"));
@@ -279,13 +283,15 @@ fn remove(args: &[String]) -> Result<(), String> {
     }
     match eguard_win::codebox::remove_with_code(move |typed| send_code(typed, dev)) {
         Ok(Some(message)) => println!("{message}"),
-        Ok(None) => println!("eGuard wasn't removed."),
+        Ok(None) => {
+            let _ = ask_either(&Request::Tamper { kind: TamperKind::UninstallBlocked }, dev);
+            println!("eGuard wasn't removed.");
+        }
         Err(e) => return Err(format!("couldn't open the window: {e}")),
     }
     Ok(())
 }
 
-/// Shows one screen with sample words, to check how it looks.
 /// Crashes on purpose, to check the crash handler's last line in `agent.log` (development builds only).
 fn crash(args: &[String]) -> Result<(), String> {
     if !eguard_core::keys::is_dev_build() {
@@ -303,6 +309,7 @@ fn crash(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Shows one screen with sample words, to check how it looks.
 fn preview(args: &[String]) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let ui = Ui::start(true, tx).map_err(|e| e.to_string())?;

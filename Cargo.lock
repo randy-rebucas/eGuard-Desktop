@@ -184,6 +184,11 @@ dependencies = [
 [[package]]
 name = "eguard-guard"
 version = "0.1.0"
+dependencies = [
+ "eguard-core",
+ "eguard-win",
+ "windows-service",
+]
 
 [[package]]
 name = "eguard-service"

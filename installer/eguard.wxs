@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  eGuard for Windows: the per-machine package (spec section 10). Built by installer/build.ps1 (WiX 5).
+
+  - The three programs go to C:\Program Files\eGuard. "eguard-service.exe install" (deferred, as SYSTEM) then registers
+    and locks the service, Safe Mode, the guard's task and cache, and the folder's permissions (lockdown.rs lists them).
+  - The package's own Settings entry is hidden (ARPSYSTEMCOMPONENT). eGuard's entry below is the visible one: its
+    Uninstall opens "Remove eGuard" (eguard-agent remove), where a parent types the code from the dashboard (owner's
+    decision, 2026-10-24: Windows 11 can't both hide Uninstall and open "Ask your parent" from it).
+  - msiexec /x runs "eguard-service.exe msi-check" first (as SYSTEM): unless eGuard may be removed (not paired, or a
+    removal the parent asked for), it tells the parent (UNINSTALL_BLOCKED) and the uninstall is rolled back. Then
+    "eguard-service.exe purge" takes out everything but the program files, which the package removes.
+  - No upgrades until the self-update is designed (the owner's call): a second version refuses to install over the
+    first, and an upgrade's removal of the old one goes through the same check.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="eGuard" Manufacturer="eGuard" Version="$(var.Version)" UpgradeCode="6F1B7C2A-3E4D-4B8A-9C51-2D7E8F0A9B63"
+           Scope="perMachine" Compressed="yes">
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPSYSTEMCOMPONENT" Value="1" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <Upgrade Id="6F1B7C2A-3E4D-4B8A-9C51-2D7E8F0A9B63">
+      <UpgradeVersion OnlyDetect="yes" Property="EGUARD_INSTALLED" Minimum="0.0.0" IncludeMinimum="yes" />
+    </Upgrade>
+    <Launch Condition="Installed OR NOT EGUARD_INSTALLED" Message="eGuard is already installed on this computer." />
+    <Launch Condition="Privileged" Message="Installing eGuard needs an administrator." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="eGuard" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Programs" Directory="INSTALLFOLDER">
+      <Component Id="Service" Bitness="always64">
+        <File Id="ServiceExe" Source="$(var.BinDir)\eguard-service.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="Agent" Bitness="always64">
+        <File Id="AgentExe" Source="$(var.BinDir)\eguard-agent.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="Guard" Bitness="always64">
+        <File Id="GuardExe" Source="$(var.BinDir)\eguard-guard.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="SettingsEntry" Bitness="always64">
+        <RegistryKey Root="HKLM" Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\eGuard">
+          <RegistryValue Name="DisplayName" Type="string" Value="eGuard" KeyPath="yes" />
+          <RegistryValue Name="DisplayVersion" Type="string" Value="$(var.Version)" />
+          <RegistryValue Name="Publisher" Type="string" Value="eGuard" />
+          <RegistryValue Name="DisplayIcon" Type="string" Value="[INSTALLFOLDER]eguard-agent.exe" />
+          <RegistryValue Name="InstallLocation" Type="string" Value="[INSTALLFOLDER]" />
+          <RegistryValue Name="UninstallString" Type="string" Value="&quot;[INSTALLFOLDER]eguard-agent.exe&quot; remove" />
+          <RegistryValue Name="NoModify" Type="integer" Value="1" />
+          <RegistryValue Name="NoRepair" Type="integer" Value="1" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main">
+      <ComponentGroupRef Id="Programs" />
+    </Feature>
+
+    <CustomAction Id="Lockdown" FileRef="ServiceExe" ExeCommand="install" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="UninstallCheck" FileRef="ServiceExe" ExeCommand="msi-check" Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="Purge" FileRef="ServiceExe" ExeCommand="purge" Execute="deferred" Impersonate="no" Return="check" />
+
+    <InstallExecuteSequence>
+      <Custom Action="UninstallCheck" After="InstallInitialize" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="Purge" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="Lockdown" Before="InstallFinalize" Condition="NOT REMOVE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

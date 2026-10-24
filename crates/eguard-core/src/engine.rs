@@ -229,6 +229,13 @@ impl Engine {
         self.secrets.is_some() || self.data.agent.is_some()
     }
 
+    /// Whether eGuard may be stopped or uninstalled now (spec section 10): it protects nothing yet (not paired), or
+    /// an authorized removal is under way and the server has heard (or can't be asked). The service's stop control
+    /// and the installer's uninstall check ask this.
+    pub fn may_be_removed(&self) -> bool {
+        crate::removal::may_be_removed(self.enforces(), self.data.removing.as_ref())
+    }
+
     pub fn server(&self) -> &str {
         self.api.server().as_str()
     }
@@ -981,11 +988,14 @@ mod tests {
         let mut e = engine(&t);
         assert_eq!(e.tick(at(1_000, "2026-10-23T07:00:00Z"), &info()), Tick { sleep_ms: MAX_SLEEP_MS, changed: false });
         assert!(t.seen.lock().unwrap().is_empty());
+        // Protecting nothing yet: may be stopped and uninstalled
+        assert!(e.may_be_removed());
 
         let secrets = DeviceSecrets { device_id: "dev_9".into(), token: "t".into(), removal_secret: None };
         let api = Api::new(ServerUrl::parse("http://localhost:3000", true).unwrap(), Box::new(t.clone()));
         let e = Engine::new(Persisted::default(), Some(secrets), api, TrustedKeys::builtin().unwrap(), caps());
         assert_eq!(e.data.agent.as_ref().unwrap().device_id, "dev_9");
+        assert!(!e.may_be_removed());
         // Before any sync, new apps wait for the parent
         assert!(e.data.agent.as_ref().unwrap().rules().policy.approval_required);
         assert!(!report::AVAILABLE.contains(&ProtectionKey::Web));
@@ -1224,8 +1234,11 @@ mod tests {
     fn eguards_command_is_acknowledged_before_anything_is_removed() {
         let t = Scripted::new(vec![]);
         let (mut e, now) = asked_to_remove(&t);
+        // Authorized but the server not told yet: still not to be stopped or uninstalled
+        assert!(!e.may_be_removed());
         t.answers.lock().unwrap().push(json(200, &j!({ "ok": true })));
         assert_eq!(e.removal(now), Removal::Remove);
+        assert!(e.may_be_removed());
         let ack = last_body(&t);
         assert_eq!(ack["type"], "UNINSTALL_ACK");
         assert!(ack.get("code").is_none());
@@ -1245,6 +1258,7 @@ mod tests {
         t.answers.lock().unwrap().push(json(409, &fixture("events-uninstall-ack-409.json")));
         assert_eq!(e.removal(now), Removal::Kept);
         assert_eq!(e.data.removing, None);
+        assert!(!e.may_be_removed());
         assert_eq!(e.removal(now), Removal::None);
     }
 

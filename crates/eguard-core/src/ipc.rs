@@ -13,6 +13,7 @@
 //! older agent skips it (the overlay's app buttons: it shows the overlay without them) and a newer agent reading an
 //! older service gets the field's empty default. Either way nothing the screens enforce goes missing.
 
+use crate::wire::TamperKind;
 use serde::{Deserialize, Serialize};
 
 /// The service's pipe.
@@ -69,6 +70,12 @@ pub enum Request {
     /// either pipe: the parent may type it in the child's session.
     RemoveWithCode {
         code: String,
+    },
+    /// Something eGuard's other parts saw (spec section 10), for the parent: `UNINSTALL_BLOCKED` from the installer's
+    /// uninstall check and from the agent's "Remove eGuard" window closed without a code, `FILES_CHANGED` from the
+    /// guard. The service takes only those kinds, and only from the pipe each comes on.
+    Tamper {
+        kind: TamperKind,
     },
 }
 
@@ -276,6 +283,10 @@ mod tests {
             b"{\"v\":1,\"type\":\"removeWithCode\",\"code\":\"MH3N-AL9P\"}\n"
         );
         assert_eq!(encode(&Response::Removed), b"{\"v\":1,\"type\":\"removed\"}\n");
+        assert_eq!(
+            encode(&Request::Tamper { kind: TamperKind::FilesChanged }),
+            b"{\"v\":1,\"type\":\"tamper\",\"kind\":\"FILES_CHANGED\"}\n"
+        );
     }
 
     #[test]

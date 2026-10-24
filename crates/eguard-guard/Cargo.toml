@@ -1,11 +1,16 @@
 [package]
 name = "eguard-guard"
-description = "eGuard's watchdog (scheduled task as SYSTEM). A stub until removal protection (Phase 6)"
+description = "eGuard's guard (a SYSTEM scheduled task at boot): starts the service again and puts back changed program files"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+
+[dependencies]
+eguard-core = { path = "../eguard-core" }
+eguard-win = { path = "../eguard-win" }
+windows-service.workspace = true
 
 [lints]
 workspace = true

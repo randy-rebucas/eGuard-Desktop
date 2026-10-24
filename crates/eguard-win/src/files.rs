@@ -82,9 +82,32 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Opens `path` for reading and keeps others from writing, deleting or renaming it while the handle is open
+/// (others may still read and run it). eGuard holds its program files this way while it runs.
+pub fn hold(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ only: no FILE_SHARE_WRITE, no FILE_SHARE_DELETE (which a rename needs too)
+    std::fs::OpenOptions::new().read(true).share_mode(1).open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_file_cant_be_deleted_renamed_or_written_but_can_be_read() {
+        let dir = std::env::temp_dir().join(format!("eguard-hold-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("held.exe");
+        std::fs::write(&path, b"MZ").unwrap();
+        let held = hold(&path).unwrap();
+        assert!(std::fs::remove_file(&path).is_err());
+        assert!(std::fs::rename(&path, dir.join("moved.exe")).is_err());
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"MZ");
+        drop(held);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn replaces_in_place_and_leaves_no_temp_file() {

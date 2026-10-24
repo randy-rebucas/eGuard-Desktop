@@ -13,6 +13,7 @@
 
 #![windows_subsystem = "console"]
 
+mod lockdown;
 mod log;
 mod monitor;
 mod runner;
@@ -92,7 +93,50 @@ fn console(args: &[String]) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: eguard-service run [--server URL] [--data-dir DIR] [--sandbox DIR] | scan | web | install | uninstall".into()
+    "usage: eguard-service run [--server URL] [--data-dir DIR] [--sandbox DIR] | scan | web | install | msi-check | purge [--force]".into()
+}
+
+/// The log for the installer's steps (`msi-check`, `purge`, `install`): eGuard's own log folder when it can be
+/// written (SYSTEM), so the steps are there to read after the program files have gone.
+fn installer_log() {
+    log::init(Some(&eguard_win::files::program_data_dir().join("logs")), false);
+}
+
+/// The installer's uninstall check (spec section 10: `msiexec /x` is refused unless eGuard may be removed). Exit 0
+/// lets the uninstall go on; anything else makes the installer roll it back. A refused one goes to the parent as
+/// `UNINSTALL_BLOCKED`, through the running service.
+fn msi_check() -> Result<(), String> {
+    installer_log();
+    if lockdown::may_be_removed() {
+        log::info("uninstall check: eGuard may be removed");
+        return Ok(());
+    }
+    let told = ask_service(&eguard_core::ipc::Request::Tamper { kind: eguard_core::wire::TamperKind::UninstallBlocked }).is_ok();
+    Err(format!("eGuard can only be removed by a parent, from the eGuard dashboard{}.", if told { "; the parent was told" } else { "" }))
+}
+
+/// `purge`: takes out everything eGuard put on this computer but the program files (`lockdown::purge`), as SYSTEM,
+/// when eGuard may be removed. `--force`, development builds only: whatever the state says (a VM between test runs).
+fn purge(args: &[String]) -> Result<(), String> {
+    installer_log();
+    let force = args.iter().any(|a| a == "--force");
+    if force && !keys::is_dev_build() {
+        return Err("--force is only for development builds".into());
+    }
+    if !force && !lockdown::may_be_removed() {
+        return Err("eGuard can only be removed by a parent, from the eGuard dashboard.".into());
+    }
+    let left = lockdown::purge(true);
+    if left.is_empty() { Ok(()) } else { Err(format!("eGuard was removed except: {}", left.join("; "))) }
+}
+
+/// One request on the admin pipe.
+fn ask_service(request: &eguard_core::ipc::Request) -> Result<eguard_core::ipc::Response, String> {
+    use std::io::Write;
+    let mut pipe = std::fs::OpenOptions::new().read(true).write(true).open(eguard_core::ipc::PIPE_NAME).map_err(|e| e.to_string())?;
+    pipe.write_all(&eguard_core::ipc::encode(request)).map_err(|e| e.to_string())?;
+    let line = eguard_core::ipc::read_line(&mut pipe).map_err(|e| e.to_string())?.ok_or("the service closed the connection")?;
+    eguard_core::ipc::decode(&line).map_err(|e| e.to_string())
 }
 
 fn main() {
@@ -101,10 +145,12 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("run") => console(&args[1..]),
         Some("scan") => scan::run(&args[1..]),
-        Some("install") => svc::install().map(|()| println!("eGuard service installed and started")),
-        Some("uninstall") => {
-            svc::uninstall().and_then(|()| web::remove_machine()).map(|()| println!("eGuard service and its browser policies removed"))
+        Some("install") => {
+            installer_log();
+            lockdown::install().map(|()| println!("eGuard installed, locked and started"))
         }
+        Some("msi-check") => msi_check(),
+        Some("purge") => purge(&args[1..]),
         Some("web") => {
             web::show();
             Ok(())

@@ -48,6 +48,11 @@ impl SecurityDescriptor {
         SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: self.0, bInheritHandle: 0 }
     }
 
+    /// The descriptor itself, for calls that take one. Valid while `self` lives.
+    pub(crate) fn raw(&self) -> PSECURITY_DESCRIPTOR {
+        self.0
+    }
+
     fn owner(&self) -> std::io::Result<PSID> {
         let (mut owner, mut defaulted) = (null_mut(), 0);
         // SAFETY: `self.0` is a valid descriptor; the out-pointers are live locals. The SID points into it.

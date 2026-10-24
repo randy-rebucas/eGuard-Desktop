@@ -50,12 +50,13 @@ pub enum Mode {
 /// What this build can do (spec section 11). The AVAILABLE protections are reported applied only by the service,
 /// which ends programs anywhere. Console mode ends them only inside `--sandbox` (or not at all), so it reports them
 /// as not applied, which is the truth: the parent mustn't be told a developer's PC is protected. Removal protection
-/// is reported off, with why, until Phase 6. Web filtering starts off and is decided after the browsers are set up
-/// (`apply_web`), before the first sync.
-fn capabilities(enforcing: bool) -> Capabilities {
+/// is what `lockdown::status` found at start (the engine also turns it off while a child's account is an
+/// administrator). Web filtering starts off and is decided after the browsers are set up (`apply_web`), before the
+/// first sync.
+fn capabilities(enforcing: bool, locked: Result<(), String>) -> Capabilities {
     Capabilities {
         enforced: if enforcing { AVAILABLE.into_iter().collect() } else { std::collections::BTreeSet::new() },
-        uninstall_protection: Err("Removal protection isn't in this version of eGuard for Windows yet.".into()),
+        uninstall_protection: locked,
         web: Err("eGuard hasn't set up its browser extension on this computer yet.".into()),
     }
 }
@@ -135,6 +136,14 @@ pub struct Runner {
     shared: OnceLock<Arc<Shared>>,
     /// eGuard has removed itself: nothing is saved again.
     removed: AtomicBool,
+    /// `Engine::may_be_removed` as of the loop's last look, for the service's stop control.
+    may_stop: AtomicBool,
+    /// A stop request was refused since the loop last looked.
+    stop_denied: AtomicBool,
+    /// Removal protection was in place at start (`lockdown::status`): the guard is kept running.
+    locked: bool,
+    /// The program files, held open so they can't be deleted, replaced or renamed while the service runs.
+    _held: Vec<std::fs::File>,
 }
 
 fn log_notes(engine: &mut Engine) {
@@ -155,7 +164,20 @@ impl Runner {
         let enforcing = opts.mode == Mode::Service;
         let browsers =
             Browsers::new(if enforcing { eguard_win::browsers::Place::machine() } else { eguard_win::browsers::Place::development() });
-        let mut engine = Engine::new(state, secrets, api, keys, capabilities(enforcing));
+        let locked = match opts.mode {
+            Mode::Service => crate::lockdown::status(),
+            Mode::Console { .. } => Err("eGuard runs in development mode on this computer, which installs no removal protection.".into()),
+        };
+        if let (Mode::Service, Err(e)) = (&opts.mode, &locked) {
+            log::warn(e);
+        }
+        let held = if locked.is_ok() {
+            crate::lockdown::PROGRAMS.iter().filter_map(|p| eguard_win::files::hold(&crate::lockdown::install_dir().join(p)).ok()).collect()
+        } else {
+            Vec::new()
+        };
+        let mut engine = Engine::new(state, secrets, api, keys, capabilities(enforcing, locked.clone()));
+        let may_stop = engine.may_be_removed();
         log_notes(&mut engine);
         // Usage and what enforcement remembers move to the enforcer; they're copied back at every save
         let mut enforcer = Enforcer::new(std::mem::take(&mut engine.data.usage), std::mem::take(&mut engine.data.enforce));
@@ -183,6 +205,10 @@ impl Runner {
             browsers,
             shared: OnceLock::new(),
             removed: AtomicBool::new(false),
+            may_stop: AtomicBool::new(may_stop),
+            stop_denied: AtomicBool::new(false),
+            locked: locked.is_ok(),
+            _held: held,
         }))
     }
 
@@ -279,6 +305,13 @@ impl Runner {
             // Enforcement's events and usage are looked at every 10 s; a tick (sync, send, save) runs when it's due,
             // when woken, or when there's something to send
             let queued = self.collect_enforcement(&mut inner);
+            if self.stop_denied.swap(false, Ordering::SeqCst) {
+                log::warn("a stop request was refused: eGuard is protecting this computer");
+                let now = inner.engine.now_ms(clock::sample());
+                inner.engine.tamper(TamperKind::ServiceStopDenied, now);
+                inner.woken = true;
+            }
+            self.may_stop.store(inner.engine.may_be_removed(), Ordering::SeqCst);
             if queued || poked || inner.woken || Instant::now() >= next_tick {
                 let info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
                 let tick = inner.engine.tick(clock::sample(), &info);
@@ -288,6 +321,9 @@ impl Runner {
                 log_notes(&mut inner.engine);
                 if self.removal(&mut inner) {
                     break;
+                }
+                if self.locked {
+                    crate::lockdown::keep_guard_running();
                 }
                 self.enforcer().update(inner.engine.enforce_inputs());
                 let web_changed = self.apply_web(&mut inner);
@@ -329,9 +365,9 @@ impl Runner {
         }
     }
 
-    /// Removes what this runner put on the computer: the agents' screens, the browser policies, the service's
-    /// registration (service mode) and the data folder (secrets, state; the log stays while it's being written).
-    /// The program files are the installer's to remove. Console mode installed no service, so it removes its own
+    /// Removes eGuard from the computer: the agents' screens, the browser policies, and in service mode everything
+    /// removal protection put in place and the data folder (secrets, state; the log stays while it's being written),
+    /// then has the installer remove the program files. Console mode installed no service, so it removes its own
     /// development data and its copy of the browser policies only.
     fn remove_self(&self, inner: &mut Inner) {
         log::warn("eGuard is removing itself from this computer");
@@ -346,19 +382,60 @@ impl Runner {
             Ok(()) => log::info("eGuard's browser policies removed"),
             Err(e) => log::error(&format!("removing the browser policies: {e}")),
         }
+        self.may_stop.store(true, Ordering::SeqCst);
         match self.mode {
-            Mode::Service => match crate::svc::delete_self() {
-                Ok(()) => log::info("the eGuard service is marked for deletion; Windows deletes it once it has stopped"),
-                Err(e) => log::error(&format!("couldn't mark the eGuard service for deletion: {e}")),
-            },
-            Mode::Console { .. } => log::info("development: console mode installed no service, so there's none to remove"),
-        }
-        self.removed.store(true, Ordering::SeqCst);
-        for left in self.store.remove_all() {
-            log::warn(&format!("couldn't remove {left}"));
+            Mode::Service => {
+                // Everything removal protection put in place, the data folder included (`lockdown::purge`); then the
+                // installer takes out the program files and the Settings entry. Its uninstall check passes: nothing
+                // is paired any more
+                self.removed.store(true, Ordering::SeqCst);
+                let left = crate::lockdown::purge(false);
+                if !left.is_empty() {
+                    log::warn(&format!("removal left {} thing(s) behind (above)", left.len()));
+                }
+                match eguard_win::msi::installed_product() {
+                    Some(product) => match std::process::Command::new("msiexec.exe").args(["/x", &product, "/qn", "/norestart"]).spawn() {
+                        Ok(_) => log::info(&format!("the installer is removing eGuard's program files ({product})")),
+                        Err(e) => log::error(&format!("couldn't start the installer to remove the program files: {e}")),
+                    },
+                    None => log::info("eGuard wasn't installed with its installer; its program files stay"),
+                }
+            }
+            Mode::Console { .. } => {
+                log::info("development: console mode installed no service, so there's none to remove");
+                self.removed.store(true, Ordering::SeqCst);
+                for left in self.store.remove_all() {
+                    log::warn(&format!("couldn't remove {left}"));
+                }
+            }
         }
         log::info(&format!("eGuard's data removed from {}; stopping", self.store.dir().display()));
         self.request_stop();
+    }
+
+    /// Something another part of eGuard saw, for the parent (one alert per kind per hour, `Engine::tamper`).
+    fn tamper(&self, kind: TamperKind) -> Response {
+        log::warn(&format!("tamper: {kind:?}"));
+        let mut inner = self.lock();
+        let now = inner.engine.now_ms(clock::sample());
+        if inner.engine.tamper(kind, now) {
+            self.save(&mut inner);
+            inner.woken = true;
+            self.wake.notify_all();
+        }
+        Response::Status(inner.engine.status())
+    }
+
+    /// Whether a stop request may stop the service now (`Engine::may_be_removed`, as of the last look). Read by the
+    /// service's control handler, which mustn't wait for the engine's lock (a sync may hold it).
+    pub fn may_stop(&self) -> bool {
+        self.may_stop.load(Ordering::SeqCst)
+    }
+
+    /// A stop request was refused: the loop tells the parent (`SERVICE_STOP_DENIED`).
+    pub fn stop_denied(&self) {
+        self.stop_denied.store(true, Ordering::SeqCst);
+        self.poke();
     }
 
     /// "Remove with a code", from either pipe: the engine checks it, and a right code wakes the loop to remove.
@@ -454,7 +531,11 @@ impl Runner {
             session_sids,
             matches!(self.mode, Mode::Console { .. }),
             Box::new(move || me.poke()),
-            Box::new(move |code| remover.remove_with_code(code)),
+            Box::new(move |req| match req {
+                Request::RemoveWithCode { code } => remover.remove_with_code(code),
+                Request::Tamper { kind } => remover.tamper(*kind),
+                _ => Response::Error { message: "That isn't asked on this pipe.".into() },
+            }),
         ));
         let _ = self.shared.set(Arc::clone(&shared));
         std::thread::Builder::new().name("sessions".into()).spawn(move || sessions::supervise(&shared)).map_err(|e| e.to_string())?;
@@ -573,6 +654,10 @@ impl Runner {
             Request::Pair { code, name, accounts } => self.pair(&code, name, accounts.as_deref()),
             Request::Accounts { set } => self.accounts(set),
             Request::RemoveWithCode { code } => self.remove_with_code(&code),
+            // From the installer's uninstall check and the guard (both SYSTEM), or an administrator's "Remove eGuard"
+            // window: only these kinds, which an administrator could at worst send for nothing
+            Request::Tamper { kind: kind @ (TamperKind::UninstallBlocked | TamperKind::FilesChanged) } => self.tamper(kind),
+            Request::Tamper { .. } => Response::Error { message: "eGuard doesn't take that from here.".into() },
             // A session's agent talks on its own session's pipe
             Request::Heartbeat { .. } | Request::AskParent { .. } | Request::AskTime { .. } => {
                 Response::Error { message: "That is asked on the session's own pipe.".into() }

@@ -4,8 +4,9 @@ What has to be checked on a Windows 11 VM, because it needs SYSTEM, a second acc
 Each item says what to do, what should happen, and what to bring back. The steps come from STATUS.md's "Needs the
 VM" lists (Phases 2 to 6) and the spec's acceptance tests (section 14).
 
-Phase 6 part 2 (the installer and what holds eGuard in place) isn't built, so acceptance test 8 and the Safe Mode
-check aren't here yet.
+Since Phase 6 part 2, eGuard is installed from `eguard.msi` and locks itself in place: an administrator can no
+longer stop or delete the service by hand. Go back to the **clean** snapshot between runs; `tools\reset.ps1` takes
+eGuard off through a one-off SYSTEM task when there's no snapshot.
 
 ## 1. The VM
 
@@ -24,7 +25,7 @@ On this PC:
 
 ```powershell
 cd C:\Users\corew\eguard-desktop
-pwsh tools\vm\bundle.ps1          # or powershell; makes target\eguard-vm.zip
+pwsh tools\vm\bundle.ps1          # or powershell; makes target\eguard-vm.zip (needs WiX 5 for eguard.msi)
 # the dev server must be running here: pnpm dev in ~/eguard
 ```
 
@@ -36,9 +37,10 @@ Set-ExecutionPolicy -Scope Process Bypass
 C:\eguard-vm\tools\install.ps1                    # VirtualBox NAT; with another network: -ServerHost <this PC's IP>
 ```
 
-It forwards `localhost:3000` on the VM to the dev server, checks it answers, copies the exes to
-`C:\Program Files\eGuard` and installs the service (LocalSystem, automatic). After each test, while still on the
-VM:
+It forwards `localhost:3000` on the VM to the dev server, checks it answers, and installs `eguard.msi` silently
+(its log: `%TEMP%\eguard-msi-install-*.log`). The package puts the programs in `C:\Program Files\eGuard`, then runs
+`eguard-service install` as SYSTEM: the service (LocalSystem, automatic) and its permissions, Safe Mode, the guard's
+task and cache, the folder's permissions. After each test, while still on the VM:
 
 ```powershell
 C:\eguard-vm\tools\collect.ps1 -Label test3       # a zip on the desktop: logs, state, service, processes, policies
@@ -58,16 +60,25 @@ Mark each **pass**, **fail** (with what happened) or **couldn't** (why) in the r
    standard one); press Enter.
    - Expect "Paired. This computer is now Mia's", and `mia` "the child's: rules apply", `parent` "not limited".
    - This PC: `dev-family show`: WINDOWS, COMPUTER, the four AVAILABLE protections **applied** (the service enforces
-     them, unlike console mode), WEB and UNINSTALL_PROTECTION not applied with their reasons, `accounts` as above.
+     them, unlike console mode), **UNINSTALL_PROTECTION applied** (`mia` is standard and the service is locked), WEB
+     not applied with its reason, `accounts` as above.
 2. `collect.ps1 -Label pairing`, then check:
-   - `service.txt`: LocalSystem, AUTO_START, restart 5 s / 5 s / 60 s, failure flag on.
-   - `data-folder.txt`: owner SYSTEM; SYSTEM full control; Administrators read only; no one else.
+   - `service.txt`: LocalSystem, AUTO_START, restart 5 s / 5 s / 60 s, failure flag on; `sdshow`
+     `D:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCLCSWRPWPDTLOCRRC;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)`
+     (administrators may stop, not change or delete).
+   - `data-folder.txt`: owner SYSTEM; SYSTEM full control; Administrators read only; no one else. A `cache` folder
+     with the three exes.
+   - `program-files.txt`: the three exes; SYSTEM full control, Administrators and Users read and execute only.
+   - `lockdown.txt`: the task `\eGuard\Guard` (SYSTEM, at boot, running), both SafeBoot keys (`(Default)` =
+     `Service`), the Settings entry (`UninstallString` = `"C:\Program Files\eGuard\eguard-agent.exe" remove`,
+     `NoModify` 1, `NoRepair` 1), and the package. Settings › Apps › Installed apps lists **one** eGuard.
+   - `processes.txt`: `eguard-guard.exe` running (SYSTEM, session 0).
 3. Restart the VM. `eguard-agent status`: still paired (the secrets read back through DPAPI as SYSTEM), last sync
    recent.
 4. As `mia`: `eguard-agent status` → "This account isn't allowed to talk to eGuard's service." (the admin pipe is
    for SYSTEM and administrators).
-5. Crashes (Phase 7). As `parent`: `taskkill /F /IM eguard-service.exe` → the SCM starts it again within ~5 s
-   (`sc query eGuard` RUNNING, `eguard-agent status` answers). As `mia`: `& "C:\Program Files\eGuard\eguard-agent.exe"
+5. Crashes (Phase 7). As `parent`: `taskkill /F /IM eguard-service.exe` → the SCM (or the guard, within 10 s)
+   starts it again within ~5 s (`sc query eGuard` RUNNING, `eguard-agent status` answers). As `mia`: `& "C:\Program Files\eGuard\eguard-agent.exe"
    crash panic`, then `crash fault` (a dev build only) → exit codes 101 and `-1073741819` (0xC0000005), and
    `%LOCALAPPDATA%\eGuard\logs\agent.log` ends with "crashed: panic at …" and "crashed: exception 0xC0000005 at
    eguard-agent.exe+0x…". No "has stopped working" box, no Application Error (event 1000) in the Application log, and
@@ -154,13 +165,47 @@ With the ids (`bundle.ps1 -ChromeId … -EdgeId … -FirefoxUrl …`):
    with a fresh pairing): "your parent chose to keep eGuard…", nothing removed, and the parent's "A removal code was
    used after you kept the computer".
 3. **Test 9:** `dev-family remove`. Within about a minute: the device is gone from `dev-family show`, "Device
-   removed" in the alerts, the agent closed in `mia`'s session. As `parent`: `sc.exe query eGuard` says the service
-   doesn't exist (1060); `collect.ps1 -Label test9`: no browser policies, `%ProgramData%\eGuard` holds only `logs`.
-   `C:\Program Files\eGuard` is still there (removing it is part 2's installer's job).
-4. **Test 10:** reinstall (`install.ps1`), pair again, then turn the VM's network off (VirtualBox › Devices ›
+   removed" in the alerts, the agent closed in `mia`'s session. Then **nothing is left** (as `parent`,
+   `collect.ps1 -Label test9`, and look):
+   - `sc.exe query eGuard`: doesn't exist (1060). No `eguard-*.exe` in Task Manager.
+   - `schtasks /Query /TN \eGuard\Guard`: not found. `reg query` of both SafeBoot keys: not found.
+   - Settings › Apps: no eGuard; `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\eGuard`: not found; no
+     package (`lockdown.txt`).
+   - `C:\Program Files\eGuard`: gone. `C:\ProgramData\eGuard`: only `logs` (kept on purpose: what happened, for
+     support; no secrets). No browser policies.
+   - `service.log` lists each "removed: …" step and the installer's run; the MsiInstaller events say the removal
+     succeeded.
+4. **Test 10:** go back to **clean**, install, pair again, then turn the VM's network off (VirtualBox › Devices ›
    Network › untick "Connect Network Adapter"). `dev-family remove` on this PC; type the printed code as `mia` in the
    window: "The code is right. eGuard is removing itself", and the same checks as test 9. The dashboard keeps showing
    "Removing" (the computer couldn't tell it: STATUS.md, Phase 6 item 1); finish with `dev-family remove now`.
+
+### F. Every local route is blocked (Phase 6 part 2, acceptance test 8)
+
+Paired, `mia` standard. Do each **as `mia`** and again **as `parent`** (an administrator). Each must fail and the
+dashboard must get the alert (one per kind per hour: wait an hour between `mia` and `parent`, or check the log's
+"tamper: …" lines for the second). Bring back `collect.ps1 -Label test8` at the end.
+
+1. **Settings › Apps › eGuard › Uninstall:** the "Remove eGuard" window opens (not an uninstaller). Close it without a
+   code → "Someone tried to uninstall eGuard". Note whether Settings asked for an administrator first.
+2. **`msiexec /x {product code}`** (the code is in `lockdown.txt`; as `mia` it asks for an administrator, which is
+   itself the block): as `parent` in an elevated prompt, the uninstall fails and is rolled back (exit 1603), eGuard
+   still runs, "Someone tried to uninstall eGuard". The MSI log (`/l*v`) shows `msi-check` refusing.
+3. **`sc stop eGuard`** → "Access is denied" (5) and "Someone tried to stop eGuard"; Services › eGuard › Stop says the
+   same. **`sc delete eGuard`** and **`sc config eGuard start= disabled`** → "Access is denied" (no alert: the
+   service never hears of those). Task Manager › Services › Stop: refused.
+4. **Deleting the install folder:** `Remove-Item -Recurse "C:\Program Files\eGuard"` → access denied (and in use).
+   As `parent`, `takeown /f "C:\Program Files\eGuard" /r` + `icacls … /grant parent:F` succeeds (an administrator
+   can), but deleting a file still fails while it's held open. Then end the guard (`taskkill /f /im eguard-guard.exe`)
+   and the service, and delete `eguard-agent.exe` quickly: within ~10–60 s it's back (the guard restarts from its
+   task, or the service starts the task), "eGuard's files were changed", and `guard.log` says "put back".
+5. **The guard's task:** `schtasks /Delete /TN \eGuard\Guard /F` and `schtasks /Change /TN \eGuard\Guard /Disable`
+   as `parent`: refused? Write down what happens (the task's own permissions say SYSTEM only).
+6. **Safe Mode:** as `parent`, `bcdedit /set {current} safeboot minimal`, restart, sign in as `mia`: eGuard runs
+   (`tasklist` shows `eguard-service.exe`), and once back online the dashboard gets "The computer was started in Safe
+   Mode". Then `bcdedit /deletevalue {current} safeboot` and restart. Try `safeboot network` too.
+7. Write down for each whether the child (standard) and the administrator were stopped. An administrator can always
+   win in the end (spec section 10, Q1): what counts is that each try is refused or undone, and alerts.
 
 ## 4. Results
 
@@ -190,5 +235,11 @@ Copy this table into STATUS.md with the outcome of each, and keep the zips from 
 | D3–D6 web with ids | | |
 | E1 wrong codes, lockout | | |
 | E2 kept | | |
-| E3 test 9 | | |
+| E3 test 9 (nothing left) | | |
 | E4 test 10 | | |
+| F1 Settings › Uninstall (child / admin) | | |
+| F2 `msiexec /x` | | |
+| F3 `sc stop`, `sc delete`, `sc config` | | |
+| F4 deleting the install folder; guard puts back | | |
+| F5 the guard's task | | |
+| F6 Safe Mode (minimal / network) | | |

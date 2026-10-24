@@ -1,10 +1,11 @@
-//! Running under the Service Control Manager, and installing there (spec section 3: `LocalSystem`, auto-start,
-//! restart on failure). Installing needs an administrator: on the owner's PC that waits for their go-ahead, so
-//! development runs in console mode and the service is installed on a VM.
+//! Running under the Service Control Manager, and registering there (spec section 3: `LocalSystem`, auto-start,
+//! restart on failure). Installing needs an administrator and locks the service (`lockdown`): never on the owner's
+//! PC, where development runs in console mode; the service is installed on a VM.
 
 use crate::log;
 use crate::runner::Runner;
 use std::ffi::OsString;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use windows_service::service::{
@@ -37,6 +38,10 @@ fn service_main(_args: Vec<OsString>) {
 const EXIT_SETUP_FAILED: u32 = 1;
 /// The service's own exit code when the runner stopped with an error.
 const EXIT_RUN_FAILED: u32 = 2;
+/// `ERROR_SERVICE_DOES_NOT_EXIST`.
+const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+/// `ERROR_ACCESS_DENIED`: the answer to a stop the service refuses, which `sc stop` shows as "Access is denied".
+const ERROR_ACCESS_DENIED: u32 = 5;
 
 fn status(state: ServiceState, accept: ServiceControlAccept, exit: ServiceExitCode) -> ServiceStatus {
     ServiceStatus {
@@ -55,9 +60,22 @@ fn run() -> Result<(), String> {
     let runner: Arc<OnceLock<Arc<Runner>>> = Arc::default();
     let r = Arc::clone(&runner);
     let handler = move |event| match event {
-        // Stopping is allowed until removal protection locks the service (Phase 6). Not accepted while starting,
-        // so the runner is there by the time a stop can arrive
-        ServiceControl::Stop | ServiceControl::Shutdown => {
+        // A stop request is refused unless eGuard may be removed (not paired, or an authorized removal), and the
+        // parent hears of it (owner's decision, 2026-10-24: the request reaches the service rather than the
+        // service's permissions refusing it unheard). Not accepted while starting, so the runner is there by then
+        ServiceControl::Stop => match r.get() {
+            Some(r) if r.may_stop() => {
+                r.request_stop();
+                ServiceControlHandlerResult::NoError
+            }
+            Some(r) => {
+                r.stop_denied();
+                ServiceControlHandlerResult::Other(ERROR_ACCESS_DENIED)
+            }
+            None => ServiceControlHandlerResult::Other(ERROR_ACCESS_DENIED),
+        },
+        // Windows is shutting down: always
+        ServiceControl::Shutdown => {
             if let Some(r) = r.get() {
                 r.request_stop();
             }
@@ -89,9 +107,10 @@ fn run() -> Result<(), String> {
     result
 }
 
-/// Registers the service: `LocalSystem`, automatic start, restarted after 5 s, 5 s, then every minute, the count
-/// reset daily. Also on a non-crash failure (the service stopping with an error code).
-pub fn install() -> Result<(), String> {
+/// Registers the service (or updates it when it's there): `LocalSystem`, automatic start, `exe`, restarted after
+/// 5 s, 5 s, then every minute, the count reset daily, also on a non-crash failure (the service stopping with an
+/// error code). Its permissions are `lockdown`'s.
+pub fn register(exe: &Path) -> Result<(), String> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)
         .map_err(|e| format!("couldn't open the service manager ({e}); run this as an administrator"))?;
     let info = ServiceInfo {
@@ -100,16 +119,20 @@ pub fn install() -> Result<(), String> {
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
-        executable_path: std::env::current_exe().map_err(|e| e.to_string())?,
+        executable_path: exe.to_owned(),
         launch_arguments: vec![],
         dependencies: vec![],
         // None: LocalSystem
         account_name: None,
         account_password: None,
     };
-    let service = manager
-        .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-        .map_err(|e| format!("couldn't create the service: {e}"))?;
+    let service = match manager.open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG) {
+        Ok(s) => {
+            s.change_config(&info).map_err(|e| format!("couldn't update the service: {e}"))?;
+            s
+        }
+        Err(_) => manager.create_service(&info, ServiceAccess::CHANGE_CONFIG).map_err(|e| format!("couldn't create the service: {e}"))?,
+    };
     service.set_description(DESCRIPTION).map_err(|e| e.to_string())?;
     let restart = |secs| ServiceAction { action_type: ServiceActionType::Restart, delay: Duration::from_secs(secs) };
     service
@@ -120,28 +143,26 @@ pub fn install() -> Result<(), String> {
             actions: Some(vec![restart(5), restart(5), restart(60)]),
         })
         .map_err(|e| e.to_string())?;
-    service.set_failure_actions_on_non_crash_failures(true).map_err(|e| e.to_string())?;
-    service.start::<&str>(&[]).map_err(|e| format!("installed, but it didn't start: {e}"))?;
-    Ok(())
+    service.set_failure_actions_on_non_crash_failures(true).map_err(|e| e.to_string())
 }
 
-/// Stops and deletes the service. For a VM between test runs; the real removal flow is Phase 6.
-pub fn uninstall() -> Result<(), String> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
-        .map_err(|e| format!("couldn't open the service manager ({e}); run this as an administrator"))?;
-    let service = manager
-        .open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS)
-        .map_err(|e| format!("couldn't open the service: {e}"))?;
-    if service.query_status().is_ok_and(|s| s.current_state != ServiceState::Stopped) {
-        let _ = service.stop();
-    }
-    service.delete().map_err(|e| e.to_string())
-}
-
-/// eGuard is removing itself (spec section 10): the service is marked for deletion, which Windows carries out once it
-/// has stopped. Called from inside the running service, as `LocalSystem`.
-pub fn delete_self() -> Result<(), String> {
+/// Starts the service unless it's running.
+pub fn start() -> Result<(), String> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(|e| e.to_string())?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::DELETE).map_err(|e| e.to_string())?;
-    service.delete().map_err(|e| e.to_string())
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::START | ServiceAccess::QUERY_STATUS).map_err(|e| e.to_string())?;
+    if service.query_status().is_ok_and(|s| s.current_state != ServiceState::Stopped) {
+        return Ok(());
+    }
+    service.start::<&str>(&[]).map_err(|e| format!("the service didn't start: {e}"))
+}
+
+/// Marks the service for deletion (Windows deletes it once it has stopped); one that isn't there is fine. As SYSTEM:
+/// administrators may not delete it once it's locked.
+pub fn delete_if_there() -> Result<(), String> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(|e| e.to_string())?;
+    match manager.open_service(SERVICE_NAME, ServiceAccess::DELETE) {
+        Ok(s) => s.delete().map_err(|e| e.to_string()),
+        Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }

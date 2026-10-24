@@ -146,6 +146,12 @@ pub struct Removing {
     pub ready: bool,
 }
 
+/// Whether eGuard may be stopped or uninstalled (spec section 10): it protects nothing yet (`paired` false), or an
+/// authorized removal is under way and the server has heard (or can't be asked).
+pub fn may_be_removed(paired: bool, removing: Option<&Removing>) -> bool {
+    !paired || removing.is_some_and(|r| r.ready)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

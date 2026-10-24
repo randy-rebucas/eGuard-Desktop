@@ -1,7 +1,8 @@
 # Status
 
-Updated 2026-10-24: Phase 7's crash handler, below. Before it: Phase 7's logs, Phase 6 part 1 (the removal flow
-and tamper reporting), Phase 5 (web), Phase 4, the owner's decisions, a full audit and its fixes.
+Updated 2026-10-24: Phase 6 part 2 (the installer and what holds eGuard in place), built and waiting for the VM,
+below. Before it: Phase 7's crash handler and logs, Phase 6 part 1 (the removal flow and tamper reporting), Phase 5
+(web), Phase 4, the owner's decisions, a full audit and its fixes.
 
 | Phase | What | Status |
 |---|---|---|
@@ -10,10 +11,69 @@ and tamper reporting), Phase 5 (web), Phase 4, the owner's decisions, a full aud
 | 3 | Scanning and identification (spec 5, 6) | Done: the last two the gate left (the XPrinter driver, Discord's leftover updater) are left out since 2026-10-23 (`scan::left_out`) |
 | 4 | Enforcement and time (spec 7, 8) | **Built and checked on this PC with stand-ins.** Tests 3–5 pass in console mode; the gate waits for the VM: test 6, everything as SYSTEM, real games (Q3) |
 | 5 | Web (spec 9) | **Built and checked on this PC** with a stand-in browser and an inert copy of the policies. The prompt gives no "Done when"; real browsers wait for the VM and for the extension's store ids, and 6 items wait for the owner (below) |
-| 6 | Removal protection and tamper (spec 10, 11) | **Part 1 built and checked on this PC** (the removal flow, "Remove with a code", tamper reporting, `ADMIN_ACCOUNT`). Part 2 (installer, service lock, guard, Safe Mode registration) waits for the VM and two decisions (below) |
+| 6 | Removal protection and tamper (spec 10, 11) | **Part 1 built and checked on this PC** (the removal flow, "Remove with a code", tamper reporting, `ADMIN_ACCOUNT`). **Part 2 built** (the MSI, the service lock, the guard, Safe Mode, complete removal): unit-tested and the MSI validated here; nothing of it has run yet. The gate (tests 7–10) is the VM's: VM-TESTS.md sections A, E, F |
 | 7 | Hardening and release readiness | **Started:** structured, rotated, scrubbed logs and a crash handler (below). Not built: the signed self-update (Q7, the owner's design), signing (the certificate), the end-to-end VM run |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## Phase 6, part 2: what was built (2026-10-24)
+
+The owner's decisions (2026-10-24): **(a)** Settings › Uninstall is visible and opens the "Remove eGuard" code
+window; closing it without a code sends `UNINSTALL_BLOCKED`. **(b)** A stop request reaches the service, which
+refuses it (outside an authorized removal) and sends `SERVICE_STOP_DENIED`. Also allowed: installing the .NET 8 SDK
+and WiX on this PC (done: SDK 8.0.426 by winget, `wix` 5.0.2 as a global dotnet tool). **WiX 5, not 6:** WiX 6's
+binaries need its Open Source Maintenance Fee agreement accepted; 5.0.2 is MS-RL with no fee. And: the VM is ready.
+
+**Nothing of part 2 has run yet.** Installing it locks a PC's service, Safe Mode boot and Program Files folder, so per
+the prompt it runs on the VM only. On this PC: unit tests, clippy, the MSI built and ICE-validated (`wix msi
+validate`), its custom actions read back (`wix msi decompile`), console mode started normally.
+
+| Piece | What it does |
+|---|---|
+| `installer/eguard.wxs`, `installer/build.ps1` | Per-machine MSI (WiX 5): the three exes in `C:\Program Files\eGuard`. Deferred custom actions as SYSTEM: `eguard-service install` before `InstallFinalize`; on `REMOVE="ALL"`, `eguard-service msi-check` right after `InstallInitialize` (a non-zero exit rolls the uninstall back) and `eguard-service purge` before `RemoveFiles`. The package's own Settings entry is hidden (`ARPSYSTEMCOMPONENT`); eGuard's entry (`…\Uninstall\eGuard`, `NoModify`, `NoRepair`) has `UninstallString` `"…\eguard-agent.exe" remove` (decision a). **No upgrades** until the self-update is designed: a second version refuses to install over the first, and an upgrade's removal of the old one goes through the same check. Unsigned (the certificate) |
+| `eguard-service` `lockdown` | `install` (only from `C:\Program Files\eGuard`: nothing is ever locked in a build folder): data folder locked, the guard's cache (`ProgramData\eGuard\cache`, the three exes), the program folder SYSTEM-write only (`INSTALL_DIR_SDDL`), the service registered or updated (`svc::register`), its DACL (`SERVICE_SDDL`: administrators may query/start/stop, not change config, delete, or change permissions/owner), `SafeBoot\Minimal\eGuard` and `\Network\eGuard` = `Service`, the guard's task `\eGuard\Guard` (`schtasks /XML`: SYSTEM, at boot, no time limit, restarted every minute on failure, its own SD SYSTEM-only), then the service and the task started. Run again, it repairs. `status()`: UNINSTALL_PROTECTION is reported applied only when all of that holds (and the engine still turns it off for an administrator child). `purge(me_too)`: the guard's task and process, the service (marked for deletion), both SafeBoot keys, the HKLM browser policies, the agents, the service process (`me_too`), the data folder but `logs`; each step logged, failures listed. `keep_guard_running()`: the service starts the task again when no guard runs (every tick) |
+| `eguard-service` `svc`, `runner`, `main` | Stop control: refused with `ERROR_ACCESS_DENIED` unless `Engine::may_be_removed` (not paired, or an authorized removal the server heard of); a refusal queues `SERVICE_STOP_DENIED` (decision b). The handler reads an atomic the loop keeps up to date, never the engine's lock. Shutdown is always accepted. Service mode holds its three exes open (`files::hold`: share read only, so no delete, write or rename). `Request::Tamper` on the admin pipe takes `UNINSTALL_BLOCKED` and `FILES_CHANGED` only; on a session pipe `UNINSTALL_BLOCKED` only. An authorized removal in service mode: browser policies, `purge(false)`, then `msiexec /x {product} /qn` (found by upgrade code, `eguard-win::msi`), whose check passes because nothing is paired any more. New commands: `install`, `msi-check`, `purge [--force]` (`--force`: dev builds only, for `reset.ps1`); `uninstall` is gone (purge replaces it). The installer's steps log to `ProgramData\eGuard\logs` |
+| `eguard-guard` | No longer a stub. Every 10 s: each program file compared byte for byte with the cache; a missing or different one moved aside, the copy put back, `FILES_CHANGED` sent through the admin pipe (retried until the service answers); files held open once they match; the service started if it's stopped. Ends when the service is gone. Logs to `ProgramData\eGuard\logs\guard.log` |
+| `eguard-win` `services`, `msi`, `files::hold`, `process::end_one` | The service's DACL (`SetServiceObjectSecurity` / `QueryServiceObjectSecurity`; the `windows-service` crate doesn't reach it). The installed product by upgrade code (`MsiEnumRelatedProductsW`). New windows-sys features (no new crates): `Win32_System_Services`, `Win32_System_ApplicationInstallationAndServicing` |
+| core `removal::may_be_removed`, `Engine::may_be_removed`, `ipc::Request::Tamper` | The one rule the stop control, the installer's check and `purge` share. `Tamper { kind }` is an optional addition (protocol still 1) |
+| `eguard-agent remove` | The window closed without a code that removed eGuard → `Tamper { UNINSTALL_BLOCKED }` (admin pipe if allowed, else the session's) |
+| `tools/vm` | `bundle.ps1` adds `eguard.msi`. `install.ps1` installs it (`msiexec /i … /qn /l*v %TEMP%\eguard-msi-install-*.log`). `reset.ps1`: a one-off SYSTEM task runs `purge --force`, then the package is uninstalled, then any leftovers taken over and deleted. `collect.ps1`: `lockdown.txt` (task, SafeBoot, Settings entry, package), the folder's ACL, MsiInstaller events, the MSI logs |
+
+**What removal takes out** (the prompt: "list what you remove"): the service; the guard's task and process; both
+SafeBoot keys; the HKLM browser policies; the agents; the data folder's secrets, state, cache and set-aside copies; then
+the package: the program folder and the Settings entry. **Left on purpose:** `C:\ProgramData\eGuard\logs` (no
+secrets; what happened, for support). Say if that should go too. Test 9's checklist proves the rest (VM-TESTS.md E3).
+
+**Verified on this PC:** `cargo test --workspace` 226 passed, 1 ignored (core 164 + 14 fixture, win 38, service 9,
+guard 1); clippy and fmt clean. New tests: `may_be_removed` before pairing, paired, authorized, acknowledged and kept;
+the `tamper` pipe message; a held file can't be deleted, renamed or written but can be read; the service DACL gives
+administrators nothing that changes or deletes it (and both SDDLs parse); the guard's task XML; `install` refuses to
+run outside Program Files; the guard puts back a missing and a changed file; the MSI lookup finds nothing here; a
+service's DACL reads back. `bundle.ps1` builds the zip with the MSI. Not run (and must not be here): `install`,
+`purge`, the MSI.
+
+**Expected to need fixing on the VM** (untried, written down so the first run looks for them): whether Settings asks
+for an administrator before running a per-machine entry's `UninstallString`; what `sc stop` prints for a handler's
+`ERROR_ACCESS_DENIED`; whether the task's own security descriptor stops an administrator deleting it (Task Scheduler
+may not honour it for administrators); `schtasks /XML` reading the UTF-16 file; whether the guard's task restarts
+after `taskkill` (RestartOnFailure counts a non-zero exit); the timing between the service's purge, its exit and
+`msiexec`'s `RemoveFiles` (a file still held is deleted at the next restart instead).
+
+**For the owner (part 2):**
+1. **The spec's section 10 table now differs in two rows** (your decisions a and b, NOT changed in
+   `~/eguard/docs/desktop-agent-spec.md`): Settings › Uninstall is "a visible entry whose Uninstall opens eGuard's
+   'Remove eGuard' window (not `NoRemove`); closing it without a code sends `UNINSTALL_BLOCKED`", and `sc stop` is
+   "the service refuses the stop (the DACL allows the request) and sends `SERVICE_STOP_DENIED`; `DELETE`,
+   `WRITE_DAC`, `WRITE_OWNER` and `CHANGE_CONFIG` stay denied". Also: the spec says the DACL denies "to Everyone,
+   Administrators included"; it's done by not granting (a deny entry for Administrators would lock out SYSTEM, which
+   holds that group).
+2. **No upgrades yet:** the MSI refuses to install over an installed eGuard, so a new version means removing the old
+   one through the dashboard first. Upgrades come with the self-update design (Q7, yours).
+3. **`sc delete`, `sc config` and deleting files raise no alert when refused**: Windows refuses them before eGuard
+   hears. Only a stop request reaches the service. Deleting files is caught by the guard when it succeeds (an
+   administrator who takes ownership), not when it's refused.
+4. **A service killed with `taskkill /F`** (an administrator can) is restarted by the SCM and the guard, but nothing
+   tells the parent; no TAMPER kind fits ("eGuard was stopped and started again" would be a server change).
 
 ## Phase 7, started: logs (2026-10-24)
 
@@ -95,14 +155,14 @@ the dev server; family deleted after):**
 2. **eGuard's signed command removes even without the server hearing it,** after 10 minutes of failed
    acknowledgements (the command is eGuard's signed word; a 409 still stops it). Say if you'd rather it wait for an
    answer however long that takes.
-3. **Part 2's two decisions** (asked 2026-10-24, not answered yet): (a) Settings › Uninstall: the spec says both
+3. **Part 2's two decisions** (asked 2026-10-24; **answered the same day: both as recommended**, built in part 2): (a) Settings › Uninstall: the spec says both
    `NoRemove=1` and "the visible Uninstall opens Ask your parent", which Windows 11 can't do together. Recommended: a
    visible entry whose Uninstall opens `eguard-agent remove` (the window above) and sends `UNINSTALL_BLOCKED` when it's
    closed without a code. (b) Stop attempts: if the service's permissions refuse `SERVICE_STOP` outright, the service
    never hears of it and can't send `SERVICE_STOP_DENIED`. Recommended: let the stop request reach the service, which
    refuses it (outside an authorized removal) and reports it.
-4. `UNINSTALL_BLOCKED`, `SERVICE_STOP_DENIED` and `FILES_CHANGED` aren't sent by anything yet: they come with
-   part 2's installer, service lock and guard. `Engine::tamper` is ready for them.
+4. `UNINSTALL_BLOCKED`, `SERVICE_STOP_DENIED` and `FILES_CHANGED` are sent since part 2 (the installer's check and
+   the code window, the stop control, the guard).
 
 ## Phase 5: what was built (2026-10-24)
 
@@ -594,18 +654,13 @@ Checked here: the bundle builds, no exe imports `vcruntime140.dll` or the CRT DL
 removes the stand-ins, and the four scripts parse. `install.ps1`, `collect.ps1` and `reset.ps1` need an administrator
 and install a service, so they haven't been run anywhere yet: the first VM session will shake them out.
 
-## Next: Phase 6, part 2 (on the VM)
+## Next: the VM run (the owner runs it; the next session reads the results)
 
-The WiX MSI (per machine, `NoModify`, the abort-unless-authorized custom action that asks the running service, the
-ARP entry per decision 3a above), the service's permissions (decision 3b), the guard task and its protected file
-cache (`FILES_CHANGED`), `SafeBoot\Minimal` and `\Network` registration, and removal of all of it from
-`Runner::remove_self` (today it removes the browser policies, the service registration and the data). Then prove
-nothing is left (prompt: "list what you remove"), and acceptance tests 7–10 on the VM. Needs WiX (a .NET SDK isn't
-installed here) and the owner's answers to decisions 3a and 3b.
-
-On the VM before or alongside it: Phase 4's open items (install the service, ETW, agents in a child's session, the
-disconnect and lock backstops, test 6, the Q3 anti-cheat spike) and Phase 5's (above; real browsers need the
-extension's store ids first). `tools/enforce/` has the stand-ins.
+`target\eguard-vm.zip` (`tools\vm\bundle.ps1`) → the VM → VM-TESTS.md from the top: A (install from the MSI,
+pairing, the lock in place), B, C (Phase 4's open items, test 6, Q3), D (web without ids), E (removal: tests 9 and 10,
+nothing left), F (test 8: every local route). Bring back the `collect.ps1` zips and the filled results table. The
+next session fixes what failed (see part 2's "Expected to need fixing"), and marks Phase 6 done when tests 7–10
+pass. Phase 7 still has the self-update (Q7) and signing (the certificate), both the owner's.
 
 ## Gotchas
 

@@ -1,4 +1,4 @@
-# On the test VM, as an administrator: installs the bundle's build as the eGuard service (docs/VM-TESTS.md, step 2).
+# On the test VM, as an administrator: installs the bundle's eguard.msi (docs/VM-TESTS.md, step 2).
 #
 #   install.ps1 [-ServerHost 10.0.2.2] [-Bin ..\bin]
 #
@@ -35,10 +35,12 @@ try {
 if ($status -ne 401) { throw "eGuard's server isn't reachable at $server ($why); is it running ($ServerHost)?" }
 "eGuard's server reachable at $server"
 
-$dest = Join-Path $env:ProgramFiles "eGuard"
-New-Item -ItemType Directory -Force $dest | Out-Null
-Copy-Item (Join-Path $Bin "*.exe") $dest -Force
-& (Join-Path $dest "eguard-service.exe") install
-if ($LASTEXITCODE -ne 0) { throw "eguard-service install failed" }
+# The package installs the programs into Program Files, then registers and locks the service, Safe Mode, the guard
+# and its cache (eguard-service install, as SYSTEM). Its log goes to %TEMP%, where collect.ps1 finds it
+$msi = Join-Path $Bin "..\eguard.msi"
+if (-not (Test-Path $msi)) { throw "eguard.msi isn't in the bundle ($msi)" }
+$log = Join-Path $env:TEMP "eguard-msi-install-$(Get-Date -Format yyyyMMdd-HHmmss).log"
+$p = Start-Process msiexec.exe -ArgumentList "/i", "`"$(Resolve-Path $msi)`"", "/qn", "/norestart", "/l*v", "`"$log`"" -Wait -PassThru
+if ($p.ExitCode -ne 0) { throw "installing eguard.msi failed ($($p.ExitCode)); see $log" }
 sc.exe queryex eGuard
-"installed in $dest. Next: pair (VM-TESTS.md, test 1)."
+"installed. Next: pair (VM-TESTS.md, test 1)."

@@ -1,5 +1,6 @@
 # Builds what the Windows 11 test VM needs into target\vm-bundle and target\eguard-vm.zip (docs/VM-TESTS.md):
 #
+#   eguard.msi the installer package made from bin\ (installer\build.ps1; WiX 5 must be installed here)
 #   bin\       eguard-service.exe, eguard-agent.exe, eguard-guard.exe: a development build (the dev signing key, the
 #              server at http://localhost:3000, which install.ps1 forwards to this PC), linked with the C runtime
 #              inside, so a clean Windows needs no Visual C++ redistributable
@@ -42,6 +43,9 @@ $bin = New-Item -ItemType Directory -Force (Join-Path $out "bin")
 foreach ($exe in "eguard-service.exe", "eguard-agent.exe", "eguard-guard.exe") {
     Copy-Item (Join-Path $root "target\vm\debug\$exe") $bin
 }
+
+# The installer package, made from the same programs (installer\build.ps1, WiX 5)
+& (Join-Path $root "installer\build.ps1") -Bin $bin -Out (Join-Path $out "eguard.msi")
 
 $standins = New-Item -ItemType Directory -Force (Join-Path $out "standins")
 $enforce = Join-Path $root "tools\enforce"

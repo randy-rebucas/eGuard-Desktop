@@ -17,7 +17,18 @@ foreach ($f in "state.json", "state.prev.json") {
     if (Test-Path (Join-Path $data $f)) { Copy-Item (Join-Path $data $f) $out }
 }
 Save "data-folder.txt" { Get-ChildItem -Force $data -Recurse | Select-Object FullName, Length, LastWriteTime | Format-Table -AutoSize | Out-String -Width 300; icacls $data }
-Save "program-files.txt" { Get-ChildItem -Force (Join-Path $env:ProgramFiles "eGuard") -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String -Width 300 }
+Save "program-files.txt" { Get-ChildItem -Force (Join-Path $env:ProgramFiles "eGuard") -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String -Width 300; icacls (Join-Path $env:ProgramFiles "eGuard") }
+Save "lockdown.txt" {
+    "== guard task"; schtasks /Query /TN "\eGuard\Guard" /V /FO LIST; schtasks /Query /TN "\eGuard\Guard" /XML
+    "== Safe Mode"; reg query "HKLM\SYSTEM\CurrentControlSet\Control\SafeBoot\Minimal\eGuard"; reg query "HKLM\SYSTEM\CurrentControlSet\Control\SafeBoot\Network\eGuard"
+    "== Settings entry"; reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\eGuard"
+    "== installed package"; Get-CimInstance Win32_Product -Filter "Name = 'eGuard'" | Format-List Name, Version, IdentifyingNumber | Out-String
+}
+Save "installer-events.txt" {
+    Get-WinEvent -FilterHashtable @{ LogName = "Application"; ProviderName = "MsiInstaller"; StartTime = (Get-Date).AddHours(-6) } -ErrorAction SilentlyContinue |
+        Where-Object { $_.Message -match "eGuard" } | Format-List TimeCreated, Id, Message | Out-String -Width 300
+}
+Get-ChildItem $env:TEMP -Filter "eguard-msi-*.log" -ErrorAction SilentlyContinue | Copy-Item -Destination $out
 Save "service.txt" { sc.exe queryex eGuard; sc.exe qc eGuard; sc.exe qfailure eGuard; sc.exe qfailureflag eGuard; sc.exe sdshow eGuard }
 Save "processes.txt" { tasklist /v /fi "imagename eq eguard*" ; query session }
 Save "accounts.txt" { Get-LocalUser | Format-Table Name, Enabled | Out-String; Get-LocalGroupMember Administrators | Format-Table Name, PrincipalSource | Out-String }

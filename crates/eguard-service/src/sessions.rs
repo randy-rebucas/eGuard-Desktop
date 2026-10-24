@@ -63,8 +63,9 @@ pub struct Shared {
     pub session_sids: SessionSids,
     /// Called after the child asks for something, so the sync loop sends it now.
     wake: Box<dyn Fn() + Send + Sync>,
-    /// "Remove with a code", answered by the runner (it holds the engine).
-    remove_with_code: Box<dyn Fn(&str) -> Response + Send + Sync>,
+    /// "Remove with a code" and the "Remove eGuard" window closed without one, answered by the runner (it holds the
+    /// engine).
+    to_runner: Box<dyn Fn(&Request) -> Response + Send + Sync>,
     /// eGuard removed itself: agents are told to close, and none is started again.
     removed: AtomicBool,
 }
@@ -82,7 +83,7 @@ impl Shared {
         session_sids: SessionSids,
         console: bool,
         wake: Box<dyn Fn() + Send + Sync>,
-        remove_with_code: Box<dyn Fn(&str) -> Response + Send + Sync>,
+        to_runner: Box<dyn Fn(&Request) -> Response + Send + Sync>,
     ) -> Self {
         let agent_exe = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("eguard-agent.exe"))).unwrap_or_default();
         Self {
@@ -94,7 +95,7 @@ impl Shared {
             disconnected: Mutex::new(HashSet::new()),
             session_sids,
             wake,
-            remove_with_code,
+            to_runner,
             removed: AtomicBool::new(false),
         }
     }
@@ -420,9 +421,10 @@ fn handle(shared: &Shared, id: u32, client: u32, req: &Request) -> Response {
             let result = shared.enforcer().ask(id, Ask::Time { notice }, sample);
             asked(shared, result)
         }
-        // The parent may type the code in the child's session; the engine counts wrong ones toward the lockout
-        Request::RemoveWithCode { code } => (shared.remove_with_code)(code),
-        Request::Pair { .. } | Request::Status | Request::Scan | Request::Accounts { .. } => {
+        // The parent may type the code in the child's session (the engine counts wrong ones toward the lockout); the
+        // "Remove eGuard" window (Settings' Uninstall) closed without a code is an attempt to uninstall
+        Request::RemoveWithCode { .. } | Request::Tamper { kind: TamperKind::UninstallBlocked } => (shared.to_runner)(req),
+        Request::Pair { .. } | Request::Status | Request::Scan | Request::Accounts { .. } | Request::Tamper { .. } => {
             Response::Error { message: "That isn't asked on this pipe.".into() }
         }
     }

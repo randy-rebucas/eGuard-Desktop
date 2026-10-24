@@ -251,6 +251,12 @@ pub fn end_tree(pid: u32, start: u64, keep: impl Fn(u32) -> bool) -> usize {
     ended
 }
 
+/// Ends `pid` alone (not its children), when it's still the process that started at `start`. For eGuard's own
+/// processes during removal: the service's children include the uninstaller, which must carry on.
+pub fn end_one(pid: u32, start: u64) -> bool {
+    pid != current_pid() && pid != 0 && pid != 4 && end(pid, start, &|_| true)
+}
+
 /// Ends one process, when `pid` is still the one that started at `start` and `keep` lets it.
 fn end(pid: u32, start: u64, keep: &impl Fn(u32) -> bool) -> bool {
     let Some(h) = Handle::open(pid, PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION) else { return false };

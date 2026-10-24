@@ -26,20 +26,27 @@ on the owner, gotchas).
   entries go into browser policies others may share). `#![forbid(unsafe_code)]` in its lib.rs.
 - `crates/eguard-win`: `windows-sys` 0.61 (the same version `windows-service` uses). `WinHTTP`, DPAPI, atomic files,
   named pipe + DACL, clocks, device details, app scan sources (`apps`), Authenticode (embedded and catalog), change
-  notifications, the crash handler (`crash`: last line in the log, no dump), processes (`process`, `etw`), sessions (`session`: WTS), input (`input`), the agent's Win32 screens
-  (`ui`), the overlay's app buttons (`launch`: switch to or start an always-allowed app), browser policies
-  (`browsers`: HKLM for the service, an inert HKCU copy in console mode). The workspace denies `unsafe`; only this
-  crate's FFI modules allow it.
-- `crates/eguard-service`, `eguard-agent`, `eguard-guard`: the three binaries (spec section 3). On the owner's PC the
-  service runs in console mode (`eguard-service run`); `install` is for a VM. Console mode ends programs only inside
+  notifications, the crash handler (`crash`: last line in the log, no dump), processes (`process`, `etw`), sessions
+  (`session`: WTS), input (`input`), the agent's Win32 screens (`ui`), the overlay's app buttons (`launch`: switch to
+  or start an always-allowed app), browser policies (`browsers`: HKLM for the service, an inert HKCU copy in console
+  mode), the service's DACL (`services`), the installed MSI (`msi`). The workspace denies `unsafe`; only this crate's
+  FFI modules allow it.
+- `crates/eguard-service`, `eguard-agent`, `eguard-guard`: the three binaries (spec section 3). The service's
+  `lockdown` is removal protection: `install` (service + DACL, SafeBoot, guard task and cache, folder ACLs) and
+  `purge` (takes all of it out). **Never run `eguard-service install`, `purge`, `msi-check` or the MSI on this PC:**
+  they lock or remove a service, Safe Mode keys and Program Files; VM only. On the owner's PC the service runs in
+  console mode (`eguard-service run`). Console mode ends programs only inside
   `--sandbox DIR` (without it, it only logs what it would end): never run it so it can end the owner's own tools.
   Browser policies on this PC are on the "ask me first" list: console mode writes them only under HKCU
   `Software\eGuard\Dev\Policies`, which no browser reads; never write HKLM policies here.
 - `tools/enforce/`: stand-ins and scripts for checking enforcement by hand (`setup.ps1` makes a fake Steam CS2, an
   unsigned "Pixel Quest" and an unsigned "Pixel Browser"; `launch.ps1`, `play.ps1`, `press.ps1`, `waitoverlay.ps1`).
+- `installer/`: `eguard.wxs` (WiX 5, per-machine MSI with the install/check/purge custom actions) and `build.ps1`.
+  WiX 5.0.2 is a global dotnet tool here (`%USERPROFILE%\.dotnet\tools\wix.exe`; not WiX 6, which needs a fee
+  agreement). Building the MSI is fine here; installing it isn't.
 - `tools/vm/`: the VM test kit ([docs/VM-TESTS.md](docs/VM-TESTS.md)). `bundle.ps1` here builds
-  `target\eguard-vm.zip`; `install.ps1`, `collect.ps1`, `reset.ps1` run on the VM only (never on this PC: they
-  install a service).
+  `target\eguard-vm.zip` (with `eguard.msi`); `install.ps1`, `collect.ps1`, `reset.ps1` run on the VM only (never on
+  this PC: they install and lock a service).
 - `fixtures/server/`: real server responses, captured by `node tools/capture-fixtures.mjs` (needs ~/eguard's dev DB
   and a dev server; it deletes its test family afterwards). `fixtures/canonical-vectors.json`: made by
   `node tools/canonical-vectors.mjs`. Never hand-edit either.
@@ -57,6 +64,8 @@ node tools/dev-family.mjs remove [now] | keep                     # the device p
 target\debug\eguard-service scan --catalog fixtures/server/catalog.json --verbose   # dry-run scan of this PC
 target\debug\eguard-service run --sandbox %TEMP%\eguard-sandbox   # console mode; ends programs only in the sandbox
 target\debug\eguard-service web                                   # the browser policies in place (reads only)
+powershell -File installer\build.ps1 -Bin target\debug            # build target\eguard.msi (never install it here)
+powershell -File tools\vm\bundle.ps1                              # target\eguard-vm.zip for the VM
 target\debug\eguard-agent preview block|overlay|warning          # look at a screen with sample words
 target\debug\eguard-agent pair CODE --accounts corew              # pair; on this PC name corew (an administrator)
 target\debug\eguard-agent accounts [--set NAME,NAME]              # which Windows accounts are the child's

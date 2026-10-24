@@ -18,6 +18,17 @@ impl Store {
         Ok(Self { dir: dir.to_owned() })
     }
 
+    /// The folder as it is, created or changed in no way (the installer's check and `purge`, which only read it or
+    /// take it out).
+    pub fn at(dir: &Path) -> Self {
+        Self { dir: dir.to_owned() }
+    }
+
+    /// Whether `secrets.bin` is there, readable or not.
+    pub fn has_secrets(&self) -> bool {
+        self.secrets_path().exists()
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
