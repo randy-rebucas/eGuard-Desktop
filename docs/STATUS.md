@@ -24,13 +24,13 @@ All twelve open decisions were answered, each as recommended:
 |---|---|
 | Offline code removal: the server finishes a removal that waited 7 days with no check-in since it was asked | **Done in `~/eguard`** (`finishQuietRemovals` in `family-service.ts`, run by the maintenance cron; "Device removed" says why) |
 | The 10-minute rule (remove after 10 min of failed acknowledgements): keep | Nothing to change |
-| Logs removed too on removal | **Not done.** Spec section 10 already says it (`~/eguard`); the agent still keeps `ProgramData\eGuard\logs`. Two attempts in this session were stopped, so it's left for the owner or a later session |
+| Logs removed too on removal | **Not done; open.** Two attempts in this session were stopped. Spec section 10 now says what's true: the log folders are left behind (no secrets), and removing them is open |
 | Q1: test 8 split (child: fails and alerts; admin: alerts) | **Done** (spec 14, open questions) |
 | BROWSERS apps PENDING while web filtering is on (server) | **Done in `~/eguard`** (`events/route.ts`: `webFilterOn`, `APP_INSTALLED` and `APPS_FOUND`) |
 | `APP_REQUESTED` `ids`/`source`/`category` (wire) | **Done** both sides: server stores them; the agent sends them for an unlisted app ended earlier (`Enforcer::unlisted`, `AppMatch.source`) |
 | `TAMPER` `SERVICE_RESTARTED` | **Done** both sides: server kind (Attention); the service keeps a `running` marker with the boot id and sends it when it starts again in the same boot without having stopped cleanly |
 | Spec updates (sections 8–14, Q1/Q7/Q8/Q9 settled) | **Done in `~/eguard`** (`docs/desktop-agent-spec.md`, `desktop-agent-open-questions.md`, `mobile-api.md`). The owner should read the Q8 end-of-life wording in section 10 |
-| Q9: end a program in exclusive fullscreen when the overlay is due | **Not built.** Spec 8 says so; an attempt in this session was stopped. Today apps on the child's list are ended at those times anyway, and the 15 s lock is the fallback for anything else |
+| Q9: end a program in exclusive fullscreen when the overlay is due | **Not built; open.** An attempt in this session was stopped. Spec 8 and the open questions now say what's true: apps on the child's list are ended at those times, and the 15 s lock covers anything else |
 | Q7: self-update, as designed | Settled in spec 10; **not built** (a phase of its own; needs the certificate for real use) |
 | Q8: support removal + end-of-life plan | Settled in spec 10; **not built** (a phase of its own) |
 | The extension reads `deviceLink` (and `privateWindows: "off"`) | **Done.** Agent: writes `privateWindows` = `off` beside `deviceLink` for Chrome and Edge (`web::PRIVATE_WINDOWS_VALUE`; Firefox keeps private windows, with the extension running in them). `~/eguard-browser`, **NOT committed**: `public/managed-schema.json` and the manifest's `storage.managed_schema` (Chrome, Edge), `background/managed.ts` (reads `chrome.storage.managed`), `deviceLink` sent on `/pair` (`PairRequest` in `packages/schemas`), and the private-windows check passes as "Private windows turned off" when the policy says so. Checks there: 180 tests (5 new), `tsc -b`, eslint clean; a build into a scratch folder has the schema in the Chrome and Edge manifests and not Firefox's |
@@ -666,7 +666,8 @@ From `~/eguard/docs/desktop-agent-open-questions.md`. Q2, Q4 and Q5 are settled 
 | Q4 Waking for removal | Computers always get `nextSyncSeconds: 60`. Later, if load matters: a long-poll endpoint | **Settled and built** 2026-10-23 (server, uncommitted) |
 | Q5 Guessing the code | 5 wrong codes lock input for 15 min, doubling each lockout, capped at 24 h, persisted; each lockout sends `REMOVAL_CODE_GUESSED` | **Settled and built** 2026-10-23; the screen comes in Phase 6 |
 | Q6 Offline clock | **Built** (`clock`), and now fed by the service: samples from `GetTickCount64` + BootId every tick (≤ 60 s), persisted with the state. Stated limit: a forward jump while offline across a reboot can end bedtime early or start a new day until the PC is back online | Done |
-| Q1, Q7, Q8, Q9 | Not decided here; they need the owner (admin-account test 8, self-update design, end-of-life recovery, exclusive fullscreen) | Open |
+| Q1, Q7, Q8 | Settled 2026-10-24 (spec 14, 10); Q7 and Q8 not built | Settled |
+| Q9 | Approved 2026-10-24, not built; spec 8 says what holds today | Open |
 
 ## The VM test kit (2026-10-24)
 
