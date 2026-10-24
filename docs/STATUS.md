@@ -33,7 +33,7 @@ All twelve open decisions were answered, each as recommended:
 | Q9: end a program in exclusive fullscreen when the overlay is due | **Not built.** Spec 8 says so; an attempt in this session was stopped. Today apps on the child's list are ended at those times anyway, and the 15 s lock is the fallback for anything else |
 | Q7: self-update, as designed | Settled in spec 10; **not built** (a phase of its own; needs the certificate for real use) |
 | Q8: support removal + end-of-life plan | Settled in spec 10; **not built** (a phase of its own) |
-| The extension reads `deviceLink` (and `privateWindows: "off"`) | **Not done yet** (`~/eguard-browser`) |
+| The extension reads `deviceLink` (and `privateWindows: "off"`) | **Done.** Agent: writes `privateWindows` = `off` beside `deviceLink` for Chrome and Edge (`web::PRIVATE_WINDOWS_VALUE`; Firefox keeps private windows, with the extension running in them). `~/eguard-browser`, **NOT committed**: `public/managed-schema.json` and the manifest's `storage.managed_schema` (Chrome, Edge), `background/managed.ts` (reads `chrome.storage.managed`), `deviceLink` sent on `/pair` (`PairRequest` in `packages/schemas`), and the private-windows check passes as "Private windows turned off" when the policy says so. Checks there: 180 tests (5 new), `tsc -b`, eslint clean; a build into a scratch folder has the schema in the Chrome and Edge manifests and not Firefox's |
 
 **`~/eguard`: changed, NOT committed** (the owner had committed everything before; review and commit):
 `src/app/api/device/v1/events/route.ts`, `src/lib/family-service.ts`, `src/lib/maintenance.ts`,

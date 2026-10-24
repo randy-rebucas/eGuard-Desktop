@@ -23,6 +23,12 @@ pub const CHROME_UPDATE_URL: &str = "https://clients2.google.com/service/update2
 pub const EDGE_UPDATE_URL: &str = "https://edge.microsoft.com/extensionwebstorebase/v1/crx";
 /// The managed-policy value the extension reads the link from (`chrome.storage.managed`, browser-extension-api.md).
 pub const LINK_VALUE: &str = "deviceLink";
+/// The managed-policy value that tells the extension private windows are off by policy (Chrome and Edge, where eGuard
+/// turns `Incognito` and `InPrivate` off), so it doesn't ask for "Allow in Incognito", which can't matter there. Only an
+/// administrator or SYSTEM can write managed policy, so the extension can trust it.
+pub const PRIVATE_WINDOWS_VALUE: &str = "privateWindows";
+/// `PRIVATE_WINDOWS_VALUE`'s value.
+pub const PRIVATE_WINDOWS_OFF: &str = "off";
 
 // A release that set up no extension would report web filtering as not applied forever, on every computer
 #[cfg(not(debug_assertions))]

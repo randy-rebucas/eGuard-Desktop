@@ -12,7 +12,7 @@
 //! reads, so a developer's own browsers are never touched.
 
 use crate::registry::{Key, Root, View};
-use eguard_core::web::{self, Browser, Extension, LINK_VALUE};
+use eguard_core::web::{self, Browser, Extension, LINK_VALUE, PRIVATE_WINDOWS_OFF, PRIVATE_WINDOWS_VALUE};
 use std::io;
 
 /// Where a set of browser policies is written.
@@ -140,6 +140,14 @@ pub fn apply(place: &Place, b: Browser, ext: &Extension, link: Option<&str>) -> 
             changed = true;
         }
     }
+    // Chrome and Edge: private windows are off by the settings above; the extension is told so
+    if matches!(b, Browser::Chrome | Browser::Edge) {
+        let k = place.create(&link_key(b, ext.id))?;
+        if k.string(PRIVATE_WINDOWS_VALUE).as_deref() != Some(PRIVATE_WINDOWS_OFF) {
+            k.set_string(PRIVATE_WINDOWS_VALUE, PRIVATE_WINDOWS_OFF)?;
+            changed = true;
+        }
+    }
     match link {
         Some(v) => {
             let k = place.create(&link_key(b, ext.id))?;
@@ -262,6 +270,9 @@ mod tests {
         assert_eq!(strings.len(), 2);
         assert_eq!(strings["2"], format!("{};{CHROME_UPDATE_URL}", CHROME.id));
         assert_eq!(p.open(r"Google\Chrome").unwrap().dword("IncognitoModeAvailability"), Some(1));
+        let managed = p.open(&link_key(Browser::Chrome, CHROME.id)).unwrap();
+        assert_eq!(managed.string(PRIVATE_WINDOWS_VALUE).as_deref(), Some(PRIVATE_WINDOWS_OFF));
+        drop(managed);
         // Nothing to do the second time
         assert!(!apply(p, Browser::Chrome, &CHROME, Some("dev.1795000000000.sig")).unwrap());
         // No link (a removal waits): the value goes, the forcing stays
@@ -297,6 +308,10 @@ mod tests {
         assert_eq!(status(p, Browser::Firefox, &FIREFOX), Status { forced: true, settings: true, link: Some("x.1.y".into()) });
         assert_eq!(p.open(r"Microsoft\Edge").unwrap().dword("InPrivateModeAvailability"), Some(1));
         assert!(p.open(&format!(r"Mozilla\Firefox\3rdparty\Extensions\{FIREFOX_ID}")).is_some());
+        // Firefox keeps private windows (the extension runs in them), so it isn't told they're off
+        let ff = p.open(&link_key(Browser::Firefox, FIREFOX.id)).unwrap();
+        assert_eq!(ff.string(PRIVATE_WINDOWS_VALUE), None);
+        drop(ff);
 
         remove(p, Browser::Edge, &edge).unwrap();
         remove(p, Browser::Firefox, &FIREFOX).unwrap();
