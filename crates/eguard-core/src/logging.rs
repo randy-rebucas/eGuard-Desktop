@@ -10,7 +10,8 @@
 //!   device token and the removal secret are such runs; nothing eGuard logs on purpose is (device ids are 25, catalog
 //!   versions 16, Windows SIDs are kept as they are).
 //!
-//! The platform adds the crash handler, which writes its last line through `error` (`eguard-win::crash`).
+//! The platform adds the crash handler (`eguard-win::crash`), which writes its last line through `last_words`;
+//! `panic_report` is what it says for a panic.
 
 use serde::Serialize;
 use std::borrow::Cow;
@@ -194,14 +195,14 @@ pub fn write(level: Level, msg: &str) {
 }
 
 /// The last line before the process ends (the crash handler). Never waits: if another thread holds the file (it may
-/// be the one that crashed), the line goes straight to the file through a handle of its own, uncut.
+/// be the one that crashed), the line goes straight to the file through a handle of its own, uncut. Also printed to
+/// stderr as text, so a command run by hand (`eguard-agent pair`, before any log) still says why it ended.
 pub fn last_words(msg: &str) {
+    let now = jiff::Timestamp::now();
+    eprintln!("{} {} {}", now.round(jiff::Unit::Second).unwrap_or(now), Level::Error.name(), scrub(msg));
     let Some(log) = LOGGER.get() else { return };
     let current = std::thread::current();
-    let line = json_line(jiff::Timestamp::now(), Level::Error, log.component, std::process::id(), current.name(), msg);
-    if log.console {
-        eprint!("{line}");
-    }
+    let line = json_line(now, Level::Error, log.component, std::process::id(), current.name(), msg);
     let Some(file) = &log.file else { return };
     match file.try_lock() {
         Ok(mut f) => f.write_line(&line),
@@ -214,6 +215,22 @@ pub fn last_words(msg: &str) {
             }
         }
     }
+}
+
+/// What a panic says, as `panic!` was given it (a `&str` or a `String`; anything else has no words).
+pub fn panic_payload(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload.downcast_ref::<&str>().copied().or_else(|| payload.downcast_ref::<String>().map(String::as_str)).unwrap_or("(no message)")
+}
+
+/// The crash handler's line for a panic: what it said, where, and the stack (scrubbed like any line when written).
+pub fn panic_report(info: &std::panic::PanicHookInfo<'_>, backtrace: &std::backtrace::Backtrace) -> String {
+    let at = info.location().map_or_else(String::new, |l| format!(" at {}:{}:{}", l.file(), l.line(), l.column()));
+    crash_report(panic_payload(info.payload()), &at, &backtrace.to_string())
+}
+
+fn crash_report(what: &str, at: &str, backtrace: &str) -> String {
+    let backtrace = backtrace.trim_end();
+    if backtrace.is_empty() { format!("crashed: panic{at}: {what}") } else { format!("crashed: panic{at}: {what}\n{backtrace}") }
 }
 
 pub fn info(msg: &str) {
@@ -256,6 +273,18 @@ mod tests {
         // Shaped like a GUID but not hex, or one part too long: a secret as far as the log knows
         assert_eq!(scrub("63a3f36e-d86b-4dad-99af-792d1036e11z"), "[redacted]");
         assert_eq!(scrub("63a3f36e-d86b-4dad-99af-792d1036e1133"), "[redacted]");
+    }
+
+    #[test]
+    fn a_panic_says_what_and_where() {
+        let s: Box<dyn std::any::Any + Send> = Box::new("index out of range");
+        assert_eq!(panic_payload(s.as_ref()), "index out of range");
+        let s: Box<dyn std::any::Any + Send> = Box::new(String::from("bad state: 3"));
+        assert_eq!(panic_payload(s.as_ref()), "bad state: 3");
+        let s: Box<dyn std::any::Any + Send> = Box::new(42_u8);
+        assert_eq!(panic_payload(s.as_ref()), "(no message)");
+        assert_eq!(crash_report("boom", " at src/x.rs:1:2", ""), "crashed: panic at src/x.rs:1:2: boom");
+        assert_eq!(crash_report("boom", "", "   0: main\n"), "crashed: panic: boom\n   0: main");
     }
 
     #[test]

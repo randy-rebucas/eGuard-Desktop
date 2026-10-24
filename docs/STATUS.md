@@ -1,7 +1,7 @@
 # Status
 
-Updated 2026-10-24: Phase 6, part 1 (the removal flow and tamper reporting), below. Before it: Phase 5 (web),
-Phase 4, the owner's decisions, a full audit and its fixes.
+Updated 2026-10-24: Phase 7's crash handler, below. Before it: Phase 7's logs, Phase 6 part 1 (the removal flow
+and tamper reporting), Phase 5 (web), Phase 4, the owner's decisions, a full audit and its fixes.
 
 | Phase | What | Status |
 |---|---|---|
@@ -11,7 +11,7 @@ Phase 4, the owner's decisions, a full audit and its fixes.
 | 4 | Enforcement and time (spec 7, 8) | **Built and checked on this PC with stand-ins.** Tests 3–5 pass in console mode; the gate waits for the VM: test 6, everything as SYSTEM, real games (Q3) |
 | 5 | Web (spec 9) | **Built and checked on this PC** with a stand-in browser and an inert copy of the policies. The prompt gives no "Done when"; real browsers wait for the VM and for the extension's store ids, and 6 items wait for the owner (below) |
 | 6 | Removal protection and tamper (spec 10, 11) | **Part 1 built and checked on this PC** (the removal flow, "Remove with a code", tamper reporting, `ADMIN_ACCOUNT`). Part 2 (installer, service lock, guard, Safe Mode registration) waits for the VM and two decisions (below) |
-| 7 | Hardening and release readiness | **Started:** structured, rotated, scrubbed logs (below). Not built: a crash handler, the signed self-update (Q7, the owner's design), signing (the certificate), the end-to-end VM run |
+| 7 | Hardening and release readiness | **Started:** structured, rotated, scrubbed logs and a crash handler (below). Not built: the signed self-update (Q7, the owner's design), signing (the certificate), the end-to-end VM run |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
 
@@ -26,8 +26,28 @@ Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md
   giving up on a silent service, errors.
 - Checked: 3 new tests (scrubbing incl. the fixture token's shape, the JSON line, rotation and reopening); console
   mode for a few seconds wrote JSON lines that all parse. `tools/vm/collect.ps1` already takes the whole `logs` folder.
-- **Not built: a crash handler.** It wasn't finished in this session; the next one should pick it up (a panic hook
-  that logs through `logging::last_words` is the core of it).
+
+**The crash handler (2026-10-24):** `eguard-win` `crash::install()`, first thing in the service's and the agent's
+`main`. A panic writes "crashed: panic at file:line:col: what" plus the stack (`logging::panic_report`), an unhandled
+fault (an access violation in a Win32 call, a stack overflow) writes "crashed: exception 0xC0000005 at
+eguard-agent.exe+0x20A40" (`SetUnhandledExceptionFilter`), both through `last_words` (which now also prints to stderr,
+so a command run by hand says why it ended). Then the process ends at once with `TerminateProcess`: 101 after a panic,
+the exception code after a fault.
+- **Why it ends the process:** a debug build unwinds, so a panic ended only its thread, and a dead monitor thread is a
+  service that looks fine but ends nothing. Now the SCM restarts a failed service (restart 5 s, failure flag on) and
+  the service starts a new agent, both from the last saved state. The service treats the agent's 101 like any other
+  non-zero exit: `AGENT_RESTARTED` (a crash looks like a kill from outside; failing closed).
+- **No crash dump:** `TerminateProcess` ends it before Windows Error Reporting sees it, and `SetErrorMode` turns off
+  the "has stopped working" box. A dump of the service would hold the device token and the removal secret (the
+  prompt: never in crash dumps). The stack in the log goes through `scrub` like any line (it turns the rustc commit
+  hash in std's paths into `[redacted]`, which is harmless).
+- `eguard-agent crash panic|fault`: crashes on purpose to check the handler (refused in a release build without
+  `EGUARD_DEV_RELEASE`). VM test A5 checks the SCM restart, the last line and that no dump is made.
+- Checked: `cargo test --workspace` 219 passed, 1 ignored (core 164 + 14 fixture, win 35, service 6); clippy and fmt
+  clean. Debug and release (`panic = "abort"`) builds: `crash panic` → exit 101, the line and a stack with function
+  names in `agent.log` (release resolves them from the PDB beside the exe); `crash fault` → exit 0xC0000005,
+  "exception 0xC0000005 at eguard-agent.exe+0x…". Not checked: a stack overflow (Rust's own handler prints its line
+  first, then ours runs with what's left of the stack) and the service under the SCM (VM).
 
 ## Phase 6, part 1: what was built (2026-10-24)
 

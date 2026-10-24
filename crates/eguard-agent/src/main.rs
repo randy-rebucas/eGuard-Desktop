@@ -286,6 +286,23 @@ fn remove(args: &[String]) -> Result<(), String> {
 }
 
 /// Shows one screen with sample words, to check how it looks.
+/// Crashes on purpose, to check the crash handler's last line in `agent.log` (development builds only).
+fn crash(args: &[String]) -> Result<(), String> {
+    if !eguard_core::keys::is_dev_build() {
+        return Err("crash is only for development builds".into());
+    }
+    let log = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("eGuard").join("logs").join("agent.log"));
+    logging::init("agent", log.as_deref(), false);
+    match args.first().map(String::as_str) {
+        Some("panic") => panic!("crashing on purpose (eguard-agent crash panic)"),
+        Some("fault") => {
+            eguard_win::crash::fault_for_testing();
+            Err("the fault didn't happen".into())
+        }
+        _ => Err("usage: eguard-agent crash panic|fault".into()),
+    }
+}
+
 fn preview(args: &[String]) -> Result<(), String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let ui = Ui::start(true, tx).map_err(|e| e.to_string())?;
@@ -338,6 +355,7 @@ fn preview(args: &[String]) -> Result<(), String> {
 }
 
 fn main() {
+    eguard_win::crash::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("session") => session(&args[1..]),
@@ -347,6 +365,7 @@ fn main() {
         Some("scan") => scan(),
         Some("preview") => preview(&args[1..]),
         Some("remove") => remove(&args[1..]),
+        Some("crash") => crash(&args[1..]),
         Some(_) => Err(
             "usage: eguard-agent session [--dev] | pair [CODE] [--name NAME] [--accounts NAME,NAME] | accounts [--set NAME,NAME] | status | scan | remove [CODE] [--dev] | preview [block|overlay|warning]"
                 .into(),

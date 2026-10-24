@@ -26,7 +26,7 @@ on the owner, gotchas).
   entries go into browser policies others may share). `#![forbid(unsafe_code)]` in its lib.rs.
 - `crates/eguard-win`: `windows-sys` 0.61 (the same version `windows-service` uses). `WinHTTP`, DPAPI, atomic files,
   named pipe + DACL, clocks, device details, app scan sources (`apps`), Authenticode (embedded and catalog), change
-  notifications, processes (`process`, `etw`), sessions (`session`: WTS), input (`input`), the agent's Win32 screens
+  notifications, the crash handler (`crash`: last line in the log, no dump), processes (`process`, `etw`), sessions (`session`: WTS), input (`input`), the agent's Win32 screens
   (`ui`), the overlay's app buttons (`launch`: switch to or start an always-allowed app), browser policies
   (`browsers`: HKLM for the service, an inert HKCU copy in console mode). The workspace denies `unsafe`; only this
   crate's FFI modules allow it.
@@ -61,6 +61,7 @@ target\debug\eguard-agent preview block|overlay|warning          # look at a scr
 target\debug\eguard-agent pair CODE --accounts corew              # pair; on this PC name corew (an administrator)
 target\debug\eguard-agent accounts [--set NAME,NAME]              # which Windows accounts are the child's
 target\debug\eguard-agent remove [CODE] --dev                     # "Remove with a code" (a window without CODE)
+target\debug\eguard-agent crash panic|fault                        # crash on purpose: last line in agent.log
 ```
 
 ## Conventions

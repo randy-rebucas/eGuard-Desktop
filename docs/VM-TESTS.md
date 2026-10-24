@@ -66,6 +66,13 @@ Mark each **pass**, **fail** (with what happened) or **couldn't** (why) in the r
    recent.
 4. As `mia`: `eguard-agent status` → "This account isn't allowed to talk to eGuard's service." (the admin pipe is
    for SYSTEM and administrators).
+5. Crashes (Phase 7). As `parent`: `taskkill /F /IM eguard-service.exe` → the SCM starts it again within ~5 s
+   (`sc query eGuard` RUNNING, `eguard-agent status` answers). As `mia`: `& "C:\Program Files\eGuard\eguard-agent.exe"
+   crash panic`, then `crash fault` (a dev build only) → exit codes 101 and `-1073741819` (0xC0000005), and
+   `%LOCALAPPDATA%\eGuard\logs\agent.log` ends with "crashed: panic at …" and "crashed: exception 0xC0000005 at
+   eguard-agent.exe+0x…". No "has stopped working" box, no Application Error (event 1000) in the Application log, and
+   nothing new under `C:\ProgramData\Microsoft\Windows\WER` (no dump: the process ends before Windows Error
+   Reporting sees it).
 
 ### B. Scanning as SYSTEM (Phase 3, acceptance test 2)
 
@@ -165,6 +172,7 @@ Copy this table into STATUS.md with the outcome of each, and keep the zips from 
 | A2 service config, data folder ACL | | |
 | A3 restart, DPAPI as SYSTEM | | |
 | A4 child refused on the admin pipe | | |
+| A5 crashes: SCM restart, last line, no dump | | |
 | B2 test 2 (found apps, one alert) | | |
 | B3 scan sees `mia`'s games | | |
 | C2 test 3 | | |
