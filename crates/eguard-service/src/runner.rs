@@ -284,6 +284,14 @@ impl Runner {
             if inner.engine.on_start(clock::sample()) {
                 self.save(&mut inner);
             }
+            // Ended without being asked to in this same boot (killed, or crashed): the parent hears (spec section 10)
+            if self.mode == Mode::Service && self.store.mark_running(clock::boot_id()) == Some(clock::boot_id()) {
+                log::warn("eGuard's service ended without being asked to and was started again");
+                let now = inner.engine.now_ms(clock::sample());
+                if inner.engine.tamper(TamperKind::ServiceRestarted, now) {
+                    self.save(&mut inner);
+                }
+            }
             // Safe Mode is a way around eGuard (spec section 10); the parent hears of it when the computer is back
             // online
             if eguard_win::sysinfo::safe_mode() {
@@ -342,6 +350,7 @@ impl Runner {
         }
         let mut inner = self.lock();
         self.save(&mut inner);
+        self.store.clear_running();
         log::info("stopped");
         Ok(())
     }

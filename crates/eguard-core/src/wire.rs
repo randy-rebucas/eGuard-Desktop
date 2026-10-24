@@ -640,6 +640,8 @@ pub enum TamperKind {
     RemovalCodeGuessed,
     /// A Windows account appeared that the child's rules don't apply in (spec section 4).
     NewAccount,
+    /// The service ended without being asked to (killed, or crashed) and was started again (spec section 10).
+    ServiceRestarted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -679,6 +681,13 @@ pub enum DeviceEvent {
     },
     AppRequested {
         app: String,
+        /// Computers: what eGuard knows of an app the parent hasn't listed (spec section 12).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ids: Vec<AppId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<AppSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<Category>,
     },
     LimitReached {
         minutes: u32,

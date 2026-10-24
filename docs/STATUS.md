@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-10-24: Phase 6 part 2 (the installer and what holds eGuard in place), built and waiting for the VM,
+Updated 2026-10-24: the owner's decisions after Phase 6 part 2 (below). Before it: Phase 6 part 2 (the installer and what holds eGuard in place), built and waiting for the VM,
 below. Before it: Phase 7's crash handler and logs, Phase 6 part 1 (the removal flow and tamper reporting), Phase 5
 (web), Phase 4, the owner's decisions, a full audit and its fixes.
 
@@ -15,6 +15,35 @@ below. Before it: Phase 7's crash handler and logs, Phase 6 part 1 (the removal 
 | 7 | Hardening and release readiness | **Started:** structured, rotated, scrubbed logs and a crash handler (below). Not built: the signed self-update (Q7, the owner's design), signing (the certificate), the end-to-end VM run |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## The owner's decisions (2026-10-24, after Phase 6 part 2)
+
+All twelve open decisions were answered, each as recommended:
+
+| Decision | State |
+|---|---|
+| Offline code removal: the server finishes a removal that waited 7 days with no check-in since it was asked | **Done in `~/eguard`** (`finishQuietRemovals` in `family-service.ts`, run by the maintenance cron; "Device removed" says why) |
+| The 10-minute rule (remove after 10 min of failed acknowledgements): keep | Nothing to change |
+| Logs removed too on removal | **Not done.** Spec section 10 already says it (`~/eguard`); the agent still keeps `ProgramData\eGuard\logs`. Two attempts in this session were stopped, so it's left for the owner or a later session |
+| Q1: test 8 split (child: fails and alerts; admin: alerts) | **Done** (spec 14, open questions) |
+| BROWSERS apps PENDING while web filtering is on (server) | **Done in `~/eguard`** (`events/route.ts`: `webFilterOn`, `APP_INSTALLED` and `APPS_FOUND`) |
+| `APP_REQUESTED` `ids`/`source`/`category` (wire) | **Done** both sides: server stores them; the agent sends them for an unlisted app ended earlier (`Enforcer::unlisted`, `AppMatch.source`) |
+| `TAMPER` `SERVICE_RESTARTED` | **Done** both sides: server kind (Attention); the service keeps a `running` marker with the boot id and sends it when it starts again in the same boot without having stopped cleanly |
+| Spec updates (sections 8–14, Q1/Q7/Q8/Q9 settled) | **Done in `~/eguard`** (`docs/desktop-agent-spec.md`, `desktop-agent-open-questions.md`, `mobile-api.md`). The owner should read the Q8 end-of-life wording in section 10 |
+| Q9: end a program in exclusive fullscreen when the overlay is due | **Not built.** Spec 8 says so; an attempt in this session was stopped. Today apps on the child's list are ended at those times anyway, and the 15 s lock is the fallback for anything else |
+| Q7: self-update, as designed | Settled in spec 10; **not built** (a phase of its own; needs the certificate for real use) |
+| Q8: support removal + end-of-life plan | Settled in spec 10; **not built** (a phase of its own) |
+| The extension reads `deviceLink` (and `privateWindows: "off"`) | **Not done yet** (`~/eguard-browser`) |
+
+**`~/eguard`: changed, NOT committed** (the owner had committed everything before; review and commit):
+`src/app/api/device/v1/events/route.ts`, `src/lib/family-service.ts`, `src/lib/maintenance.ts`,
+`tests/api/desktop-agent.test.ts` (4 new tests), `docs/desktop-agent-spec.md`, `docs/desktop-agent-open-questions.md`,
+`docs/mobile-api.md`. Checks: `tsc` and eslint clean; `desktop-agent.test.ts` 32 of 33 pass, all new ones included.
+The failing one ("a browser paired with it … takes no device slot", `expected 201 to be 409`) is the one STATUS
+recorded earlier from the owner's browser-pairing work. A run with these changes stashed couldn't confirm it either
+way: repeated runs had used up the pairing rate limit (20 per IP per 15 min) and 10 tests failed on that alone.
+
+**This repo:** `cargo test --workspace` 226 passed, 1 ignored; clippy and fmt clean.
 
 ## Phase 6, part 2: what was built (2026-10-24)
 

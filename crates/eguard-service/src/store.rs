@@ -24,6 +24,23 @@ impl Store {
         Self { dir: dir.to_owned() }
     }
 
+    /// Marks the service as running in boot `boot_id`. Returns the boot id the last run left, when it didn't end
+    /// cleanly (`clear_running`): the same boot means it was killed or crashed; another means the computer lost power
+    /// or restarted without stopping it, which isn't anyone's doing.
+    pub fn mark_running(&self, boot_id: u64) -> Option<u64> {
+        let path = self.dir.join("running");
+        let left = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok());
+        if let Err(e) = files::write_atomic(&path, boot_id.to_string().as_bytes()) {
+            log::warn(&format!("couldn't write {}: {e}", path.display()));
+        }
+        left
+    }
+
+    /// The service is stopping as asked (or Windows is shutting down): the next start isn't a restart.
+    pub fn clear_running(&self) {
+        let _ = std::fs::remove_file(self.dir.join("running"));
+    }
+
     /// Whether `secrets.bin` is there, readable or not.
     pub fn has_secrets(&self) -> bool {
         self.secrets_path().exists()

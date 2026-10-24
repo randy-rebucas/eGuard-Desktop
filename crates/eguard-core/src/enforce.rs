@@ -124,6 +124,8 @@ pub struct AppMatch {
     pub name: String,
     pub ids: Vec<AppId>,
     pub category: Category,
+    /// How the scan or the catalog knows it (for "Ask parent" on an app the parent hasn't seen).
+    pub source: Option<AppSource>,
     /// The parent's rule for it, when it's on the child's list.
     pub rule: Option<AppRule>,
 }
@@ -342,11 +344,18 @@ fn untrusted(c: &Candidate, category: Option<Category>) -> Option<FoundApp> {
 /// `found` as the app on the list `rule` is, or as an app not on the list yet.
 fn app_match(found: &FoundApp, rule: Option<&AppRule>) -> Resolved {
     Resolved::App(match rule {
-        Some(r) => AppMatch { name: r.name.clone(), ids: found.ids.clone(), category: r.category.effective(), rule: Some(r.clone()) },
+        Some(r) => AppMatch {
+            name: r.name.clone(),
+            ids: found.ids.clone(),
+            category: r.category.effective(),
+            source: found.source,
+            rule: Some(r.clone()),
+        },
         None => AppMatch {
             name: found.app.clone(),
             ids: found.ids.clone(),
             category: found.category.unwrap_or(Category::Other).effective(),
+            source: found.source,
             rule: None,
         },
     })
@@ -534,7 +543,12 @@ pub struct Enforcer {
     /// Which app each running program is, by path, while the inputs and the program's facts stay the same (the
     /// sweep checks every process every second).
     resolved: HashMap<String, (Program, Resolved)>,
+    /// Unlisted apps ended lately, by name, with what eGuard knows of them: "Ask parent" sends it along.
+    unlisted: HashMap<String, FoundApp>,
 }
+
+/// At most this many unlisted apps are remembered for "Ask parent" (the oldest set is dropped past it).
+const UNLISTED_KEEP: usize = 200;
 
 fn category_label(c: Category) -> &'static str {
     match c.effective() {
@@ -736,6 +750,15 @@ impl Enforcer {
         match rules::evaluate(&self.inputs.rules, app.subject(), today, &at, now) {
             Verdict::Allow { .. } => Decision::Allow,
             Verdict::Block(block) => {
+                if will_end && app.rule.is_none() {
+                    if self.unlisted.len() >= UNLISTED_KEEP && !self.unlisted.contains_key(&app.name) {
+                        self.unlisted.clear();
+                    }
+                    self.unlisted.insert(
+                        app.name.clone(),
+                        FoundApp { app: app.name.clone(), ids: app.ids.clone(), source: app.source, category: Some(app.category) },
+                    );
+                }
                 if will_end && block == Block::Blocked && self.blocked_sent.get(&app.name).is_none_or(|t| now - t >= BLOCKED_EVENT_EVERY_MS)
                 {
                     self.blocked_sent.insert(app.name.clone(), now);
@@ -904,9 +927,17 @@ impl Enforcer {
                 if n.block.is_time() {
                     return Err(gone());
                 }
+                // An app the parent hasn't listed goes with what eGuard knows of it, so the parent sees a browser as a
+                // browser (spec section 12)
+                let known = self.unlisted.get(&n.app);
                 (
                     format!("app|{}", n.app),
-                    DeviceEvent::AppRequested { app: n.app.clone() },
+                    DeviceEvent::AppRequested {
+                        app: n.app.clone(),
+                        ids: known.map(|k| k.ids.clone()).unwrap_or_default(),
+                        source: known.and_then(|k| k.source),
+                        category: known.and_then(|k| k.category),
+                    },
                     format!("Asked. {} opens once your parent allows it.", n.app),
                 )
             }
@@ -1369,7 +1400,10 @@ mod tests {
             "Asked. Counter-Strike 2 opens once your parent allows it."
         );
         assert_eq!(e.ask(1, Ask::Parent { notice: screen.id }, at(9)).unwrap(), "You already asked. Your parent has been told.");
-        assert_eq!(e.take_events(), vec![DeviceEvent::AppRequested { app: "Counter-Strike 2".into() }]);
+        assert_eq!(
+            e.take_events(),
+            vec![DeviceEvent::AppRequested { app: "Counter-Strike 2".into(), ids: vec![], source: None, category: None }]
+        );
         assert_eq!(
             e.heartbeat(1, Seen::Ours, 0, at(10)).block.unwrap().asked.as_deref(),
             Some("You already asked. Your parent has been told.")
@@ -1413,6 +1447,14 @@ mod tests {
         e.update(inputs(r.clone()));
         assert_eq!(e.check(&opera, at(0)), Decision::End { app: "Opera GX".into(), block: Block::Browser });
         assert_eq!(e.check(&tor, at(0)), Decision::End { app: "Opera GX".into(), block: Block::Browser });
+        // "Ask parent" on it says what it is, so the parent sees a browser (not OTHER)
+        e.ended(1, "Opera GX", Block::Browser, at(0));
+        let id = e.heartbeat(1, Seen::Ours, 0, at(1)).block.unwrap().id;
+        e.take_events();
+        e.ask(1, Ask::Parent { notice: id }, at(1)).unwrap();
+        let [DeviceEvent::AppRequested { app, ids, source, category }] = &e.take_events()[..] else { panic!() };
+        assert_eq!((app.as_str(), *category, *source), ("Opera GX", Some(Category::Browsers), Some(AppSource::UnknownPublisher)));
+        assert_eq!(ids.first().map(|i| i.kind), Some(AppIdKind::Exe));
         // Chrome is the extension's: never ended
         assert_eq!(e.resolve(&chrome), Resolved::Exempt(Exempt::Trusted));
         // The parent's answer decides once it's on the list
