@@ -207,6 +207,52 @@ dashboard must get the alert (one per kind per hour: wait an hour between `mia` 
 7. Write down for each whether the child (standard) and the administrator were stopped. An administrator can always
    win in the end (spec section 10, Q1): what counts is that each try is refused or undone, and alerts.
 
+### G. Self-update (Phase 7, Q7)
+
+Installed from the 0.1.0 bundle and paired (A), `mia` signed in. eGuard's real certificate doesn't exist yet, so a
+development build accepts files signed by **"eGuard Dev"**: `tools\update-release.ps1` makes that certificate on the
+VM and trusts it there (**VM only**: it adds a root certificate). The files are served from the VM itself
+(`http://localhost:8099`, which a development build may download from); the manifest comes from the dev server.
+
+On this PC: `powershell -File tools\vm\bundle.ps1 -Version 0.1.1` → `target\eguard-vm-0.1.1.zip`. Copy it to the VM and
+unzip it to `C:\eguard-next`. Watch `C:\ProgramData\eGuard\logs\service.log` and `guard.log` throughout (as `parent`,
+`Get-Content -Wait`).
+
+1. **An update.** As `parent`, elevated: `C:\eguard-vm\tools\update-release.ps1 -Bin C:\eguard-next\bin -Version 0.1.1`
+   and leave it running. Put the two lines it prints in `~/eguard/.env.local` on this PC. Within about two minutes
+   (the next sync sees `minAppVersion`):
+   - `service.log`: "eGuard needs version 0.1.1 …", "eGuard 0.1.1 is available", "downloading eGuard 0.1.1", "… is in
+     the guard's cache; stopping so the guard can put it in place"; the server window shows three `200` lines.
+   - `guard.log`: "eGuard 0.1.1 is in place of 0.1.0; starting it", then (after the new service's first sync) "eGuard
+     0.1.1 works; the previous version 0.1.0 is gone. This guard ends for the new one"; within a minute a new guard
+     logs "eguard-guard 0.1.1 watching …".
+   - `service.log`: "eGuard 0.1.1 for …", "eGuard 0.1.1 synced and saved its state; the guard keeps it".
+   - `mia`'s screens close and come back (a new agent). Write down how long the computer was without its service (the
+     gap between "stopping" and "eGuard 0.1.1 for").
+   - Settings › Apps shows eGuard 0.1.1; `node tools/dev-family.mjs show` shows appVersion 0.1.1; **no** alerts
+     ("files were changed", "stopped and started again", "app restarted").
+   - `C:\ProgramData\eGuard\cache` has the three programs (0.1.0's sizes differ) and no `previous`, `update.json` or
+     `update-health.json`; `C:\Program Files\eGuard` has no `*.old-*` left once the new guard has started.
+2. **Refused files.** Stop the server window (Ctrl+C). `update-release.ps1 -Bin C:\eguard-next\bin -Version 0.1.2
+   -NoSign`, and its two lines in `.env.local`: `service.log` says "the update failed: eguard-service.exe carries no
+   valid signature; this version carries on", three times a few minutes apart, then not again for 6 hours. Nothing
+   in Program Files or the cache changes. Then the same signed, but before the agent asks, change one byte of
+   `C:\eguard-release\0.1.2\eguard-agent.exe` (e.g. append a byte): "… SHA-256 doesn't match the manifest".
+3. **A rollback.** Revert the VM to the snapshot taken after G1 (or restart the service so its tries start over:
+   `Restart-Computer`). `update-release.ps1 -Bin C:\eguard-next\bin -Version 0.1.2 -Broken` (its
+   `eguard-service.exe` is really the agent, so the new version never starts), and its lines in `.env.local`. Expected:
+   the swap as in G1, then `guard.log` "eGuard's service has stopped and couldn't be started" every 10 s, and after
+   10 minutes "eGuard 0.1.2: it didn't sync and save its state within 10 minutes; putting 0.1.1 back", "eGuard 0.1.1
+   is back in place and started". `service.log` (0.1.1): "the update to eGuard 0.1.2 was rolled back (…); it won't
+   be tried again", and no further download of 0.1.2. No "stopped and started again" alert.
+4. **A swap that has to end the service.** Not reachable by hand without a debugger; skip unless G1 showed the
+   service taking more than 2 minutes to stop (then `guard.log` says "ended eGuard's service … for the update").
+5. **Removal after an update.** After G1 (0.1.1 running, while the package's own records still say 0.1.0): E3's
+   removal from the dashboard leaves nothing behind, as E3 lists, and `msiexec`'s log shows the 0.1.1 files removed.
+6. Bring back `collect.ps1 -Label update` after each of G1–G3 and G5, and the server window's lines.
+
+Afterwards take `DESKTOP_RELEASE` and `CHILD_MIN_APP_VERSION` out of `.env.local` on this PC.
+
 ## 4. Results
 
 Copy this table into STATUS.md with the outcome of each, and keep the zips from `collect.ps1`.
@@ -243,3 +289,7 @@ Copy this table into STATUS.md with the outcome of each, and keep the zips from 
 | F4 deleting the install folder; guard puts back | | |
 | F5 the guard's task | | |
 | F6 Safe Mode (minimal / network) | | |
+| G1 update 0.1.0 → 0.1.1 (gap without the service: … s) | | |
+| G2 unsigned / changed files refused | | |
+| G3 rollback of a version that never starts | | |
+| G5 removal after an update | | |

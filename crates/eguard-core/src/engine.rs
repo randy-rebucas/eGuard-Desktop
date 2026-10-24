@@ -1,5 +1,5 @@
 //! The service's work between pairing and removal, without the platform: pairing, the `/sync` loop, `/report`, the
-//! catalog, when to scan and what a scan sends, and the offline queue. The platform gives it a `Transport`, clock
+//! catalog, when to scan and what a scan sends, the offline queue, and when eGuard updates itself. The platform gives it a `Transport`, clock
 //! samples and the computer's details, runs the scans it asks for, and saves `Persisted` (and, at pairing, the
 //! secrets) when told something changed.
 //!
@@ -16,6 +16,7 @@ use crate::scan::{self, Classifier, ExeCache, ScanResult};
 use crate::signature::{CatalogUpdate, TrustedKeys, verify_catalog};
 use crate::state::{AgentState, AuthState, UNAUTHORIZED_SYNC_SECS};
 use crate::store::{DeviceSecrets, Persisted};
+use crate::update::{self, Manifest, Outcome};
 use crate::wire::{
     BrowserLink, Catalog, DeviceEvent, EventEnvelope, PairRequest, Platform, ReportRequest, SyncRequest, TamperKind, UsageReport,
 };
@@ -27,6 +28,11 @@ const SEND_ROUNDS: usize = 20;
 /// A full scan this often (spec section 5), and the catalog checked for changes as often.
 pub const SCAN_EVERY_MS: i64 = 6 * 60 * 60_000;
 const CATALOG_EVERY_MS: u64 = 6 * 60 * 60_000;
+/// eGuard asks for a newer version of itself this often, and at once when `/sync` `minAppVersion` is above this build.
+const UPDATE_EVERY_MS: u64 = 6 * 60 * 60_000;
+/// An update that failed this many times in a row (a download, a check, a copy) waits `UPDATE_EVERY_MS` before the
+/// next try, so a file that never checks out isn't downloaded every few minutes.
+const UPDATE_TRIES: u32 = 3;
 /// Scans asked for by a change (an install writes many keys) wait at least this long after the last.
 pub const SCAN_MIN_GAP_MS: i64 = 2 * 60_000;
 /// One `TAMPER` of each kind per this long: the server raises one alert per kind and hour anyway.
@@ -154,6 +160,16 @@ pub struct Engine {
     catalog: Option<Catalog>,
     next_catalog_mono_ms: u64,
     catalog_failures: u32,
+    next_update_mono_ms: u64,
+    update_failures: u32,
+    /// A verified newer version, for the platform to take (`take_update`).
+    update_offer: Option<Manifest>,
+    /// The platform is downloading or installing one.
+    update_busy: bool,
+    /// The `minAppVersion` that last made an update due at once, so the same one doesn't again every sync.
+    update_min_seen: Option<String>,
+    /// A `/sync` succeeded since the service started.
+    synced: bool,
     /// Something changed (an Uninstall key, a launcher's folder): scan again soon.
     scan_requested: bool,
     /// The child's accounts that are administrators, as last looked at (`observe_accounts`).
@@ -209,6 +225,12 @@ impl Engine {
             catalog,
             next_catalog_mono_ms: 0,
             catalog_failures: 0,
+            next_update_mono_ms: 0,
+            update_failures: 0,
+            update_offer: None,
+            update_busy: false,
+            update_min_seen: None,
+            synced: false,
             scan_requested: false,
             child_admins: Vec::new(),
             notes,
@@ -342,9 +364,14 @@ impl Engine {
         if s.mono_ms >= self.next_catalog_mono_ms {
             self.refresh_catalog(&token, s);
         }
+        let update_waits = self.update_busy || self.update_offer.is_some();
+        if !update_waits && s.mono_ms >= self.next_update_mono_ms {
+            self.refresh_update(&token, s, &info.app_version);
+        }
         self.send_due(&token, now_ms);
 
-        let until_sync = self.next_sync_mono_ms.min(self.next_catalog_mono_ms).saturating_sub(s.mono_ms);
+        let next_update = if update_waits { u64::MAX } else { self.next_update_mono_ms };
+        let until_sync = self.next_sync_mono_ms.min(self.next_catalog_mono_ms).min(next_update).saturating_sub(s.mono_ms);
         let until_send = self.data.queue.next_due_ms().map_or(u64::MAX, |t| t.saturating_sub(now_ms).max(0) as u64);
         Tick { sleep_ms: until_sync.min(until_send).clamp(1_000, MAX_SLEEP_MS), changed }
     }
@@ -387,11 +414,13 @@ impl Engine {
             }
         };
         self.sync_failures = 0;
+        self.synced = true;
         for n in &outcome.notes {
             self.notes.push(Note::Warn(n.clone()));
         }
         let now_ms = agent.clock.now(s).map_or(s.wall_ms, |n| n.ms);
         let update_required = agent.update_required;
+        let min_app_version = agent.last_sync.as_ref().and_then(|s| s.min_app_version.clone());
         if let Some(c) = outcome.clock_change {
             self.clock_changed(c, now_ms);
         }
@@ -403,7 +432,16 @@ impl Engine {
             self.notes.push(Note::Warn(format!("an uninstall command failed verification and was ignored: {e}")));
         }
         if update_required {
-            self.notes.push(Note::Warn("eGuard needs a newer version of this app; enforcement carries on".into()));
+            // A new minimum makes an update due now, once: the update itself comes only in eGuard's signed manifest
+            let min = min_app_version;
+            if self.update_min_seen != min {
+                self.notes.push(Note::Warn(format!(
+                    "eGuard needs version {} or later of this app; asking for it now, and enforcement carries on",
+                    min.as_deref().unwrap_or("?")
+                )));
+                self.update_min_seen = min;
+                self.next_update_mono_ms = 0;
+            }
         }
         self.report_if_changed(outcome.full_report_requested || !outcome.requests.is_empty(), info, now_ms);
         u64::from(outcome.next_sync_secs) * 1000
@@ -490,6 +528,93 @@ impl Engine {
             }
         };
         self.next_catalog_mono_ms = s.mono_ms + wait_ms;
+    }
+
+    /// `GET /update`. A verified manifest for a version newer than this one, and not the one rolled back, is offered
+    /// to the platform (`take_update`). One that doesn't verify, or was issued before the last one accepted, changes
+    /// nothing.
+    fn refresh_update(&mut self, token: &str, s: ClockSample, own: &str) {
+        let wait_ms = match self.api.update(token) {
+            Ok(raw) => match update::verify_manifest(&self.keys, &raw, crate::keys::is_dev_build()) {
+                Ok(None) => {
+                    self.update_failures = 0;
+                    UPDATE_EVERY_MS
+                }
+                Ok(Some(m)) if self.data.update.older(&m) => {
+                    self.update_failures += 1;
+                    self.notes.push(Note::Warn("an update manifest older than the last one accepted was refused".into()));
+                    queue::backoff_ms(self.update_failures, (self.jitter)()) as u64
+                }
+                Ok(Some(m)) => {
+                    self.update_failures = 0;
+                    self.data.update.issued_at = Some(m.issued_at);
+                    if self.data.update.wanted(&m, own) {
+                        self.notes.push(Note::Info(format!("eGuard {} is available (this is {own})", m.version)));
+                        self.update_offer = Some(m);
+                    }
+                    UPDATE_EVERY_MS
+                }
+                Err(e) => {
+                    self.update_failures += 1;
+                    self.notes.push(Note::Warn(format!("the update manifest from eGuard was refused: {e}")));
+                    queue::backoff_ms(self.update_failures, (self.jitter)()) as u64
+                }
+            },
+            Err(ApiError::Status { status: 429, .. }) => 60 * 60_000,
+            // A server that doesn't offer updates
+            Err(ApiError::Status { status: 404, .. }) => UPDATE_EVERY_MS,
+            Err(e) => {
+                self.update_failures += 1;
+                if self.update_failures == 1 {
+                    self.notes.push(Note::Warn(format!("couldn't ask eGuard for updates: {e}")));
+                }
+                queue::backoff_ms(self.update_failures, (self.jitter)()) as u64
+            }
+        };
+        self.next_update_mono_ms = s.mono_ms + wait_ms;
+    }
+
+    /// A verified newer version for the platform to download, check and install, handed over once. The platform
+    /// calls `update_done` when it didn't install it (a service that installed it stops, and the new version starts).
+    pub fn take_update(&mut self) -> Option<Manifest> {
+        let m = self.update_offer.take()?;
+        self.update_busy = true;
+        Some(m)
+    }
+
+    /// The platform's update ended without installing. `Err` (a download, a check or a copy failed) is tried again
+    /// after a backoff, and after `UPDATE_TRIES` in a row at the usual time; `Ok` (checked but not installed, as in
+    /// development) waits the usual time.
+    pub fn update_done(&mut self, result: Result<(), String>, s: ClockSample) {
+        self.update_busy = false;
+        let wait_ms = match result {
+            Ok(()) => {
+                self.update_failures = 0;
+                UPDATE_EVERY_MS
+            }
+            Err(e) => {
+                self.update_failures += 1;
+                self.notes.push(Note::Warn(format!("the update failed: {e}; this version carries on")));
+                if self.update_failures >= UPDATE_TRIES {
+                    UPDATE_EVERY_MS
+                } else {
+                    queue::backoff_ms(self.update_failures, (self.jitter)()) as u64
+                }
+            }
+        };
+        self.next_update_mono_ms = s.mono_ms + wait_ms;
+    }
+
+    /// The guard put this version back after the update to `o.version` didn't become healthy: that version isn't
+    /// tried again (a newer one is). Save `data` next.
+    pub fn update_rolled_back(&mut self, o: &Outcome) {
+        self.notes.push(Note::Warn(format!("the update to eGuard {} was rolled back ({}); it won't be tried again", o.version, o.why)));
+        self.data.update.failed_version = Some(o.version.clone());
+    }
+
+    /// A `/sync` succeeded since the service started: with a saved state, a new version's health (spec section 10).
+    pub fn has_synced(&self) -> bool {
+        self.synced
     }
 
     /// eGuard's time now (the wall clock before the first sync ever).
@@ -871,14 +996,15 @@ mod tests {
         first["deviceId"] = j!(e.secrets.as_ref().unwrap().device_id);
         t.answers.lock().unwrap().extend([json(200, &first), json(200, &j!({ "ok": true }))]);
         *t.catalog.lock().unwrap() = Some(fixture("catalog.json"));
+        *t.update.lock().unwrap() = Some(j!({ "manifest": null }));
 
         let tick = e.tick(at(1_000, &now), &info());
         assert!(tick.changed);
         let seen = t.seen.lock().unwrap();
         let urls: Vec<_> = seen.iter().map(|r| r.url.rsplit('/').next().unwrap().to_owned()).collect();
-        assert_eq!(urls, ["pair", "sync", "catalog", "report"]);
+        assert_eq!(urls, ["pair", "sync", "catalog", "update", "report"]);
         assert!(seen[1].bearer.is_some());
-        let report: Value = serde_json::from_slice(seen[3].body.as_ref().unwrap()).unwrap();
+        let report: Value = serde_json::from_slice(seen[4].body.as_ref().unwrap()).unwrap();
         assert_eq!(report["full"], true);
         let keys: Vec<_> = report["protections"].as_array().unwrap().iter().map(|p| p["key"].as_str().unwrap()).collect();
         // Nothing enforced yet: only the guided ones, as off, with why
@@ -1348,5 +1474,103 @@ mod tests {
         assert_eq!(d.model, "PC");
         assert_eq!(d.app_version.len(), 20);
         assert_eq!(d.battery, None);
+    }
+
+    const HOUR: u64 = 60 * 60_000;
+
+    /// A paired engine that trusts the update tests' key, and a way to have `GET /update` offer a version.
+    fn paired_for_updates(t: &Arc<Scripted>) -> (Engine, String, impl Fn(&str, u64)) {
+        let (mut e, now) = paired(t);
+        let (sk, keys) = crate::update::tests::key();
+        e.keys = keys;
+        let t = Arc::clone(t);
+        let offer = move |version: &str, issued_at: u64| {
+            let m = crate::update::tests::manifest_for(version, issued_at);
+            *t.update.lock().unwrap() = Some(crate::update::tests::signed(&sk, &m));
+        };
+        (e, now, offer)
+    }
+
+    fn update_requests(t: &Arc<Scripted>) -> usize {
+        t.seen.lock().unwrap().iter().filter(|r| r.url.ends_with("/update")).count()
+    }
+
+    #[test]
+    fn a_newer_signed_version_is_offered_once_and_tried_again_after_a_failure() {
+        let t = Scripted::new(vec![]);
+        let (mut e, now, offer) = paired_for_updates(&t);
+        offer("0.2.0", 1_000);
+        e.tick(at(1_000, &now), &info());
+        let m = e.take_update().unwrap();
+        assert_eq!((m.version.as_str(), m.files.len()), ("0.2.0", 3));
+        assert_eq!(e.data.update.issued_at, Some(1_000));
+        assert!(e.take_update().is_none());
+
+        // While the platform works on it, eGuard isn't asked again, however long it takes
+        e.tick(at(7 * HOUR, &now), &info());
+        assert_eq!(update_requests(&t), 1);
+        // It failed: asked again after the backoff, and offered again
+        e.update_done(Err("the download was cut off".into()), at(7 * HOUR, &now));
+        assert!(e.take_notes().iter().any(|n| matches!(n, Note::Warn(m) if m.contains("the download was cut off"))));
+        e.tick(at(7 * HOUR + 1_000, &now), &info());
+        assert_eq!(update_requests(&t), 1);
+        e.tick(at(8 * HOUR, &now), &info());
+        assert_eq!(update_requests(&t), 2);
+        assert_eq!(e.take_update().map(|m| m.version), Some("0.2.0".into()));
+
+        // The same version, or an older one, isn't offered to a computer that has it
+        e.update_done(Ok(()), at(8 * HOUR, &now));
+        let mut on_it = info();
+        on_it.app_version = "0.2.0".into();
+        e.tick(at(15 * HOUR, &now), &on_it);
+        assert_eq!(update_requests(&t), 3);
+        assert!(e.take_update().is_none());
+    }
+
+    #[test]
+    fn a_replayed_manifest_and_a_rolled_back_version_arent_offered() {
+        let t = Scripted::new(vec![]);
+        let (mut e, now, offer) = paired_for_updates(&t);
+        e.data.update.issued_at = Some(2_000);
+        offer("0.2.0", 1_000);
+        e.tick(at(1_000, &now), &info());
+        assert!(e.take_update().is_none());
+        assert_eq!(e.data.update.issued_at, Some(2_000));
+        assert!(e.take_notes().iter().any(|n| matches!(n, Note::Warn(m) if m.contains("older than the last one accepted"))));
+
+        e.update_rolled_back(&Outcome { version: "0.2.0".into(), why: "it didn't sync within 10 minutes".into() });
+        offer("0.2.0", 3_000);
+        e.tick(at(HOUR, &now), &info());
+        assert!(e.take_update().is_none());
+        assert_eq!(e.data.update.issued_at, Some(3_000));
+        // A newer one is
+        offer("0.3.0", 4_000);
+        e.tick(at(8 * HOUR, &now), &info());
+        assert_eq!(e.take_update().map(|m| m.version), Some("0.3.0".into()));
+    }
+
+    #[test]
+    fn a_minimum_above_this_build_asks_for_the_update_at_once() {
+        let t = Scripted::new(vec![]);
+        let (mut e, now, _) = paired_for_updates(&t);
+        *t.update.lock().unwrap() = Some(j!({ "manifest": null }));
+        let mut sync = fixture("sync-first.json");
+        sync["deviceId"] = j!(e.secrets.as_ref().unwrap().device_id);
+        t.answers.lock().unwrap().push(json(200, &sync));
+        e.tick(at(1_000, &now), &info());
+        assert_eq!(update_requests(&t), 1);
+
+        // The next sync says this build is too old: eGuard is asked now, not in 6 hours
+        sync["minAppVersion"] = j!("0.2.0");
+        t.answers.lock().unwrap().push(json(200, &sync));
+        e.sync_soon();
+        e.tick(at(2_000, &now), &info());
+        assert_eq!(update_requests(&t), 2);
+        // The same minimum again doesn't ask again
+        t.answers.lock().unwrap().push(json(200, &sync));
+        e.sync_soon();
+        e.tick(at(3_000, &now), &info());
+        assert_eq!(update_requests(&t), 2);
+        assert!(e.has_synced());
     }
 }

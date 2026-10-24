@@ -6,7 +6,8 @@
 //! - the process monitor (`monitor`): ending what the rules say to end;
 //! - the session supervisor (`sessions`): an agent and a pipe per signed-in session;
 //! - the browsers' policies (`web`), after every tick;
-//! - eGuard's own removal (spec section 10), once eGuard's signed command or a right code authorized it.
+//! - eGuard's own removal (spec section 10), once eGuard's signed command or a right code authorized it;
+//! - eGuard's own update (spec section 10, `update`), on a thread of its own when eGuard offers a newer version.
 //!
 //! The engine (sync state) and the enforcer (rules in force, usage) each sit behind their own lock, so ending a
 //! program never waits for a network call. After each tick the loop hands the enforcer the newest rules, and takes
@@ -25,6 +26,7 @@ use eguard_core::ipc::{self, AccountInfo, Request, Response};
 use eguard_core::report::{AVAILABLE, Capabilities};
 use eguard_core::scan::{self, Classifier, ExeCache};
 use eguard_core::signature::TrustedKeys;
+use eguard_core::update::Manifest;
 use eguard_core::usage::UsageLedger;
 use eguard_core::wire::TamperKind;
 use eguard_win::apps;
@@ -35,7 +37,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// This build's version (`update::VERSION`).
+pub const APP_VERSION: &str = eguard_core::update::VERSION;
 
 /// How the service runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,6 +132,10 @@ pub struct Runner {
     poked: AtomicBool,
     /// A scan is running; the loop doesn't start another.
     scanning: AtomicBool,
+    /// An update is being downloaded or installed.
+    updating: AtomicBool,
+    /// This version's health went to the guard (or no update waits for it).
+    health_noted: AtomicBool,
     /// Launcher folders the last scan found, for the watcher.
     watch_dirs: Arc<Mutex<Vec<PathBuf>>>,
     browsers: Browsers,
@@ -201,6 +208,8 @@ impl Runner {
             facts: Arc::new(Facts::new()),
             poked: AtomicBool::new(false),
             scanning: AtomicBool::new(false),
+            updating: AtomicBool::new(false),
+            health_noted: AtomicBool::new(false),
             watch_dirs: Arc::new(Mutex::new(Vec::new())),
             browsers,
             shared: OnceLock::new(),
@@ -292,6 +301,14 @@ impl Runner {
                     self.save(&mut inner);
                 }
             }
+            // The guard put this version back after an update that didn't work: that version isn't tried again
+            if self.installs_updates() {
+                crate::update::show_version(APP_VERSION);
+                if let Some(o) = crate::update::take_outcome() {
+                    inner.engine.update_rolled_back(&o);
+                    self.save(&mut inner);
+                }
+            }
             // Safe Mode is a way around eGuard (spec section 10); the parent hears of it when the computer is back
             // online
             if eguard_win::sysinfo::safe_mode() {
@@ -337,8 +354,13 @@ impl Runner {
                 let web_changed = self.apply_web(&mut inner);
                 if tick.changed || web_changed {
                     self.save(&mut inner);
+                    // Synced and saved: a new version is healthy, and the guard keeps it
+                    if self.installs_updates() && inner.engine.has_synced() && !self.health_noted.load(Ordering::SeqCst) {
+                        self.health_noted.store(crate::update::note_health(APP_VERSION), Ordering::SeqCst);
+                    }
                 }
                 self.start_scan_if_due(&mut inner);
+                self.start_update_if_offered(&mut inner);
                 next_tick = Instant::now() + Duration::from_millis(tick.sleep_ms);
             }
             inner.woken = false;
@@ -383,7 +405,7 @@ impl Runner {
         // Saved first: if anything below stops the process, the next start carries on removing
         self.save(inner);
         if let Some(shared) = self.shared.get() {
-            shared.set_removed();
+            shared.close_agents();
             // Each agent hears it at its next heartbeat (every second) and closes its screens
             std::thread::sleep(Duration::from_secs(3));
         }
@@ -549,6 +571,70 @@ impl Runner {
         let _ = self.shared.set(Arc::clone(&shared));
         std::thread::Builder::new().name("sessions".into()).spawn(move || sessions::supervise(&shared)).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Whether this service puts updates in place: only the Windows service with removal protection, whose guard
+    /// swaps the program files. Console mode (and a service without the guard) downloads and checks them only.
+    fn installs_updates(&self) -> bool {
+        self.mode == Mode::Service && self.locked
+    }
+
+    fn start_update_if_offered(self: &Arc<Self>, inner: &mut Inner) {
+        if self.updating.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(m) = inner.engine.take_update() else { return };
+        self.updating.store(true, Ordering::SeqCst);
+        let me = Arc::clone(self);
+        let (version, started) = (m.version.clone(), std::thread::Builder::new().name("update".into()).spawn(move || me.update(&m)));
+        if let Err(e) = started {
+            self.updating.store(false, Ordering::SeqCst);
+            inner.engine.update_done(Err(format!("couldn't start updating to {version}: {e}")), clock::sample());
+        }
+    }
+
+    /// Downloads and checks eGuard `m.version`, without the lock (it takes a while). The service then puts it in the
+    /// guard's cache and stops, and the guard swaps the program files and starts the new version (`update`).
+    fn update(&self, m: &Manifest) {
+        log::info(&format!("downloading eGuard {}", m.version));
+        let staged = self.store.dir().join("update");
+        let result = crate::update::stage(m, &staged).and_then(|()| {
+            if !self.installs_updates() {
+                let _ = std::fs::remove_dir_all(&staged);
+                log::info(&format!(
+                    "eGuard {} downloaded and checked; {} installs nothing",
+                    m.version,
+                    if self.mode == Mode::Service {
+                        "without removal protection there's no guard to swap the files, so this"
+                    } else {
+                        "development mode"
+                    }
+                ));
+                return Ok(false);
+            }
+            // The guard puts the new version in place once this service has stopped: without one, nothing would
+            if !crate::lockdown::guard_running() {
+                return Err("the guard isn't running, so nothing would put the new version in place".into());
+            }
+            crate::update::install(m, &staged).map(|()| true)
+        });
+        match result {
+            Ok(true) => {
+                log::warn(&format!("eGuard {} is in the guard's cache; stopping so the guard can put it in place", m.version));
+                if let Some(shared) = self.shared.get() {
+                    shared.close_agents();
+                    // Each agent hears it at its next heartbeat (every second) and closes its screens
+                    std::thread::sleep(Duration::from_secs(3));
+                }
+                self.request_stop();
+            }
+            other => {
+                let mut inner = self.lock();
+                inner.engine.update_done(other.map(|_| ()), clock::sample());
+                log_notes(&mut inner.engine);
+                self.updating.store(false, Ordering::SeqCst);
+            }
+        }
     }
 
     fn start_scan_if_due(self: &Arc<Self>, inner: &mut Inner) {

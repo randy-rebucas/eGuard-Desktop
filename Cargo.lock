@@ -187,6 +187,8 @@ version = "0.1.0"
 dependencies = [
  "eguard-core",
  "eguard-win",
+ "serde",
+ "serde_json",
  "windows-service",
 ]
 
@@ -197,6 +199,7 @@ dependencies = [
  "eguard-core",
  "eguard-win",
  "jiff",
+ "serde",
  "serde_json",
  "windows-service",
 ]

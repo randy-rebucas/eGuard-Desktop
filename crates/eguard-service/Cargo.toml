@@ -11,6 +11,7 @@ publish.workspace = true
 eguard-core = { path = "../eguard-core" }
 eguard-win = { path = "../eguard-win" }
 jiff.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 windows-service.workspace = true
 

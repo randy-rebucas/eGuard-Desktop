@@ -214,6 +214,20 @@ impl Api {
         serde_json::from_slice(&res.body).map_err(|e| ApiError::Malformed(e.to_string()))
     }
 
+    /// `GET /update`: the version eGuard offers this computer. Raw JSON: `update::verify_manifest` checks it as
+    /// received.
+    pub fn update(&self, token: &str) -> Result<Value, ApiError> {
+        let res = self.transport.send(HttpRequest {
+            method: Method::Get,
+            url: self.server.device("/update"),
+            bearer: Some(token.to_owned()),
+            body: None,
+            timeout: REQUEST_TIMEOUT,
+        })?;
+        let res = ok_or_status(res)?;
+        serde_json::from_slice(&res.body).map_err(|e| ApiError::Malformed(e.to_string()))
+    }
+
     /// Sends one queued item and says how it went, for `OutboundQueue::settle`.
     pub fn send(&self, token: &str, item: &Outbound) -> SendOutcome {
         let res = match item {
@@ -255,21 +269,35 @@ pub(crate) mod tests {
         /// What `GET /catalog` answers, every time (no network when unset). Kept apart from `answers` so tests of
         /// sync and the queue don't have to script the catalog in between.
         pub catalog: Mutex<Option<Value>>,
+        /// What `GET /update` answers, every time (no network when unset), kept apart for the same reason.
+        pub update: Mutex<Option<Value>>,
         pub seen: Mutex<Vec<HttpRequest>>,
     }
 
     impl Scripted {
         pub fn new(answers: Vec<Result<HttpResponse, TransportError>>) -> std::sync::Arc<Self> {
-            std::sync::Arc::new(Self { answers: Mutex::new(answers), catalog: Mutex::new(None), seen: Mutex::new(Vec::new()) })
+            std::sync::Arc::new(Self {
+                answers: Mutex::new(answers),
+                catalog: Mutex::new(None),
+                update: Mutex::new(None),
+                seen: Mutex::new(Vec::new()),
+            })
         }
     }
 
     impl Transport for std::sync::Arc<Scripted> {
         fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
-            let catalog = request.url.contains("/catalog");
+            let (catalog, update) = (request.url.contains("/catalog"), request.url.ends_with("/update"));
             self.seen.lock().unwrap().push(request);
-            if catalog {
-                return self.catalog.lock().unwrap().as_ref().map_or_else(|| Err(TransportError("no network".into())), |v| json(200, v));
+            let fixed = if catalog {
+                Some(&self.catalog)
+            } else if update {
+                Some(&self.update)
+            } else {
+                None
+            };
+            if let Some(fixed) = fixed {
+                return fixed.lock().unwrap().as_ref().map_or_else(|| Err(TransportError("no network".into())), |v| json(200, v));
             }
             let mut a = self.answers.lock().unwrap();
             if a.is_empty() { Err(TransportError("no network".into())) } else { a.remove(0) }

@@ -21,6 +21,7 @@ mod scan;
 mod sessions;
 mod store;
 mod svc;
+mod update;
 mod web;
 
 use eguard_core::api::ServerUrl;

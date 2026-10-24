@@ -17,6 +17,7 @@ use crate::queue::OutboundQueue;
 use crate::removal::{CodeAttempts, Removing};
 use crate::scan::{ExeCache, Place};
 use crate::state::AgentState;
+use crate::update::UpdateRecord;
 use crate::usage::UsageLedger;
 use crate::wire::{FoundApp, ReportedAccount, ReportedProtection, TamperKind};
 use serde::{Deserialize, Serialize};
@@ -75,6 +76,9 @@ pub struct Persisted {
     /// When `ADMIN_ACCOUNT` was last queued while one of the child's accounts is an administrator; `None` while none is.
     #[serde(default)]
     pub admin_alert_ms: Option<i64>,
+    /// eGuard's own updates: the last manifest accepted, a version rolled back.
+    #[serde(default)]
+    pub update: UpdateRecord,
 }
 
 impl Default for Persisted {
@@ -97,6 +101,7 @@ impl Default for Persisted {
             removing: None,
             tamper_sent: BTreeMap::new(),
             admin_alert_ms: None,
+            update: UpdateRecord::default(),
         }
     }
 }

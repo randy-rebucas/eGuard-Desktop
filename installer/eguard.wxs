@@ -10,8 +10,9 @@
   - msiexec /x runs "eguard-service.exe msi-check" first (as SYSTEM): unless eGuard may be removed (not paired, or a
     removal the parent asked for), it tells the parent (UNINSTALL_BLOCKED) and the uninstall is rolled back. Then
     "eguard-service.exe purge" takes out everything but the program files, which the package removes.
-  - No upgrades until the self-update is designed (the owner's call): a second version refuses to install over the
-    first, and an upgrade's removal of the old one goes through the same check.
+  - No upgrades through this package: a second version refuses to install over the first. A new version reaches an
+    installed computer through eGuard's own update (spec section 10, Q7), which replaces the program files in place;
+    the package's records keep the version it installed, and the service sets the visible entry's DisplayVersion.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="eGuard" Manufacturer="eGuard" Version="$(var.Version)" UpgradeCode="6F1B7C2A-3E4D-4B8A-9C51-2D7E8F0A9B63"

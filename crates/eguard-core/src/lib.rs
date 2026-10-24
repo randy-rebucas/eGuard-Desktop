@@ -1,6 +1,7 @@
 //! The platform-neutral core of eGuard for Windows (and the Mac agent later): the device API's wire types and client,
 //! the parent's rules, enforcement, screen-time accounting on eGuard's clock, signature and removal-code checks, the offline
-//! queue, and the service's sync loop. No Windows APIs here; the `windows-sys` crate lives in the platform crate.
+//! queue, the service's sync loop and eGuard's own updates. No Windows APIs here; the `windows-sys` crate lives in the
+//! platform crate.
 //!
 //! The spec is `~/eguard/docs/desktop-agent-spec.md`.
 
@@ -24,6 +25,7 @@ pub mod scan;
 pub mod signature;
 pub mod state;
 pub mod store;
+pub mod update;
 pub mod usage;
 pub mod web;
 pub mod wire;

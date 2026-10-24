@@ -66,7 +66,7 @@ pub struct Shared {
     /// "Remove with a code" and the "Remove eGuard" window closed without one, answered by the runner (it holds the
     /// engine).
     to_runner: Box<dyn Fn(&Request) -> Response + Send + Sync>,
-    /// eGuard removed itself: agents are told to close, and none is started again.
+    /// eGuard removed itself or stops for an update: agents are told to close, and none is started again.
     removed: AtomicBool,
 }
 
@@ -100,12 +100,13 @@ impl Shared {
         }
     }
 
-    /// eGuard has removed itself: each agent closes at its next heartbeat, and none is started again.
-    pub fn set_removed(&self) {
+    /// eGuard has removed itself, or stops for an update: each agent closes at its next heartbeat, and none is
+    /// started again (an update's new version starts its own).
+    pub fn close_agents(&self) {
         self.removed.store(true, Ordering::SeqCst);
     }
 
-    fn is_removed(&self) -> bool {
+    fn agents_closed(&self) -> bool {
         self.removed.load(Ordering::SeqCst)
     }
 
@@ -225,7 +226,7 @@ pub fn supervise(shared: &Arc<Shared>) {
             }
             // Not one of the child's accounts (a parent's own on a family PC): no agent, nothing counted or ended.
             // After removal, nothing at all
-            if !shared.applies(s.id) || shared.is_removed() {
+            if !shared.applies(s.id) || shared.agents_closed() {
                 continue;
             }
 
@@ -392,7 +393,7 @@ fn genuine_agent(shared: &Shared, id: u32, conn: &std::fs::File) -> Option<u32> 
 fn handle(shared: &Shared, id: u32, client: u32, req: &Request) -> Response {
     let sample = clock::sample();
     match req {
-        Request::Heartbeat { .. } if shared.is_removed() => Response::Removed,
+        Request::Heartbeat { .. } if shared.agents_closed() => Response::Removed,
         &Request::Heartbeat { .. } if !shared.applies(id) => Response::Session(SessionView::default()),
         // Switched away from: the agent is alive (so it isn't silent), but nobody is there to see a screen or use time
         &Request::Heartbeat { .. } if shared.is_disconnected(id) => {

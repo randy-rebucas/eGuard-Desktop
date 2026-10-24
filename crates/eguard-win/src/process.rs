@@ -273,6 +273,23 @@ pub fn alive(pid: u32, started: u64) -> bool {
     start_time(pid) == Some(started) && image_path(pid).is_some()
 }
 
+/// The processes running the program at `path` (the whole path, in any case), with when each started.
+pub fn running_program(path: &Path) -> Vec<(u32, u64)> {
+    let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else { return Vec::new() };
+    let want = path.to_string_lossy();
+    list()
+        .into_iter()
+        .filter(|p| p.exe.eq_ignore_ascii_case(&name))
+        .filter(|p| image_path(p.pid).is_some_and(|i| i.to_string_lossy().eq_ignore_ascii_case(&want)))
+        .filter_map(|p| start_time(p.pid).map(|t| (p.pid, t)))
+        .collect()
+}
+
+/// Ends every process running the program at `path` but this one, each alone (`end_one`). Returns their ids.
+pub fn end_program(path: &Path) -> Vec<u32> {
+    running_program(path).into_iter().filter(|&(pid, start)| end_one(pid, start)).map(|(pid, _)| pid).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +347,14 @@ mod tests {
         // Never this process
         let me = current_pid();
         assert_eq!(end_tree(me, start_time(me).unwrap(), |_| true), 0);
+    }
+
+    #[test]
+    fn a_program_is_found_by_its_whole_path_and_this_process_never_ended() {
+        let me = current_pid();
+        let exe = image_path(me).unwrap();
+        assert!(running_program(&exe).iter().any(|&(pid, _)| pid == me));
+        assert_eq!(running_program(&exe.with_file_name("not-this.exe")), Vec::new());
+        assert_eq!(end_program(&exe), Vec::<u32>::new());
     }
 }

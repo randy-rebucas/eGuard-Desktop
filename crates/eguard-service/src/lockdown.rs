@@ -166,17 +166,15 @@ pub fn purge(me_too: bool) -> Vec<String> {
 }
 
 /// Ends every running copy of eGuard's `exe` (from the program folder) but this process.
-fn end_all(exe: &str) {
-    let path = install_dir().join(exe);
-    for p in process::list() {
-        if p.exe.eq_ignore_ascii_case(exe)
-            && process::image_path(p.pid).is_some_and(|i| i.to_string_lossy().eq_ignore_ascii_case(&path.to_string_lossy()))
-            && let Some(start) = process::start_time(p.pid)
-            && process::end_one(p.pid, start)
-        {
-            log::info(&format!("ended {exe} ({})", p.pid));
-        }
+pub fn end_all(exe: &str) {
+    for pid in process::end_program(&install_dir().join(exe)) {
+        log::info(&format!("ended {exe} ({pid})"));
     }
+}
+
+/// Whether the guard is running (from the program folder).
+pub fn guard_running() -> bool {
+    !process::running_program(&install_dir().join("eguard-guard.exe")).is_empty()
 }
 
 fn task_exists() -> bool {
@@ -240,12 +238,7 @@ fn guard_task_xml(exe: &Path) -> String {
 /// Starts the guard's task when no guard is running (it was ended, or its task failed for good). The service calls
 /// this about once a minute; the guard does the same for the service.
 pub fn keep_guard_running() {
-    let path = install_dir().join("eguard-guard.exe");
-    let running = process::list().iter().any(|p| {
-        p.exe.eq_ignore_ascii_case("eguard-guard.exe")
-            && process::image_path(p.pid).is_some_and(|i| i.to_string_lossy().eq_ignore_ascii_case(&path.to_string_lossy()))
-    });
-    if !running {
+    if !guard_running() {
         match schtasks(&["/Run", "/TN", GUARD_TASK]) {
             Ok(()) => log::warn("eGuard's guard wasn't running; started it again"),
             Err(e) => log::error(&format!("eGuard's guard isn't running and couldn't be started: {e}")),

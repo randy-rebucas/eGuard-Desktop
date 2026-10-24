@@ -10,13 +10,15 @@
 #
 #   bundle.ps1                                   no extension ids: nothing is forced in browsers (Phase 5 waits)
 #   bundle.ps1 -ChromeId ID -EdgeId ID -FirefoxUrl URL   the extension's real store ids, once they exist
+#   bundle.ps1 -Version 0.1.1                    a newer version (EGUARD_VERSION), to test updates (VM-TESTS.md G):
+#                                                target\eguard-vm-0.1.1.zip; its bin\ is what update-release.ps1 offers
 #   bundle.ps1 -ServerUrl https://… -PublicKeys KEY      a build for a real eGuard server instead of this PC's dev
 #                                                server: its https address and its policy-signing public key (base64
 #                                                SPKI, as the extension's VITE_POLICY_PUBLIC_KEY; never the private key).
 #                                                Both or neither: the dev key can't check a real server's signatures
 #
 # Its own target folder (target\vm), so the static C runtime doesn't rebuild everyday builds.
-param([string]$ChromeId, [string]$EdgeId, [string]$FirefoxUrl, [string]$ServerUrl, [string]$PublicKeys)
+param([string]$ChromeId, [string]$EdgeId, [string]$FirefoxUrl, [string]$ServerUrl, [string]$PublicKeys, [string]$Version)
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 $out = Join-Path $root "target\vm-bundle"
@@ -26,6 +28,8 @@ if ([bool]$ServerUrl -ne [bool]$PublicKeys) { throw "give -ServerUrl and -Public
 if ($ServerUrl -and -not $ServerUrl.StartsWith("https://")) { throw "-ServerUrl must be https://" }
 $ids["EGUARD_SERVER_URL"] = $ServerUrl
 $ids["EGUARD_POLICY_PUBLIC_KEYS"] = $PublicKeys
+if ($Version -and $Version -notmatch '^\d+(\.\d+){0,3}$') { throw "-Version is numbers with dots, like 0.1.1" }
+$ids["EGUARD_VERSION"] = $Version
 
 $saved = @{ RUSTFLAGS = $env:RUSTFLAGS }
 foreach ($k in $ids.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
@@ -45,7 +49,7 @@ foreach ($exe in "eguard-service.exe", "eguard-agent.exe", "eguard-guard.exe") {
 }
 
 # The installer package, made from the same programs (installer\build.ps1, WiX 5)
-& (Join-Path $root "installer\build.ps1") -Bin $bin -Out (Join-Path $out "eguard.msi")
+& (Join-Path $root "installer\build.ps1") -Bin $bin -Out (Join-Path $out "eguard.msi") -Version $Version
 
 $standins = New-Item -ItemType Directory -Force (Join-Path $out "standins")
 $enforce = Join-Path $root "tools\enforce"
@@ -62,7 +66,7 @@ $tools = New-Item -ItemType Directory -Force (Join-Path $out "tools")
 Copy-Item (Join-Path $root "tools\vm\*.ps1"), (Join-Path $enforce "*.ps1") $tools -Exclude bundle.ps1
 Copy-Item (Join-Path $root "docs\VM-TESTS.md") $out
 
-$zip = Join-Path $root "target\eguard-vm.zip"
+$zip = Join-Path $root $(if ($Version) { "target\eguard-vm-$Version.zip" } else { "target\eguard-vm.zip" })
 if (Test-Path $zip) { Remove-Item $zip }
 if ($ServerUrl) { $ServerUrl | Set-Content -Encoding ascii (Join-Path $out "bin\server.txt") }
 Compress-Archive -Path (Join-Path $out "*") -DestinationPath $zip

@@ -1,8 +1,9 @@
 # Status
 
-Updated 2026-10-24: the owner's decisions after Phase 6 part 2 (below). Before it: Phase 6 part 2 (the installer and what holds eGuard in place), built and waiting for the VM,
-below. Before it: Phase 7's crash handler and logs, Phase 6 part 1 (the removal flow and tamper reporting), Phase 5
-(web), Phase 4, the owner's decisions, a full audit and its fixes.
+Updated 2026-10-24: Phase 7's self-update (Q7), built and waiting for the VM (below). Before it: the owner's decisions
+after Phase 6 part 2, Phase 6 part 2 (the installer and what holds eGuard in place), built and waiting for the VM,
+Phase 7's crash handler and logs, Phase 6 part 1 (the removal flow and tamper reporting), Phase 5 (web), Phase 4, the
+owner's decisions, a full audit and its fixes.
 
 | Phase | What | Status |
 |---|---|---|
@@ -12,9 +13,75 @@ below. Before it: Phase 7's crash handler and logs, Phase 6 part 1 (the removal 
 | 4 | Enforcement and time (spec 7, 8) | **Built and checked on this PC with stand-ins.** Tests 3–5 pass in console mode; the gate waits for the VM: test 6, everything as SYSTEM, real games (Q3) |
 | 5 | Web (spec 9) | **Built and checked on this PC** with a stand-in browser and an inert copy of the policies. The prompt gives no "Done when"; real browsers wait for the VM and for the extension's store ids, and 6 items wait for the owner (below) |
 | 6 | Removal protection and tamper (spec 10, 11) | **Part 1 built and checked on this PC** (the removal flow, "Remove with a code", tamper reporting, `ADMIN_ACCOUNT`). **Part 2 built** (the MSI, the service lock, the guard, Safe Mode, complete removal): unit-tested and the MSI validated here; nothing of it has run yet. The gate (tests 7–10) is the VM's: VM-TESTS.md sections A, E, F |
-| 7 | Hardening and release readiness | **Started:** structured, rotated, scrubbed logs and a crash handler (below). Not built: the signed self-update (Q7, the owner's design), signing (the certificate), the end-to-end VM run |
+| 7 | Hardening and release readiness | **Started:** structured, rotated, scrubbed logs, a crash handler, and the **signed self-update (Q7): built**, unit-tested, its download-and-check path run here; the swap and rollback wait for the VM (VM-TESTS.md G). Not built: signing (the certificate), the end-to-end VM run |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## Phase 7: the self-update (Q7), built (2026-10-24)
+
+As designed in spec 10 ("Updates"). **Nothing that installs or replaces files has run on this PC**: the service
+installs an update only as the Windows service with removal protection in place; console mode downloads and checks
+only. The swap and the rollback are the VM's (VM-TESTS.md G).
+
+How it goes: the service asks `GET /update` every 6 hours, and at once when `/sync` `minAppVersion` rises above this
+build. A verified manifest for a newer version (not one rolled back, not issued before the last one accepted) is
+downloaded on its own thread; each file must match the manifest's size and SHA-256 **and** carry a valid Authenticode
+signature by eGuard. The service then copies the guard's cache to `cache\previous`, writes the hand-off
+(`cache\update.json`, step `swap`), puts the new files in the cache, closes the agents and stops cleanly. The guard
+(polling every second while the swap waits) sees the stop, puts the cache's files in place (old ones renamed
+aside, swept later), marks `running` and starts the service. The new service, after a good sync and a saved state,
+writes `cache\update-health.json`; the guard then deletes `previous` and the hand-off and ends, and the service starts
+the new guard within a minute. No health within 10 minutes (or no swap within 10): the guard puts `previous` back in
+the cache and the program files (ending the service if it must), writes `cache\update-outcome.json`, and starts the old
+version, which keeps that version as failed and never tries it again.
+
+| Piece | What it does |
+|---|---|
+| core `update` | The manifest's checks (`verify_manifest`: signature, type, a 1–4 number version, exactly the three programs, size ≤ 256 MB, lower-case SHA-256, https or a dev build's `http://localhost`), `check_file`, `UpdateRecord` (in `Persisted.update`: last `issuedAt`, the failed version; `older`, `wanted`), the hand-off files (`Handoff`/`Step`, `Health`, `Outcome`) and the guard's decision (`guard_action`: wait, swap, swap after ending a service that didn't stop in 2 min, commit, roll back after 10 min). `SIGNER`: `EGUARD_UPDATE_SIGNER` at compile time, "eGuard Dev" until the certificate exists; a release refuses to compile without it (as the keys). `VERSION`: `EGUARD_VERSION` at compile time, else the workspace's (the service, agent and guard all use it now) |
+| core `engine`, `api` | `refresh_update` beside the catalog's (6 h; 429: an hour; 404: 6 h; failures back off), a new `minAppVersion` makes it due at once (once per value); `take_update`, `update_done` (3 failures in a row: next try in 6 h), `update_rolled_back`, `has_synced`. `Api::update` |
+| `eguard-win` | `http::WinHttp::download` (no token, size cap, redirects followed but never https→http, a partial file deleted; `send` and it now share `open`/`status_of`/`read_all`). `process::running_program`, `end_program` (by whole image path; `lockdown::end_all`/`guard_running` use them) |
+| `eguard-service` `update`, `runner` | `stage` (download + both checks into `<data>\update`), `install` (previous → hand-off → cache, undone on failure), `note_health`, `take_outcome`, `show_version` (Settings' DisplayVersion follows the running version). The runner's update thread; refuses to install when the guard isn't running. `Shared::close_agents` (was `set_removed`) closes the agents for an update as for a removal |
+| `eguard-guard` | The hand-off: swap, commit (then ends, for the new guard), roll back; `sweep` deletes old program files set aside once nothing runs them. During the swap the program files aren't compared (no `FILES_CHANGED`); after it, as before. Ending the service on purpose deletes its `running` marker (no `SERVICE_RESTARTED`) |
+| `tools/vm` | `bundle.ps1 -Version 0.1.1` (a newer build: `target\eguard-vm-0.1.1.zip`; `installer\build.ps1 -Version` too). `update-release.ps1` (**VM only**): makes and trusts a self-signed "eGuard Dev" code-signing certificate, signs a build, prints `DESKTOP_RELEASE`, serves the files at `http://localhost:8099`; `-NoSign`, `-Broken` for G2 and G3 |
+| `~/eguard` | `GET /api/device/v1/update` (`update/route.ts`): `{ manifest: null }`, or the release in `DESKTOP_RELEASE` (`lib/desktop-release.ts`, parsed with zod; malformed: 503) signed with `signPolicy` and `issuedAt`; computers only (404 for a phone), 30 an hour (`LIMITS.deviceUpdate`). `.env.example` documents it. Docs: spec 10 (built, what's not), spec 12 (the endpoint), mobile-api Part C, open questions Q7 |
+
+**Checked on this PC:** `cargo test --workspace` **244 passed**, 1 ignored (core 176 + 14 fixture, win 40, service
+11, guard 3); clippy (pedantic) and fmt clean. New tests: the manifest's checks (a signed one verifies; a changed,
+mistyped or other key's one doesn't; names, sizes, hashes, URLs, versions), `wanted`/`older`, the signer names, every
+`guard_action` branch, the hand-off's JSON; the engine offering an update once, not asking while the platform works on
+it, backing off after a failure, refusing a replayed manifest and a rolled-back version, asking at once for a new
+minimum; `stage` against a loopback HTTP server: the right bytes unsigned → "carries no valid signature", wrong bytes →
+"SHA-256 doesn't match", too many → "too large", 404, and **Edge's real Microsoft-signed exe → "is signed by
+microsoft corporation, not by eGuard"**; a failed download leaves no file; the guard's swap, sweep and rollback on temp
+folders; a program found by its path. `~/eguard`: `tsc` and eslint clean; the two new tests pass (the parser; the
+endpoint against the dev server, which has no `DESKTOP_RELEASE`, so the `null` branch). `bundle.ps1` and
+`bundle.ps1 -Version 0.1.1` both build; the two builds differ in the version byte (the guard reads `cache0.1.0` /
+`cache0.1.1`) and their MSIs say 0.1.0 / 0.1.1. The PowerShell scripts parse.
+
+**Not checked here (the VM, G1–G5):** the swap, the guard's timing, the gap without a service, the rollback, Settings'
+version, removal after an update; `update-release.ps1` itself (it trusts a certificate: never on this PC); the signed
+branch of `GET /update` end to end (the signature scheme is the catalog's, which the captured fixtures cover).
+
+**For the owner (Q7):**
+1. **The dashboard doesn't show a failed update.** Spec 10 says it should; nothing on the wire says it. Recommended:
+   a `TAMPER`-like event `UPDATE_FAILED { version, why }` (Attention: "eGuard couldn't update on Gaming PC; it's
+   still protected by version X"), sent by the old version after a rollback. A wire and server change, so yours.
+   Until then the device page's app version shows the old one.
+2. **`CHILD_MIN_APP_VERSION` without a platform applies to computers too** (`lib/child-app.ts`): "1.2.0" meant for the
+   phones makes every computer ask for 1.2.0. Use the per-platform form (`android:…,ios:…,windows:…`), or make the
+   plain form phones-only (a server change).
+3. **Real signing waits for the certificate.** A release build must be built with `EGUARD_UPDATE_SIGNER` (the
+   organisation on eGuard's code-signing certificate, exactly) and `EGUARD_VERSION`; the release pipeline signs the
+   three exes (with a timestamp), uploads them over https, and sets `DESKTOP_RELEASE` (plus `windows:<version>` in
+   `CHILD_MIN_APP_VERSION` to hurry it). Where the files are hosted is yours to choose.
+4. **During the swap the computer has no service** for a few seconds (the old one stops, the guard swaps within a
+   second, the new one starts). G1 measures it. The agents' screens close and come back.
+5. **The installer's records keep the version it installed** (no MSI upgrade); the visible Settings entry shows the
+   running version. Removal still goes through `msiexec /x`, which removes the program files by path (G5 checks).
+
+**`~/eguard` for Q7, NOT committed:** `src/app/api/device/v1/update/route.ts` and `src/lib/desktop-release.ts` (new),
+`src/lib/rate-limit.ts`, `.env.example`, `tests/api/desktop-agent.test.ts` (2 new tests in "updates"),
+`docs/desktop-agent-spec.md`, `docs/mobile-api.md`, `docs/desktop-agent-open-questions.md`.
 
 ## The owner's decisions (2026-10-24, after Phase 6 part 2)
 
@@ -31,7 +98,7 @@ All twelve open decisions were answered, each as recommended:
 | `TAMPER` `SERVICE_RESTARTED` | **Done** both sides: server kind (Attention); the service keeps a `running` marker with the boot id and sends it when it starts again in the same boot without having stopped cleanly |
 | Spec updates (sections 8–14, Q1/Q7/Q8/Q9 settled) | **Done in `~/eguard`** (`docs/desktop-agent-spec.md`, `desktop-agent-open-questions.md`, `mobile-api.md`). The owner should read the Q8 end-of-life wording in section 10 |
 | Q9: end a program in exclusive fullscreen when the overlay is due | **Not built; open.** An attempt in this session was stopped. Spec 8 and the open questions now say what's true: apps on the child's list are ended at those times, and the 15 s lock covers anything else |
-| Q7: self-update, as designed | Settled in spec 10; **not built** (a phase of its own; needs the certificate for real use) |
+| Q7: self-update, as designed | Settled in spec 10; **built 2026-10-24** (below; the VM test waits, and real use needs the certificate) |
 | Q8: support removal + end-of-life plan | Settled in spec 10; **not built** (a phase of its own) |
 | The extension reads `deviceLink` (and `privateWindows: "off"`) | **Done.** Agent: writes `privateWindows` = `off` beside `deviceLink` for Chrome and Edge (`web::PRIVATE_WINDOWS_VALUE`; Firefox keeps private windows, with the extension running in them). `~/eguard-browser`, **NOT committed**: `public/managed-schema.json` and the manifest's `storage.managed_schema` (Chrome, Edge), `background/managed.ts` (reads `chrome.storage.managed`), `deviceLink` sent on `/pair` (`PairRequest` in `packages/schemas`), and the private-windows check passes as "Private windows turned off" when the policy says so. Checks there: 180 tests (5 new), `tsc -b`, eslint clean; a build into a scratch folder has the schema in the Chrome and Edge manifests and not Firefox's |
 
@@ -684,20 +751,16 @@ Checked here: the bundle builds, no exe imports `vcruntime140.dll` or the CRT DL
 removes the stand-ins, and the four scripts parse. `install.ps1`, `collect.ps1` and `reset.ps1` need an administrator
 and install a service, so they haven't been run anywhere yet: the first VM session will shake them out.
 
-## Next session: build Q7, the self-update (owner, 2026-10-24)
+## Next session: the owner picks (2026-10-24)
 
-The design is settled in spec section 10 ("Updates") and the open questions (Q7). Build it in this repo and the one
-server endpoint in `~/eguard` (approved with the design; leave it uncommitted there):
-- Server: `GET /device/v1/update`, a manifest `{ type: "eguard.desktop.update", version, issuedAt, files: [{ name,
-  size, sha256, url }] }` signed like the catalog (`signPolicy`), with a test in `tests/api/desktop-agent.test.ts`.
-- Agent: fetch when `/sync` `minAppVersion` is above this build (and on a slow schedule); refuse a manifest issued
-  before the last accepted one (as `signature::older_catalog`); download over HTTPS (`WinHTTP`), check SHA-256 and the
-  Authenticode signer (`eguard-win::authenticode`, a dev signer name until the certificate exists); replace the
-  guard's cache first (keeping `cache\previous`), then the program files; restart; the guard rolls back if the new
-  version isn't healthy within 10 minutes.
-- Core logic (manifest checks, version compare, the rollback decision) with unit tests; Windows parts unit-tested
-  where possible, the rest added to VM-TESTS.md. Nothing that installs or replaces files runs on this PC.
-- Real signing waits for the certificate (the owner's); say so where it matters.
+Q7 is built (above). What's left, each a session of its own:
+- **Q8, support removal** (settled in spec 10, not built). Recommended next: it's the last way off a computer that
+  doesn't depend on the live server. Ask first where the offline support key's private half lives (the agent builds
+  in only the public half; a dev key for tests is generated in the tests).
+- **Q9**, ending a program in exclusive fullscreen when the overlay is due (approved, not built).
+- **Logs removed on removal** (open; two attempts were stopped).
+- **The VM results**, whenever they come back: fix what failed (below), then mark Phases 4–6 and Q7 done.
+- The owner's Q7 items above (the failed-update alert, `CHILD_MIN_APP_VERSION`).
 
 The VM run below is still waiting for the owner, alongside.
 
@@ -705,9 +768,10 @@ The VM run below is still waiting for the owner, alongside.
 
 `target\eguard-vm.zip` (`tools\vm\bundle.ps1`) → the VM → VM-TESTS.md from the top: A (install from the MSI,
 pairing, the lock in place), B, C (Phase 4's open items, test 6, Q3), D (web without ids), E (removal: tests 9 and 10,
-nothing left), F (test 8: every local route). Bring back the `collect.ps1` zips and the filled results table. The
-next session fixes what failed (see part 2's "Expected to need fixing"), and marks Phase 6 done when tests 7–10
-pass. Phase 7 still has the self-update (Q7) and signing (the certificate), both the owner's.
+nothing left), F (test 8: every local route), G (the self-update: `target\eguard-vm-0.1.1.zip` from
+`bundle.ps1 -Version 0.1.1`, and `update-release.ps1` on the VM). Bring back the `collect.ps1` zips and the filled
+results table. The next session fixes what failed (see part 2's "Expected to need fixing"), and marks Phase 6 done
+when tests 7–10 pass. Phase 7 still has signing (the certificate, the owner's).
 
 ## Gotchas
 
@@ -754,6 +818,9 @@ pass. Phase 7 still has the self-update (Q7) and signing (the certificate), both
   (`tools/enforce/press.ps1`), which is also what screen readers use.
 - Bash heredocs with nested quotes broke twice in this session (`unexpected EOF`); write edit scripts to the
   scratchpad and run them instead.
+- **Python on Windows writes CRLF** in text mode: this repo's sources are LF (git `autocrlf` hides it in `git
+  diff --stat` but not in the files). Open with `newline=''` both ways. `~/eguard`'s files are mixed
+  (`tests/api/desktop-agent.test.ts` is CRLF): keep each file's own endings.
 - A first scan on this PC takes about 35–50 s (it verifies ~160 signatures); later ones take a few seconds from the
   cache. Signature checks never use the network (no revocation, no URL retrieval).
 - The scan reads only what the account running it can read. In console mode that's this user; as SYSTEM it will see

@@ -200,7 +200,7 @@ fn session(args: &[String]) -> Result<(), String> {
     // This user's own log: the agent runs as the person signed in, who can't write eGuard's data folder
     let log = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("eGuard").join("logs").join("agent.log"));
     logging::init("agent", log.as_deref(), false);
-    logging::info(&format!("eguard-agent {} in session {id}", env!("CARGO_PKG_VERSION")));
+    logging::info(&format!("eguard-agent {} in session {id}", eguard_core::update::VERSION));
     let pipe_name = ipc::session_pipe_name(id);
     let service = service_exe();
     let (tx, rx) = std::sync::mpsc::channel();
