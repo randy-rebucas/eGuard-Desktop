@@ -684,7 +684,24 @@ Checked here: the bundle builds, no exe imports `vcruntime140.dll` or the CRT DL
 removes the stand-ins, and the four scripts parse. `install.ps1`, `collect.ps1` and `reset.ps1` need an administrator
 and install a service, so they haven't been run anywhere yet: the first VM session will shake them out.
 
-## Next: the VM run (the owner runs it; the next session reads the results)
+## Next session: build Q7, the self-update (owner, 2026-10-24)
+
+The design is settled in spec section 10 ("Updates") and the open questions (Q7). Build it in this repo and the one
+server endpoint in `~/eguard` (approved with the design; leave it uncommitted there):
+- Server: `GET /device/v1/update`, a manifest `{ type: "eguard.desktop.update", version, issuedAt, files: [{ name,
+  size, sha256, url }] }` signed like the catalog (`signPolicy`), with a test in `tests/api/desktop-agent.test.ts`.
+- Agent: fetch when `/sync` `minAppVersion` is above this build (and on a slow schedule); refuse a manifest issued
+  before the last accepted one (as `signature::older_catalog`); download over HTTPS (`WinHTTP`), check SHA-256 and the
+  Authenticode signer (`eguard-win::authenticode`, a dev signer name until the certificate exists); replace the
+  guard's cache first (keeping `cache\previous`), then the program files; restart; the guard rolls back if the new
+  version isn't healthy within 10 minutes.
+- Core logic (manifest checks, version compare, the rollback decision) with unit tests; Windows parts unit-tested
+  where possible, the rest added to VM-TESTS.md. Nothing that installs or replaces files runs on this PC.
+- Real signing waits for the certificate (the owner's); say so where it matters.
+
+The VM run below is still waiting for the owner, alongside.
+
+## The VM run (the owner runs it; a later session reads the results)
 
 `target\eguard-vm.zip` (`tools\vm\bundle.ps1`) → the VM → VM-TESTS.md from the top: A (install from the MSI,
 pairing, the lock in place), B, C (Phase 4's open items, test 6, Q3), D (web without ids), E (removal: tests 9 and 10,
