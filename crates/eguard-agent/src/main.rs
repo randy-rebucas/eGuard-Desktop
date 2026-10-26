@@ -34,8 +34,14 @@ const GIVE_UP_AFTER: Duration = Duration::from_secs(5 * 60);
 /// One request on the service's admin pipe (`\\.\pipe\eguard`).
 fn ask(request: &Request) -> Result<Response, String> {
     let mut pipe = eguard_win::pipe::connect(ipc::PIPE_NAME).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => "eGuard's service isn't running. Start it (eguard-service run) and try again.".to_owned(),
-        std::io::ErrorKind::PermissionDenied => "This account isn't allowed to talk to eGuard's service.".to_owned(),
+        std::io::ErrorKind::NotFound => {
+            "eGuard's service isn't running. Start it (sc start eGuard; in development, eguard-service run) and try again.".to_owned()
+        }
+        // An administrator's prompt that wasn't opened with "Run as administrator" lands here too (UAC)
+        std::io::ErrorKind::PermissionDenied => {
+            "This account isn't allowed to talk to eGuard's service. An administrator: open the prompt with Run as administrator."
+                .to_owned()
+        }
         _ => format!("couldn't reach eGuard's service: {e}"),
     })?;
     // Any program could have made a pipe by that name first: nothing (a pairing code least of all) goes to anything

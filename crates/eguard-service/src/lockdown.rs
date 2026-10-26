@@ -81,23 +81,33 @@ pub fn may_be_removed() -> bool {
 /// Puts everything in the table above in place, and starts the service and the guard. Run again, it repairs what's
 /// missing or changed.
 pub fn install() -> Result<(), String> {
+    // Each step is logged before it runs: the installer shows none of this, so the log is where a failure is found
+    let step = |what: &str| log::info(&format!("install: {what}"));
     let dir = installed_here()?;
     let data = files::program_data_dir();
+    step("the data folder");
     files::ensure_dir(&data, Some(security::DATA_DIR_SDDL)).map_err(|e| format!("{}: {e}", data.display()))?;
+    step("the guard's cache");
     std::fs::create_dir_all(cache_dir()).map_err(|e| format!("{}: {e}", cache_dir().display()))?;
     for p in PROGRAMS {
         std::fs::copy(dir.join(p), cache_dir().join(p)).map_err(|e| format!("copying {p} to the guard's cache: {e}"))?;
     }
+    step("the program folder's permissions");
     security::set_dir_security(&dir, INSTALL_DIR_SDDL).map_err(|e| format!("locking {}: {e}", dir.display()))?;
+    step("the service");
     crate::svc::register(&dir.join("eguard-service.exe"))?;
     services::set_security(crate::svc::SERVICE_NAME, SERVICE_SDDL).map_err(|e| format!("locking the service: {e}"))?;
+    step("Safe Mode");
     for k in SAFE_BOOT {
         let key = Key::create(Root::LocalMachine, k, View::Native).map_err(|e| format!("{k}: {e}"))?;
         key.set_string("", "Service").map_err(|e| format!("{k}: {e}"))?;
     }
+    step("the guard's task");
     register_guard(&dir.join("eguard-guard.exe"))?;
+    step("starting the service and the guard");
     crate::svc::start()?;
     schtasks(&["/Run", "/TN", GUARD_TASK])?;
+    log::info("install: done");
     Ok(())
 }
 

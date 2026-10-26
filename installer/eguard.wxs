@@ -62,12 +62,17 @@
     </Feature>
 
     <CustomAction Id="Lockdown" FileRef="ServiceExe" ExeCommand="install" Execute="deferred" Impersonate="no" Return="check" />
+    <!-- A failed install takes out what "install" got to (the service, Safe Mode, the guard's task, the data folder)
+         before the package removes its files: otherwise a running service holds them and a retry meets leftovers.
+         Nothing is paired yet, so purge is allowed -->
+    <CustomAction Id="LockdownRollback" FileRef="ServiceExe" ExeCommand="purge" Execute="rollback" Impersonate="no" Return="ignore" />
     <CustomAction Id="UninstallCheck" FileRef="ServiceExe" ExeCommand="msi-check" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="Purge" FileRef="ServiceExe" ExeCommand="purge" Execute="deferred" Impersonate="no" Return="check" />
 
     <InstallExecuteSequence>
       <Custom Action="UninstallCheck" After="InstallInitialize" Condition="REMOVE=&quot;ALL&quot;" />
       <Custom Action="Purge" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="LockdownRollback" Before="Lockdown" Condition="NOT REMOVE" />
       <Custom Action="Lockdown" Before="InstallFinalize" Condition="NOT REMOVE" />
     </InstallExecuteSequence>
   </Package>

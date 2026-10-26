@@ -13,7 +13,13 @@ $version = if ($Version) { $Version } else {
     (Select-String -Path (Join-Path $root "Cargo.toml") -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
 }
 foreach ($exe in "eguard-service.exe", "eguard-agent.exe", "eguard-guard.exe") {
-    if (-not (Test-Path (Join-Path $Bin $exe))) { throw "$exe isn't in $Bin" }
+    $path = Join-Path $Bin $exe
+    if (-not (Test-Path $path)) { throw "$exe isn't in $Bin" }
+    # A clean Windows has no Visual C++ runtime: an exe that needs it can't even start as the install step, and the
+    # package fails with nothing in eGuard's log. tools\vm\bundle.ps1 builds with the runtime linked in
+    if (Select-String -Path $path -Pattern "vcruntime140.dll" -SimpleMatch -Quiet) {
+        throw "$exe needs the Visual C++ runtime (VCRUNTIME140.dll), which a clean Windows doesn't have; build with RUSTFLAGS=`"-C target-feature=+crt-static`" (tools\vm\bundle.ps1 does)"
+    }
 }
 $wix = Get-Command wix -ErrorAction SilentlyContinue
 if (-not $wix) {

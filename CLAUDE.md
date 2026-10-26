@@ -69,7 +69,7 @@ node tools/dev-family.mjs remove [now] | keep                     # the device p
 target\debug\eguard-service scan --catalog fixtures/server/catalog.json --verbose   # dry-run scan of this PC
 target\debug\eguard-service run --sandbox %TEMP%\eguard-sandbox   # console mode; ends programs only in the sandbox
 target\debug\eguard-service web                                   # the browser policies in place (reads only)
-powershell -File installer\build.ps1 -Bin target\debug            # build target\eguard.msi (never install it here)
+powershell -File installer\build.ps1 -Bin target\vm\debug         # build target\eguard.msi from bundle.ps1's static build (never install it here)
 powershell -File tools\vm\bundle.ps1                              # target\eguard-vm.zip for the VM
 powershell -File tools\vm\bundle.ps1 -Version 0.1.1               # target\eguard-vm-0.1.1.zip: a newer build (VM-TESTS G)
 target\debug\eguard-agent preview block|overlay|warning          # look at a screen with sample words

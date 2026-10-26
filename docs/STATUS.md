@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-10-24: Phase 7's self-update (Q7), built and waiting for the VM (below). Before it: the owner's decisions
+Updated 2026-10-26: an install audit and its fixes (below). Before it, 2026-10-24: Phase 7's self-update (Q7), built and waiting for the VM (below). Before it: the owner's decisions
 after Phase 6 part 2, Phase 6 part 2 (the installer and what holds eGuard in place), built and waiting for the VM,
 Phase 7's crash handler and logs, Phase 6 part 1 (the removal flow and tamper reporting), Phase 5 (web), Phase 4, the
 owner's decisions, a full audit and its fixes.
@@ -16,6 +16,24 @@ owner's decisions, a full audit and its fixes.
 | 7 | Hardening and release readiness | **Started:** structured, rotated, scrubbed logs, a crash handler, and the **signed self-update (Q7): built**, unit-tested, its download-and-check path run here; the swap and rollback wait for the VM (VM-TESTS.md G). Not built: signing (the certificate), the end-to-end VM run |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## Install audit (2026-10-26)
+
+The owner found eGuard hard to install. The MSI builds and ICE-validates; what made installing hard was around it.
+
+| Finding | What was done |
+|---|---|
+| **No pairing window from the installer.** Spec 4.2: "the installer opens eGuard's window, and the parent types the code". The MSI is silent (no UI, no next step); pairing is `eguard-agent pair CODE` from a prompt opened with Run as administrator | **Not built; the owner decides** (Next session, below) |
+| An MSI made from everyday builds (`target\debug`) needs `VCRUNTIME140.dll`, which a clean Windows lacks: the install step can't start, the package rolls back, eGuard's log is empty | `installer\build.ps1` refuses such exes; CLAUDE.md's command builds from `target\vm\debug` (bundle.ps1's static build) |
+| Smart App Control (on in some fresh Windows 11 installs) blocks unsigned programs: the install step fails | `install.ps1` stops first and says how to turn it off (VM only; signing is the real fix) |
+| `netsh portproxy` does nothing while IP Helper (`iphlpsvc`) is stopped or disabled | `install.ps1` starts it |
+| Pairing from a non-elevated prompt said only "This account isn't allowed…"; "service not running" pointed at console mode on a real install | The agent's words now say Run as administrator, and `sc start eGuard` |
+| A failed install left a running service holding the files (a retry met leftovers); the package's error named no cause | `LockdownRollback` (`purge` as a rollback action; refuses once paired, `Return="ignore"`); each `install` step logged; `install.ps1` prints eGuard's log and the package's failing lines |
+
+**For the VM:** whether running the MSI again repairs (`status()` tells the parent "Install eGuard again to repair
+it", but a second install of the same version may only enter maintenance mode); whether `installed_here` ever sees
+an 8.3 path (`PROGRA~1`) from msiexec; Settings › Uninstall opens a console window behind "Remove eGuard" (the agent
+is a console program).
 
 ## Phase 7: the self-update (Q7), built (2026-10-24)
 
@@ -754,6 +772,11 @@ and install a service, so they haven't been run anywhere yet: the first VM sessi
 ## Next session: the owner picks (2026-10-24)
 
 Q7 is built (above). What's left, each a session of its own:
+- **The installer's pairing window** (spec 4.2, the install audit above). The window the installer opens runs as
+  the installing user without elevation, and the admin pipe takes pairing from SYSTEM and administrators only. Ask
+  the owner first: (a) the pairing window asks for elevation itself (UAC prompt; no security change; recommended), or
+  (b) the service takes a pairing from whoever installed (a pipe/security change). Then: a Win32 window in the agent
+  (as "Remove eGuard"), the MSI launching it after install, and a Start menu entry.
 - **Q8, support removal** (settled in spec 10, not built). Recommended next: it's the last way off a computer that
   doesn't depend on the live server. Ask first where the offline support key's private half lives (the agent builds
   in only the public half; a dev key for tests is generated in the tests).
