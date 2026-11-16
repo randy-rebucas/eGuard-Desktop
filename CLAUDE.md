@@ -45,11 +45,12 @@ on the owner, gotchas).
   replaces files here. The guard swaps the program files and rolls a bad version back.
 - `tools/enforce/`: stand-ins and scripts for checking enforcement by hand (`setup.ps1` makes a fake Steam CS2, an
   unsigned "Pixel Quest" and an unsigned "Pixel Browser"; `launch.ps1`, `play.ps1`, `press.ps1`, `waitoverlay.ps1`).
-- `installer/`: `eguard.wxs` (WiX 5, per-machine MSI with the install/check/purge custom actions) and `build.ps1`.
+- `installer/`: `eguard.wxs` (WiX 5, per-machine MSI with the install/check/purge custom actions), `build.ps1` and `release.ps1`
+  (the optimized build against production, `https://www.eguard.family`, then the MSI).
   WiX 5.0.2 is a global dotnet tool here (`%USERPROFILE%\.dotnet\tools\wix.exe`; not WiX 6, which needs a fee
   agreement). Building the MSI is fine here; installing it isn't.
 - `tools/vm/`: the VM test kit ([docs/VM-TESTS.md](docs/VM-TESTS.md)). `bundle.ps1` here builds
-  `target\eguard-vm.zip` (with `eguard.msi`; `-Version 0.1.1` makes a newer build for the update test);
+  `target\eguard-vm.zip` (with `eguard.msi`; `-Version 0.1.2` makes a newer build for the update test);
   `install.ps1`, `collect.ps1`, `reset.ps1`, `update-release.ps1` run on the VM only (never on this PC: they install
   and lock a service, or make and trust a code-signing certificate).
 - `fixtures/server/`: real server responses, captured by `node tools/capture-fixtures.mjs` (needs ~/eguard's dev DB
@@ -70,8 +71,9 @@ target\debug\eguard-service scan --catalog fixtures/server/catalog.json --verbos
 target\debug\eguard-service run --sandbox %TEMP%\eguard-sandbox   # console mode; ends programs only in the sandbox
 target\debug\eguard-service web                                   # the browser policies in place (reads only)
 powershell -File installer\build.ps1 -Bin target\vm\debug         # build target\eguard.msi from bundle.ps1's static build (never install it here)
+powershell -File installer\release.ps1 -PublicKeys KEY -Signer ORG -ChromeId ID -EdgeId ID -FirefoxUrl URL   # the release MSI, against production
 powershell -File tools\vm\bundle.ps1                              # target\eguard-vm.zip for the VM
-powershell -File tools\vm\bundle.ps1 -Version 0.1.1               # target\eguard-vm-0.1.1.zip: a newer build (VM-TESTS G)
+powershell -File tools\vm\bundle.ps1 -Version 0.1.2               # target\eguard-vm-0.1.2.zip: a newer build (VM-TESTS G)
 target\debug\eguard-agent preview block|overlay|warning          # look at a screen with sample words
 target\debug\eguard-agent pair CODE --accounts corew              # pair; on this PC name corew (an administrator)
 target\debug\eguard-agent accounts [--set NAME,NAME]              # which Windows accounts are the child's

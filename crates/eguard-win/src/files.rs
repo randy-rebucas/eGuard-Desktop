@@ -28,9 +28,11 @@ pub fn ensure_dir(path: &Path, sddl: Option<&str>) -> std::io::Result<()> {
         let reparse = meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
         let owned = !reparse && crate::security::owner_of(path).is_ok_and(|o| crate::security::is_trusted_owner(&o));
         if !owned {
-            let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            // Not guessable: a folder made beforehand under the aside name would stop the move, and the service
+            // with it
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             let name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-            let aside = path.with_file_name(format!("{name}.untrusted-{secs}"));
+            let aside = path.with_file_name(format!("{name}.untrusted-{}-{}-{}", now.as_secs(), now.subsec_nanos(), std::process::id()));
             // Renaming a junction moves the junction, never what it points to
             std::fs::rename(path, &aside).map_err(|e| {
                 std::io::Error::new(e.kind(), format!("{} was made by someone else and couldn't be moved aside: {e}", path.display()))
@@ -43,9 +45,39 @@ pub fn ensure_dir(path: &Path, sddl: Option<&str>) -> std::io::Result<()> {
     }
     std::fs::create_dir_all(path)?;
     if let Some(sddl) = sddl {
+        // Between the move aside and the create, its maker could have put a junction (or a folder of their own)
+        // back at the path, which `create_dir_all` accepts. Setting the permissions by path would then follow it,
+        // and eGuard's secrets would land where that user can read them. A folder this process made is owned by
+        // SYSTEM or administrators, and its maker can't replace it: anything else is refused (the next start moves
+        // it aside again)
+        let reparse = std::fs::symlink_metadata(path).map(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)?;
+        if reparse || !crate::security::owner_of(path).is_ok_and(|o| crate::security::is_trusted_owner(&o)) {
+            return Err(std::io::Error::other(format!("{} was replaced by someone else while it was made", path.display())));
+        }
         crate::security::set_dir_security(path, sddl)?;
     }
     Ok(())
+}
+
+/// The path of an open file as the file system names it: long names (never `PROGRA~1`), junctions and links
+/// followed, without the `\\?\` prefix. What a place is decided from, since the path a process was started by can
+/// spell the same folder several ways.
+pub fn final_path_of(file: &std::fs::File) -> Option<PathBuf> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+    let mut buf = vec![0u16; 32_768];
+    // SAFETY: the handle is open for the call; `buf` is writable for its length, which is passed. Flags 0: a
+    // normalized name with the drive letter.
+    let n = unsafe { GetFinalPathNameByHandleW(file.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, 0) } as usize;
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    let s = crate::wide::from_wide(&buf[..n]);
+    let s = match s.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => s.strip_prefix(r"\\?\").map_or(s.clone(), str::to_owned),
+    };
+    Some(PathBuf::from(s))
 }
 
 /// The file's bytes, or `None` when it doesn't exist.

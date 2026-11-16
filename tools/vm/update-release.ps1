@@ -2,7 +2,7 @@
 # release of eGuard's programs for the update test (docs/VM-TESTS.md G), the way the release pipeline will once
 # eGuard's certificate exists, and serves it.
 #
-#   update-release.ps1 -Bin C:\eguard-next\bin -Version 0.1.1      sign, print DESKTOP_RELEASE, serve until Ctrl+C
+#   update-release.ps1 -Bin C:\eguard-next\bin -Version 0.1.2      sign, print DESKTOP_RELEASE, serve until Ctrl+C
 #   update-release.ps1 -Bin … -Version 0.1.2 -NoSign               unsigned: the agent refuses it (G2)
 #   update-release.ps1 -Bin … -Version 0.1.2 -Broken               eguard-service.exe is really the agent, so the new
 #                                                                  version never starts: rolled back after 10 min (G3)

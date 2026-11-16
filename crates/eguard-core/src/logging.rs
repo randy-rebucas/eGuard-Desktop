@@ -142,6 +142,9 @@ impl RotatingFile {
         let _ = std::fs::rename(&self.path, self.cut_name(1));
         self.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
         self.size = 0;
+        if let Some(f) = ON_ROTATE.get() {
+            f();
+        }
     }
 
     /// Appends one line, cutting the file first when it would pass the limit. Errors are dropped: a log that can't
@@ -168,6 +171,14 @@ struct Logger {
 }
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
+/// Called after each cut (`on_rotate`).
+static ON_ROTATE: OnceLock<fn()> = OnceLock::new();
+
+/// `f` runs after the log is cut, for whoever holds the file open themselves (the crash handler's own handle would
+/// otherwise follow the old file as it's renamed, and then deleted). Once; later calls are ignored.
+pub fn on_rotate(f: fn()) {
+    let _ = ON_ROTATE.set(f);
+}
 /// The log file's path, readable without the lock (`last_words`).
 static PATH: OnceLock<PathBuf> = OnceLock::new();
 

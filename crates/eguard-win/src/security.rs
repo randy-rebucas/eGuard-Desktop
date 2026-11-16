@@ -5,8 +5,8 @@ use crate::wide::{from_wide, wide};
 use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
-    SetNamedSecurityInfoW,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1,
+    SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation, OWNER_SECURITY_INFORMATION,
@@ -183,6 +183,123 @@ pub(crate) fn token_sid(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> std::i
     unsafe { sid_string(sid) }
 }
 
+/// Who may own or change a file without it being in a standard account's reach: SYSTEM, administrators, Local and
+/// Network Service, and service SIDs (`S-1-5-80-…`, `TrustedInstaller` among them).
+fn trusted_writer(sid: &str) -> bool {
+    matches!(sid, "S-1-5-18" | "S-1-5-19" | "S-1-5-20" | "S-1-5-32-544") || sid.starts_with("S-1-5-80-")
+}
+
+/// Rights that let someone change what a file or folder holds: write or add to it, delete it or what's in it,
+/// change its permissions or owner (and the generic rights that include them).
+const CHANGE_RIGHTS: u32 = 0x2 // FILE_WRITE_DATA / FILE_ADD_FILE
+    | 0x4 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+    | 0x40 // FILE_DELETE_CHILD
+    | 0x1_0000 // DELETE
+    | 0x4_0000 // WRITE_DAC
+    | 0x8_0000 // WRITE_OWNER
+    | 0x1000_0000 // GENERIC_ALL
+    | 0x4000_0000; // GENERIC_WRITE
+
+/// Whether only SYSTEM, administrators and services can change the file or folder at `path`: its owner is one of
+/// them (an owner can always change the permissions), and its permissions let no one else write to it, add to it,
+/// delete from it or change who may. Anything that can't be read counts as within reach.
+///
+/// This, not the path, is what says a program is out of the child's reach: a folder under Program Files can be
+/// writable by every user (Steam's is), and a path can spell the same folder several ways.
+pub fn out_of_users_reach(path: &std::path::Path) -> bool {
+    let p = wide(&path.to_string_lossy());
+    let (mut owner, mut dacl, mut sd): (PSID, *mut ACL, PSECURITY_DESCRIPTOR) = (null_mut(), null_mut(), null_mut());
+    // SAFETY: `p` is zero-terminated; on success `sd` is a LocalAlloc'd descriptor (freed in `judge_reach`) that
+    // `owner` and `dacl` point into.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            p.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            null_mut(),
+            &raw mut dacl,
+            null_mut(),
+            &raw mut sd,
+        )
+    };
+    // SAFETY: as above
+    rc == ERROR_SUCCESS && unsafe { judge_reach(owner, dacl, sd) }
+}
+
+/// `out_of_users_reach` for an open file (opened with read access, which includes the right to read its
+/// permissions), so the answer is about that file and no other put at its path.
+pub fn file_out_of_users_reach(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    let (mut owner, mut dacl, mut sd): (PSID, *mut ACL, PSECURITY_DESCRIPTOR) = (null_mut(), null_mut(), null_mut());
+    // SAFETY: the handle is open for the call; on success `sd` is a LocalAlloc'd descriptor (freed in
+    // `judge_reach`) that `owner` and `dacl` point into.
+    let rc = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle() as HANDLE,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &raw mut owner,
+            null_mut(),
+            &raw mut dacl,
+            null_mut(),
+            &raw mut sd,
+        )
+    };
+    // SAFETY: as above
+    rc == ERROR_SUCCESS && unsafe { judge_reach(owner, dacl, sd) }
+}
+
+/// # Safety
+/// `owner` and `dacl` point into `sd`, a descriptor from `Get*SecurityInfo` that this frees.
+unsafe fn judge_reach(owner: PSID, dacl: *mut ACL, sd: PSECURITY_DESCRIPTOR) -> bool {
+    // SAFETY: the caller guarantees the pointers
+    let out = unsafe { !owner.is_null() && sid_string(owner).is_ok_and(|s| trusted_writer(&s)) && !dacl_lets_others_change(dacl) };
+    // SAFETY: allocated by Get*SecurityInfo, freed once.
+    unsafe { LocalFree(sd as HLOCAL) };
+    out
+}
+
+/// Whether an allow entry in `dacl` gives `CHANGE_RIGHTS` to anyone not a `trusted_writer`. No DACL at all lets
+/// everyone do anything. Deny entries aren't weighed: they could only make the answer less strict.
+///
+/// # Safety
+/// `dacl` is null or points at a valid ACL.
+unsafe fn dacl_lets_others_change(dacl: *mut ACL) -> bool {
+    use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, ACE_HEADER, GetAce};
+    const ACCESS_ALLOWED: u8 = 0;
+    const ACCESS_ALLOWED_CALLBACK: u8 = 9;
+    const INHERIT_ONLY: u8 = 0x08;
+    if dacl.is_null() {
+        return true;
+    }
+    // SAFETY: the caller guarantees `dacl`
+    let count = unsafe { (*dacl).AceCount };
+    for i in 0..u32::from(count) {
+        let mut ace = null_mut();
+        // SAFETY: `i` is below the ACL's count; `ace` receives a pointer into the ACL.
+        if unsafe { GetAce(dacl, i, &raw mut ace) } == 0 {
+            return true;
+        }
+        // SAFETY: every ACE starts with an ACE_HEADER
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        if header.AceFlags & INHERIT_ONLY != 0 || !matches!(header.AceType, ACCESS_ALLOWED | ACCESS_ALLOWED_CALLBACK) {
+            continue;
+        }
+        // SAFETY: both allow types are laid out as ACCESS_ALLOWED_ACE (header, mask, then the SID)
+        let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        if allowed.Mask & CHANGE_RIGHTS == 0 {
+            continue;
+        }
+        // SAFETY: the SID starts at `SidStart` and lies inside the ACE
+        let sid = unsafe { sid_string((&raw const allowed.SidStart).cast_mut().cast()) };
+        if !sid.is_ok_and(|s| trusted_writer(&s)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// A SID as a string (`S-1-5-21-…`).
 ///
 /// # Safety
@@ -221,5 +338,28 @@ mod tests {
         assert!(is_trusted_owner("S-1-5-18") && is_trusted_owner("S-1-5-32-544") && !is_trusted_owner(&sid));
         let logon = current_logon_sid().unwrap();
         assert!(logon.starts_with("S-1-5-5-"), "{logon}");
+    }
+
+    #[test]
+    fn program_files_is_out_of_reach_and_a_users_own_folder_is_not() {
+        let system_root = std::env::var_os("SystemRoot").unwrap();
+        let system32 = std::path::Path::new(&system_root).join("System32");
+        assert!(out_of_users_reach(&system32));
+        let program_files = std::path::PathBuf::from(std::env::var_os("ProgramFiles").unwrap());
+        assert!(out_of_users_reach(&program_files) && out_of_users_reach(&program_files.join("Common Files")));
+        let notepad = std::fs::File::open(system32.join("notepad.exe")).unwrap();
+        assert!(file_out_of_users_reach(&notepad));
+        // Made by this (non-SYSTEM) user, who owns it
+        let dir = std::env::temp_dir().join(format!("eguard-reach-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("game.exe"), b"MZ").unwrap();
+        let mine = std::fs::File::open(dir.join("game.exe")).unwrap();
+        let (folder, file) = (out_of_users_reach(&dir), file_out_of_users_reach(&mine));
+        drop(mine);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!folder && !file);
+        assert!(!out_of_users_reach(&dir), "a folder that isn't there");
+        assert!(trusted_writer("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"));
+        assert!(!trusted_writer("S-1-5-32-545") && !trusted_writer("S-1-5-11") && !trusted_writer("S-1-1-0"));
     }
 }

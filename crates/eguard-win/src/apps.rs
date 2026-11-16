@@ -199,6 +199,31 @@ pub fn exe_facts(path: &Path) -> ExeFacts {
     }
 }
 
+/// The file at `path`, opened for the checks that judge it (`exe_facts_of`, `authenticode::*_of`): readable by
+/// others while it's open, but not written, renamed, replaced or deleted. Every check then reads the one file the
+/// identity was taken from, and nothing can be swapped in between (a rename keeps a file's id, so comparing ids
+/// before and after wouldn't see a file swapped away and back).
+pub fn open_for_checks(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_SHARE_READ only: no FILE_SHARE_WRITE, no FILE_SHARE_DELETE (which a rename needs too)
+    std::fs::OpenOptions::new().read(true).share_mode(1).open(path)
+}
+
+/// What `exe_facts` reads, from a file opened with `open_for_checks` (its `path`, for the name and the version
+/// resource, which can only be the same file while `file` is held).
+pub fn exe_facts_of(file: &std::fs::File, path: &Path) -> ExeFacts {
+    let imports = read_head_of(file).and_then(|b| pe::imports(&b)).unwrap_or_default();
+    let signer = authenticode::signer_names_of(file, path);
+    ExeFacts {
+        file_name: path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default(),
+        signer: signer.as_ref().and_then(|s| s.name().map(str::to_owned)),
+        signer_alt: signer.as_ref().and_then(|s| s.alternative().map(str::to_owned)),
+        product: if is_exe(path) { version::product_name(path) } else { None },
+        graphics: imports.iter().any(|d| pe::is_graphics_import(d)),
+        browser: imports.iter().any(|d| pe::is_browser_import(d)),
+    }
+}
+
 /// Which file a path names right now, and its version: what a cached verdict about a file is kept against.
 ///
 /// Size and modification time alone can be copied onto another file (`SetFileTime` and padding), which would hand a
@@ -224,17 +249,22 @@ impl FileIdentity {
 
 /// The identity of the file at `path`, read from one open handle so all of it is about the same file. `None` for
 /// a folder, or a file that can't be opened.
-#[allow(unsafe_code)]
 pub fn file_identity(path: &Path) -> Option<FileIdentity> {
     use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+    // Attributes only: enough for the id, and works on a file the caller may not read
+    let f = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(path).ok()?;
+    identity_of(&f)
+}
+
+/// The identity of an open file. `None` for a folder.
+#[allow(unsafe_code)]
+pub fn identity_of(f: &std::fs::File) -> Option<FileIdentity> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FileIdInfo, GetFileInformationByHandle,
-        GetFileInformationByHandleEx,
+        BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
     };
-    // Attributes only: enough for the id, and works on a file the caller may not read
-    let f = std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(path).ok()?;
     let meta = f.metadata().ok().filter(std::fs::Metadata::is_file)?;
     let h = f.as_raw_handle() as HANDLE;
     let mut info = FILE_ID_INFO::default();
@@ -278,7 +308,7 @@ fn named_paths(location: Option<&str>, icon: Option<&str>, uninstall: &str) -> V
     [location.map(|l| PathBuf::from(l.trim().trim_matches('"'))), icon.and_then(clean_path), command_exe(uninstall).filter(|p| !is_host(p))]
         .into_iter()
         .flatten()
-        .filter(|p| p.is_absolute())
+        .filter(|p| plain_local(p))
         .collect()
 }
 
@@ -387,11 +417,11 @@ impl Collector<'_> {
                 c.launcher = Some(launcher);
                 c.ids.extend(id);
             }
-            let location = e.string("InstallLocation").map(PathBuf::from).filter(|p| p.is_dir());
+            let location = e.string("InstallLocation").map(PathBuf::from).filter(|p| plain_local(p) && p.is_dir());
             if location.as_deref().is_some_and(|p| self.under_windows(p)) {
                 continue;
             }
-            let icon = e.string("DisplayIcon").and_then(|s| clean_path(&s)).filter(|p| is_exe(p) && p.is_file());
+            let icon = e.string("DisplayIcon").and_then(|s| clean_path(&s)).filter(|p| is_exe(p) && plain_local(p) && p.is_file());
             let exe = icon
                 .filter(|p| p.file_name().is_some_and(|f| !is_helper(&f.to_string_lossy())))
                 .or_else(|| location.as_deref().and_then(|d| main_exe(d, &display, 2)));
@@ -402,7 +432,7 @@ impl Collector<'_> {
                 self.with_exe(&mut c, exe);
             }
             // Evidence of who made it when the main exe says nothing: the uninstaller's signature, or the cached MSI's
-            let uninstaller = command_exe(&uninstall).filter(|p| p.is_file() && !self.under_windows(p));
+            let uninstaller = command_exe(&uninstall).filter(|p| plain_local(p) && p.is_file() && !self.under_windows(p));
             let msi = (e.dword("WindowsInstaller") == Some(1)).then(|| msi_package(&name, msi_sid)).flatten();
             for evidence in [uninstaller, msi].into_iter().flatten() {
                 if c.exe.as_ref().and_then(|x| x.signer.as_ref()).is_some() || c.other_signer.is_some() {
@@ -422,11 +452,12 @@ impl Collector<'_> {
 
     fn steam(&mut self, roots: &[PathBuf]) {
         let mut libraries: Vec<PathBuf> = Vec::new();
-        for root in roots {
+        // The roots and libraries come from the child's registry and files: never a share or a device
+        for root in roots.iter().filter(|r| plain_local(r)) {
             let vdf = root.join("steamapps").join("libraryfolders.vdf");
             libraries.push(root.clone());
-            if let Ok(text) = std::fs::read_to_string(&vdf) {
-                libraries.extend(launchers::steam_libraries(&text).into_iter().map(PathBuf::from));
+            if let Some(text) = read_small_text(&vdf) {
+                libraries.extend(launchers::steam_libraries(&text).into_iter().map(PathBuf::from).filter(|l| plain_local(l)));
             }
         }
         let mut seen = HashSet::new();
@@ -439,8 +470,12 @@ impl Collector<'_> {
                 if !(n.starts_with("appmanifest_") && Path::new(&n).extension().is_some_and(|x| x.eq_ignore_ascii_case("acf"))) {
                     continue;
                 }
-                let Some(app) = std::fs::read_to_string(e.path()).ok().and_then(|t| launchers::steam_app(&t)) else { continue };
+                let Some(app) = read_small_text(&e.path()).and_then(|t| launchers::steam_app(&t)) else { continue };
+                // An absolute `installdir` would replace the library's folder
                 let dir = apps.join("common").join(&app.installdir);
+                if !plain_local(&dir) || !dir.starts_with(&apps) {
+                    continue;
+                }
                 let mut c = Candidate::new(&app.name, Origin::Launcher);
                 c.launcher = Some(Launcher::Steam);
                 c.ids.push(AppId::new(AppIdKind::Steam, &app.appid));
@@ -462,11 +497,14 @@ impl Collector<'_> {
             if !e.file_name().to_string_lossy().to_ascii_lowercase().ends_with(".item") {
                 continue;
             }
-            let Some(app) = std::fs::read(e.path()).ok().and_then(|b| launchers::epic_item(&b)) else { continue };
+            let Some(app) = read_small(&e.path()).and_then(|b| launchers::epic_item(&b)) else { continue };
             let mut c = Candidate::new(&app.name, Origin::Launcher);
             c.launcher = Some(Launcher::Epic);
             c.ids.push(AppId::new(AppIdKind::Epic, &app.app_name));
             let location = PathBuf::from(&app.install_location);
+            if !plain_local(&location) {
+                continue;
+            }
             let exe = app.launch_executable.map(|x| location.join(x)).filter(|p| p.is_file()).or_else(|| main_exe(&location, &app.name, 3));
             if let Some(exe) = exe {
                 self.with_exe(&mut c, &exe);
@@ -510,15 +548,23 @@ impl Collector<'_> {
 
     fn store(&mut self, sid: &str) {
         let Some(repo) = Key::open(Root::Users, &format!(r"{sid}_Classes\{STORE_REPO}"), View::Native) else { return };
+        let windows_apps =
+            std::env::var_os("ProgramFiles").map_or_else(|| PathBuf::from(r"C:\Program Files"), PathBuf::from).join("WindowsApps");
         let mut families = HashSet::new();
         for full in repo.subkeys() {
             let Some(family) = launchers::store_family(&full) else { continue };
             let Some(pkg) = repo.sub(&full, View::Native) else { continue };
             let Some(root) = pkg.string("PackageRootFolder").map(PathBuf::from) else { continue };
+            // The user's own registry names the folder: only a package Windows installed is read, so this service
+            // (SYSTEM) never opens a share (it would sign in there as the computer), a device or a folder the user
+            // made, and the publisher below is from a manifest the Store put there
+            if !store_root_ok(&root, &full, &windows_apps) {
+                continue;
+            }
             if self.under_windows(&root) || !families.insert(family.clone()) {
                 continue;
             }
-            let Some(m) = std::fs::read_to_string(root.join("AppxManifest.xml")).ok().and_then(|x| launchers::store_manifest(&x)) else {
+            let Some(m) = read_small_text(&root.join("AppxManifest.xml")).and_then(|x| launchers::store_manifest(&x)) else {
                 continue;
             };
             let Some(exe) = m.executable.as_ref().map(|e| root.join(e)) else { continue };
@@ -568,12 +614,12 @@ impl Collector<'_> {
                 if name.to_ascii_lowercase().contains("uninstall") {
                     continue;
                 }
-                let Some(target) = std::fs::read(&p).ok().and_then(|b| launchers_lnk(&b)) else { continue };
+                let Some(target) = read_small(&p).and_then(|b| launchers_lnk(&b)) else { continue };
                 let app = squirrel_app(&target);
                 // A Squirrel updater whose app is gone: the shortcut's name is all there is to go on
                 let updater_only = app.is_none() && target.file_name().is_some_and(|f| f.eq_ignore_ascii_case("update.exe"));
                 let target = app.unwrap_or(target);
-                if !is_exe(&target) || !target.is_file() || self.under_windows(&target) {
+                if !is_exe(&target) || !plain_local(&target) || !target.is_file() || self.under_windows(&target) {
                     continue;
                 }
                 let mut c = Candidate::new(&name, Origin::Shortcut);
@@ -646,10 +692,60 @@ impl Collector<'_> {
     }
 }
 
+/// Whether a Store package's folder (from the user's registry) is one Windows installed: a plain local path, inside
+/// `windows_apps` once every link and `..` is resolved, in the folder named for the package (`full_name`).
+fn store_root_ok(root: &Path, full_name: &str, windows_apps: &Path) -> bool {
+    // Checked as written first: resolving a share's path would already reach out to it
+    if !plain_local(root) {
+        return false;
+    }
+    let (Ok(real), Ok(base)) = (std::fs::canonicalize(root), std::fs::canonicalize(windows_apps)) else { return false };
+    let (real, base) = (lower(&real), lower(&base));
+    real.strip_prefix(&format!("{base}\\")).is_some_and(|rest| rest == full_name.to_lowercase())
+}
+
+/// The largest launcher file (`.lnk`, `.vdf`, `.acf`, `.item`) the scan reads: real ones are a few KB.
+const LAUNCHER_FILE_MAX: u64 = 1024 * 1024;
+
+/// A small file the scan reads to learn about apps (a shortcut, a launcher's manifest), or `None`. These files are
+/// in folders the child can write to, and the scan runs as SYSTEM inside the service: only a plain local path, only
+/// a regular file (never a pipe that would hold the read forever), and at most `LAUNCHER_FILE_MAX` bytes (a 4 GB
+/// file named `x.lnk` mustn't take the service's memory).
+fn read_small(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if !plain_local(path) {
+        return None;
+    }
+    let f = std::fs::File::open(path).ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut out = Vec::new();
+    f.take(LAUNCHER_FILE_MAX + 1).read_to_end(&mut out).ok()?;
+    (out.len() as u64 <= LAUNCHER_FILE_MAX).then_some(out)
+}
+
+/// `read_small` as text.
+fn read_small_text(path: &Path) -> Option<String> {
+    String::from_utf8(read_small(path)?).ok()
+}
+
+/// `X:\...` with no `..`: not a share (`\\host\...`), a device or `\\?\` path, or a relative one.
+fn plain_local(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' && !s.split(['\\', '/']).any(|part| part == "..")
+}
+
 /// A Store package's name as people read it. Packages name themselves with resource references: `ms-resource:Name`
 /// means the package's `Resources/Name`, `ms-resource:Dir/Name` its `Dir/Name`; the shell looks them up.
 fn store_text(full_name: &str, package: &str, s: &str) -> Option<String> {
-    let reference = if s.starts_with('@') {
+    let reference = if let Some(rest) = s.strip_prefix('@') {
+        // Only this package's own resources (`@{<full name>?ms-resource:…}`), never `@file.dll,-1` or another
+        // package's: the string is from the user's registry, and resolving it would load what it names as SYSTEM
+        if !rest.to_lowercase().starts_with(&format!("{{{}?", full_name.to_lowercase())) {
+            return None;
+        }
         s.to_owned()
     } else if let Some(r) = s.strip_prefix("ms-resource:") {
         let uri = if r.starts_with("//") {
@@ -672,9 +768,15 @@ fn launchers_lnk(b: &[u8]) -> Option<PathBuf> {
 
 /// The start of a file, for its PE headers and import table.
 fn read_head(path: &Path) -> Option<Vec<u8>> {
-    use std::io::Read;
+    read_head_of(&std::fs::File::open(path).ok()?)
+}
+
+/// The start of an open file, read from its beginning.
+fn read_head_of(mut f: &std::fs::File) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek};
+    f.seek(std::io::SeekFrom::Start(0)).ok()?;
     let mut b = Vec::new();
-    std::fs::File::open(path).ok()?.take(PE_READ_BYTES).read_to_end(&mut b).ok()?;
+    f.take(PE_READ_BYTES).read_to_end(&mut b).ok()?;
     Some(b)
 }
 
@@ -746,6 +848,72 @@ pub fn collect(cache: &mut ExeCache) -> Collected {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_held_for_its_checks_cant_be_swapped_and_reads_the_same() {
+        let dir = std::env::temp_dir().join(format!("eguard-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notepad.exe");
+        std::fs::copy(r"C:\Windows\System32\notepad.exe", &path).unwrap();
+        let file = open_for_checks(&path).unwrap();
+        // Renamed away, written or deleted: refused while held; still readable and runnable by others
+        assert!(std::fs::rename(&path, dir.join("moved.exe")).is_err());
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        assert!(std::fs::read(&path).is_ok());
+        assert_eq!(identity_of(&file), file_identity(&path));
+        assert_eq!(exe_facts_of(&file, &path), exe_facts(&path));
+        // Read twice through the same handle: the same answer (each check starts from the file's beginning)
+        assert_eq!(exe_facts_of(&file, &path), exe_facts_of(&file, &path));
+        drop(file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn launcher_files_are_read_only_when_small_local_and_regular() {
+        let dir = std::env::temp_dir().join(format!("eguard-small-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (small, big) = (dir.join("a.lnk"), dir.join("b.lnk"));
+        std::fs::write(&small, b"shortcut").unwrap();
+        std::fs::write(&big, vec![0u8; LAUNCHER_FILE_MAX as usize + 1]).unwrap();
+        assert_eq!(read_small(&small).as_deref(), Some(&b"shortcut"[..]));
+        assert_eq!(read_small(&big), None);
+        assert_eq!(read_small(&dir), None, "a folder");
+        std::fs::remove_dir_all(&dir).unwrap();
+        for p in [r"\\host\share\x.lnk", r"\\.\pipe\x\steamapps\libraryfolders.vdf", r"\\?\C:\x.lnk", r"C:\a\..\x.lnk"] {
+            assert_eq!(read_small(Path::new(p)), None, "{p}");
+        }
+    }
+
+    #[test]
+    fn a_store_package_folder_must_be_a_plain_path_inside_windowsapps() {
+        assert!(plain_local(Path::new(r"C:\Program Files\WindowsApps\Pkg_1.0_x64__abc")));
+        for p in [
+            r"\\evil\share\Pkg",
+            r"\\?\C:\Program Files\WindowsApps\Pkg",
+            r"\\.\pipe\x",
+            r"Pkg",
+            r"C:\Program Files\WindowsApps\..\x",
+            "C:",
+        ] {
+            assert!(!plain_local(Path::new(p)), "{p}");
+        }
+        let apps = std::env::temp_dir().join(format!("eguard-windowsapps-{}", std::process::id()));
+        let pkg = apps.join("Pkg_1.0_x64__abc");
+        std::fs::create_dir_all(&pkg).unwrap();
+        assert!(store_root_ok(&pkg, "pkg_1.0_x64__ABC", &apps));
+        // Another package's folder, the folder itself, one outside it, a share
+        assert!(!store_root_ok(&pkg, "Other_1.0_x64__abc", &apps));
+        assert!(!store_root_ok(&apps, "Pkg_1.0_x64__abc", &apps));
+        assert!(!store_root_ok(&std::env::temp_dir(), "Pkg_1.0_x64__abc", &apps));
+        assert!(!store_root_ok(Path::new(r"\\127.0.0.1\c$\Pkg_1.0_x64__abc"), "Pkg_1.0_x64__abc", &apps));
+        std::fs::remove_dir_all(&apps).unwrap();
+        // Only this package's own resources are looked up
+        assert_eq!(store_text("Pkg_1.0_x64__abc", "Pkg", r"@C:\Users\kid\x.dll,-1"), None);
+        assert_eq!(store_text("Pkg_1.0_x64__abc", "Pkg", "@{Other_1.0_x64__abc?ms-resource://Other/Name}"), None);
+        assert_eq!(store_text("Pkg_1.0_x64__abc", "Pkg", "Plain Name").as_deref(), Some("Plain Name"));
+    }
 
     #[test]
     fn registry_paths_and_command_lines() {

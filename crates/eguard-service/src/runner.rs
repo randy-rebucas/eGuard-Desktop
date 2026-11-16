@@ -356,7 +356,11 @@ impl Runner {
                     self.save(&mut inner);
                     // Synced and saved: a new version is healthy, and the guard keeps it
                     if self.installs_updates() && inner.engine.has_synced() && !self.health_noted.load(Ordering::SeqCst) {
-                        self.health_noted.store(crate::update::note_health(APP_VERSION), Ordering::SeqCst);
+                        let told = crate::update::note_health(APP_VERSION);
+                        if told {
+                            self.store.forget_before_update();
+                        }
+                        self.health_noted.store(told, Ordering::SeqCst);
                     }
                 }
                 self.start_scan_if_due(&mut inner);
@@ -620,6 +624,9 @@ impl Runner {
         });
         match result {
             Ok(true) => {
+                if let Err(e) = self.store.keep_before_update(&self.lock().engine.data) {
+                    log::warn(&format!("couldn't keep the state before the update: {e}"));
+                }
                 log::warn(&format!("eGuard {} is in the guard's cache; stopping so the guard can put it in place", m.version));
                 if let Some(shared) = self.shared.get() {
                     shared.close_agents();

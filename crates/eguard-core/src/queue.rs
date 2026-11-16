@@ -6,12 +6,14 @@
 //!
 //! Order is kept per lane (usage, report, and each event type): an item waits while an older one in its lane is
 //! waiting to be retried. Lanes don't hold each other up. Failures back off from 30 seconds to 15 minutes with
-//! jitter. A `400` drops the item (a bug in this build; the caller logs it). A `401` never drops anything and never
+//! jitter. A `400` drops the item (a bug in this build; the caller logs it). A `413` (the body is over the server's
+//! limit) splits the item and sends both halves at once (`APPS_FOUND`), or sends `/usage` with fewer apps; an item that
+//! can't be made smaller is dropped. A `401` never drops anything and never
 //! switches protection off: the agent keeps everything and keeps retrying at the slowest pace (spec principle 5).
 //! An item the server keeps failing on (5xx, 403, 404, 413…) is given up after `MAX_REJECTIONS` tries or
 //! `GIVE_UP_AFTER_MS`, so it can't hold its lane forever; no network, `401` and `429` never count toward that.
 
-use crate::wire::{EventEnvelope, ReportRequest, UsageReport};
+use crate::wire::{DeviceEvent, EventEnvelope, ReportRequest, UsageReport};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -83,7 +85,9 @@ pub enum SendOutcome {
     Unauthorized,
     /// 429. `retry_after_secs` from the response, when it said.
     RateLimited { retry_after_secs: Option<u32> },
-    /// The server answered with another status (5xx, 403, 404, 413…). Counts toward giving the item up.
+    /// 413: the body is over the server's limit. Split or trimmed and sent again; dropped when it can't be.
+    TooLarge,
+    /// The server answered with another status (5xx, 403, 404…). Counts toward giving the item up.
     Failed,
     /// No answer: no network, DNS, TLS, a timeout. Not the item's fault, so it's kept however long it takes.
     Unreachable,
@@ -97,6 +101,7 @@ impl SendOutcome {
             409 => Self::Conflict,
             401 => Self::Unauthorized,
             429 => Self::RateLimited { retry_after_secs: None },
+            413 => Self::TooLarge,
             _ => Self::Failed,
         }
     }
@@ -217,6 +222,19 @@ impl OutboundQueue {
                 Some(Settled::Done)
             }
             SendOutcome::BadRequest | SendOutcome::Conflict => Some(Settled::Dropped(self.items.remove(i).item)),
+            SendOutcome::TooLarge => {
+                let Some(smaller) = self.smaller(i) else { return Some(Settled::Dropped(self.items.remove(i).item)) };
+                let q = &mut self.items[i];
+                q.not_before_ms = now_ms;
+                if let Smaller::Split(item) = smaller {
+                    // Right behind the first half, so its lane keeps its order
+                    let seq = self.next_seq;
+                    self.next_seq += 1;
+                    let rest = Queued { seq, item, attempts: 0, not_before_ms: now_ms, rejections: 0, first_rejected_ms: None };
+                    self.items.insert(i + 1, rest);
+                }
+                Some(Settled::Retry { not_before_ms: now_ms })
+            }
             SendOutcome::Unauthorized | SendOutcome::RateLimited { .. } | SendOutcome::Failed | SendOutcome::Unreachable => {
                 let q = &mut self.items[i];
                 q.attempts += 1;
@@ -241,6 +259,23 @@ impl OutboundQueue {
         }
     }
 
+    /// Makes item `i` smaller after a 413: `APPS_FOUND` keeps the first half of its apps (and its `eventId`, which the
+    /// server never took) and returns the second half as a new event; `/usage` keeps the larger half of its apps (a
+    /// day's totals replace each other on the server, so they can't be split). `None` when it can't get smaller.
+    fn smaller(&mut self, i: usize) -> Option<Smaller> {
+        match &mut self.items[i].item {
+            Outbound::Event(EventEnvelope { event: DeviceEvent::AppsFound { apps }, .. }) if apps.len() > 1 => {
+                let rest = apps.split_off(apps.len() / 2);
+                Some(Smaller::Split(Outbound::Event(EventEnvelope::new(DeviceEvent::AppsFound { apps: rest }))))
+            }
+            Outbound::Usage(u) if !u.apps.is_empty() => {
+                u.apps.truncate(u.apps.len() / 2);
+                Some(Smaller::Trimmed)
+            }
+            _ => None,
+        }
+    }
+
     /// Drops totals for days the server no longer accepts (before `oldest`, `YYYY-MM-DD`).
     pub fn prune_usage_before(&mut self, oldest: &str) {
         self.items.retain(|q| !matches!(&q.item, Outbound::Usage(u) if u.date.as_str() < oldest));
@@ -252,6 +287,14 @@ impl OutboundQueue {
             q.not_before_ms = q.not_before_ms.min(now_ms);
         }
     }
+}
+
+/// How an item was made smaller after a 413.
+enum Smaller {
+    /// It kept a part; the rest is this new item.
+    Split(Outbound),
+    /// It's smaller and whole (what was left out isn't sent).
+    Trimmed,
 }
 
 /// Exponential backoff for the `attempts`-th failure: 30 s, 60 s, 120 s … up to 15 minutes, then between half and
@@ -456,5 +499,82 @@ mod tests {
         }
         assert_eq!(q.len(), MAX_EVENTS);
         assert!(q.items().iter().any(|i| i.item.lane() == "event:TAMPER"));
+    }
+
+    fn big_app(i: usize) -> crate::wire::FoundApp {
+        use crate::wire::{AppId, AppIdKind};
+        crate::wire::FoundApp {
+            app: format!("App {i}"),
+            ids: (0..8).map(|n| AppId::new(AppIdKind::Exe, &format!("{n}-{}", "x".repeat(190)))).collect(),
+            source: None,
+            category: None,
+        }
+    }
+
+    #[test]
+    fn apps_found_is_split_by_size_not_only_by_count() {
+        let apps: Vec<_> = (0..200).map(big_app).collect();
+        let events = DeviceEvent::apps_found(&apps);
+        assert!(events.len() > 1, "200 apps with 8 long ids each don't fit one body");
+        let mut total = 0;
+        for e in &events {
+            let DeviceEvent::AppsFound { apps } = e else { panic!() };
+            total += apps.len();
+            assert!(serde_json::to_vec(&EventEnvelope::new(e.clone())).unwrap().len() <= crate::wire::BODY_BYTES_MAX);
+        }
+        assert_eq!(total, 200);
+    }
+
+    #[test]
+    fn a_413_splits_apps_found_and_trims_usage_and_drops_what_cant_shrink() {
+        let mut q = OutboundQueue::default();
+        let apps: Vec<_> = (0..4).map(big_app).collect();
+        let first = EventEnvelope::new(DeviceEvent::AppsFound { apps });
+        let id = first.event_id.clone();
+        let a = q.push_event(first, 0);
+        assert_eq!(q.settle(a, SendOutcome::from_status(413), 5, 0.0), Some(Settled::Retry { not_before_ms: 5 }));
+        let found: Vec<_> = q
+            .items()
+            .iter()
+            .map(|i| match &i.item {
+                Outbound::Event(EventEnvelope { event_id, event: DeviceEvent::AppsFound { apps } }) => (event_id.clone(), apps.len()),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(found.len(), 2);
+        assert_eq!((found[0].0.as_str(), found[0].1, found[1].1), (id.as_str(), 2, 2));
+        assert_ne!(found[1].0, id);
+        // Both halves are due now, the first one first
+        assert_eq!(q.due(5).len(), 1);
+
+        let mut q = OutboundQueue::default();
+        let mut u = usage("2026-11-11", 90);
+        u.apps = (0..10).map(|i| crate::wire::UsageApp { name: format!("A{i}"), minutes: 1, ids: vec![] }).collect();
+        q.push_usage(u, 0);
+        let seq = q.items()[0].seq;
+        assert!(matches!(q.settle(seq, SendOutcome::TooLarge, 0, 0.0), Some(Settled::Retry { .. })));
+        assert!(matches!(&q.items()[0].item, Outbound::Usage(u) if u.apps.len() == 5 && u.total_minutes == 90));
+
+        let mut q = OutboundQueue::default();
+        let t = q.push_event(tamper(TamperKind::FilesChanged), 0);
+        assert!(matches!(q.settle(t, SendOutcome::TooLarge, 0, 0.0), Some(Settled::Dropped(_))));
+        // 400 still drops
+        assert_eq!(SendOutcome::from_status(400), SendOutcome::BadRequest);
+    }
+
+    #[test]
+    fn usage_is_trimmed_to_the_body_limit_keeping_its_totals() {
+        let mut u = usage("2026-11-11", 600);
+        u.apps = (0..200)
+            .map(|i| crate::wire::UsageApp {
+                name: format!("App {i}"),
+                minutes: 1,
+                ids: (0..8).map(|n| crate::wire::AppId::new(crate::wire::AppIdKind::Exe, &format!("{n}{}", "y".repeat(190)))).collect(),
+            })
+            .collect();
+        u.fit_to(crate::wire::BODY_BYTES_MAX);
+        assert!(serde_json::to_vec(&u).unwrap().len() <= crate::wire::BODY_BYTES_MAX);
+        assert!(!u.apps.is_empty() && u.apps.len() < 200);
+        assert_eq!(u.total_minutes, 600);
     }
 }

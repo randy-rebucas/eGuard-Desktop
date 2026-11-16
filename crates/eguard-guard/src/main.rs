@@ -66,7 +66,13 @@ fn restore(installed: &Path, copy: &Path, tag: &str) -> std::io::Result<()> {
         std::fs::rename(installed, &aside)?;
         let _ = std::fs::remove_file(&aside);
     }
-    std::fs::copy(copy, installed).map(|_| ())
+    put(installed, copy)
+}
+
+/// Writes the cache's copy at `installed`, flushed to disk before it takes the name: a power cut never leaves a
+/// half-written program there.
+fn put(installed: &Path, copy: &Path) -> std::io::Result<()> {
+    files::write_atomic(installed, &std::fs::read(copy)?)
 }
 
 /// Deletes the files set aside in `dir` (`restore`) that nothing runs any more.
@@ -82,14 +88,41 @@ fn sweep(dir: &Path) {
 }
 
 /// Puts every program file that differs from the cache's in place. An update's: the old one is set aside as `old`.
+///
+/// All or nothing: every file to replace is set aside first, and if one can't be (someone holds it open), those
+/// already moved go back, so the computer is never left with programs of two versions.
 fn put_in_place(dir: &Path, cache: &Path) -> Result<(), String> {
+    let mut changed = Vec::new();
     for p in update::PROGRAMS {
-        let (installed, copy) = (dir.join(p), cache.join(p));
-        match check(&installed, &copy) {
+        match check(&dir.join(p), &cache.join(p)) {
             Check::Same => {}
             Check::NoCopy => return Err(format!("the cache has no {p}")),
-            Check::Changed => restore(&installed, &copy, "old").map_err(|e| format!("{p}: {e}"))?,
+            Check::Changed => changed.push(p),
         }
+    }
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for p in &changed {
+        let installed = dir.join(p);
+        if !installed.exists() {
+            continue;
+        }
+        let aside = installed.with_extension(format!("old-{secs}"));
+        if let Err(e) = std::fs::rename(&installed, &aside) {
+            for (installed, aside) in moved.iter().rev() {
+                if let Err(back) = std::fs::rename(aside, installed) {
+                    logging::error(&format!("{} couldn't be put back after a failed swap: {back}", installed.display()));
+                }
+            }
+            return Err(format!("{p}: {e}"));
+        }
+        moved.push((installed, aside));
+    }
+    for p in &changed {
+        put(&dir.join(p), &cache.join(p)).map_err(|e| format!("{p}: {e}"))?;
+    }
+    for (_, aside) in moved {
+        let _ = std::fs::remove_file(aside);
     }
     Ok(())
 }
@@ -145,7 +178,7 @@ fn update_step(dir: &Path, cache: &Path, h: &Handoff, action: GuardAction) -> bo
             let placed = if end_service { end_service_and_put_in_place(dir, cache) } else { put_in_place(dir, cache) };
             match placed {
                 Ok(()) => {
-                    match write_handoff(&Handoff { step: Step::Running, ..h.clone() }) {
+                    match write_handoff(&Handoff { step: Step::Running, step_since_ms: Some(wall_ms()), ..h.clone() }) {
                         Ok(()) => logging::info(&format!("eGuard {} is in place of {}; starting it", h.to, h.from)),
                         Err(e) => logging::error(&format!("eGuard {} is in place, but the hand-off couldn't be updated: {e}", h.to)),
                     }
@@ -153,7 +186,14 @@ fn update_step(dir: &Path, cache: &Path, h: &Handoff, action: GuardAction) -> bo
                         logging::error(&format!("eGuard {} couldn't be started: {e}", h.to));
                     }
                 }
-                Err(e) => logging::warn(&format!("eGuard {} couldn't be put in place yet: {e}", h.to)),
+                Err(e) => {
+                    // The old files are all still there (`put_in_place`): the old version protects the computer
+                    // meanwhile, rather than nothing until the swap can be made or is given up
+                    logging::warn(&format!("eGuard {} couldn't be put in place yet: {e}; {} runs meanwhile", h.to, h.from));
+                    if let Err(e) = start_service() {
+                        logging::error(&format!("eGuard {} couldn't be started again: {e}", h.from));
+                    }
+                }
             }
         }
         GuardAction::Commit => {
@@ -179,8 +219,12 @@ fn update_step(dir: &Path, cache: &Path, h: &Handoff, action: GuardAction) -> bo
                 logging::error(&format!("{} couldn't be put back yet: {e}; trying again", h.from));
                 return false;
             }
-            let outcome = Outcome { version: h.to.clone(), why: why.into() };
-            let _ = files::write_atomic(&cache.join(update::OUTCOME_FILE), &serde_json::to_vec(&outcome).unwrap_or_default());
+            // A version that never ran isn't known to be bad (its files were held, the disk was full): it's offered
+            // again later. One that ran and didn't work is never tried again
+            if h.step == Step::Running {
+                let outcome = Outcome { version: h.to.clone(), why: why.into() };
+                let _ = files::write_atomic(&cache.join(update::OUTCOME_FILE), &serde_json::to_vec(&outcome).unwrap_or_default());
+            }
             finish(cache);
             match start_service() {
                 Ok(()) => logging::warn(&format!("eGuard {} is back in place and started", h.from)),
@@ -191,11 +235,36 @@ fn update_step(dir: &Path, cache: &Path, h: &Handoff, action: GuardAction) -> bo
     false
 }
 
-/// The service's state; `None` when it isn't there (eGuard was removed) or can't be asked.
-fn service_state() -> Option<ServiceState> {
-    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).ok()?;
-    let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS).ok()?;
-    service.query_status().ok().map(|s| s.current_state)
+/// What the service manager says about the service.
+enum Service {
+    State(ServiceState),
+    /// It isn't there: eGuard was removed.
+    Gone,
+    /// It couldn't be asked this time.
+    Unknown(String),
+}
+
+fn service_state() -> Service {
+    /// `ERROR_SERVICE_DOES_NOT_EXIST`
+    const NO_SUCH_SERVICE: i32 = 1060;
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) {
+        Ok(m) => m,
+        Err(e) => return Service::Unknown(e.to_string()),
+    };
+    let service = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
+        Ok(s) => s,
+        Err(windows_service::Error::Winapi(e)) if e.raw_os_error() == Some(NO_SUCH_SERVICE) => return Service::Gone,
+        Err(e) => return Service::Unknown(e.to_string()),
+    };
+    match service.query_status() {
+        Ok(s) => Service::State(s.current_state),
+        Err(e) => Service::Unknown(e.to_string()),
+    }
+}
+
+/// The computer's clock, in milliseconds since 1970.
+fn wall_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn start_service() -> Result<(), String> {
@@ -212,7 +281,9 @@ fn tell(kind: TamperKind) -> bool {
 
 fn main() {
     eguard_win::crash::install();
-    logging::init("guard", Some(&files::program_data_dir().join("logs").join("guard.log")), false);
+    let log = files::program_data_dir().join("logs").join("guard.log");
+    logging::init("guard", Some(&log), false);
+    eguard_win::crash::log_faults_to(&"guard", &log);
     let dir = install_dir();
     let cache = files::program_data_dir().join("cache");
     logging::info(&format!("eguard-guard {} watching {}", update::VERSION, dir.display()));
@@ -222,15 +293,35 @@ fn main() {
     let mut seen: Option<(Step, Instant)> = None;
     sweep(&dir);
     loop {
-        let Some(state) = service_state() else {
-            logging::info("eGuard's service isn't there any more; the guard ends");
-            return;
+        let state = match service_state() {
+            Service::State(s) => s,
+            Service::Gone => {
+                logging::info("eGuard's service isn't there any more; the guard ends");
+                return;
+            }
+            // Ending here would leave no guard until the next boot (the task restarts only a failed run)
+            Service::Unknown(e) => {
+                logging::warn(&format!("couldn't ask the service manager about eGuard's service ({e}); asking again"));
+                std::thread::sleep(ROUND);
+                continue;
+            }
         };
         let handoff = read::<Handoff>(&cache.join(update::HANDOFF_FILE));
         if let Some(h) = &handoff {
+            // Since when: from the hand-off when it says (a guard before this one saw the step start), else from now,
+            // written there for the next guard
             let since = match seen {
                 Some((step, at)) if step == h.step => at,
-                _ => seen.insert((h.step, Instant::now())).1,
+                _ => {
+                    let at = if let Some(ms) = h.step_since_ms {
+                        Instant::now().checked_sub(Duration::from_millis(u64::try_from(wall_ms() - ms).unwrap_or(0)))
+                    } else {
+                        let marked = Handoff { step_since_ms: Some(wall_ms()), ..h.clone() };
+                        let _ = files::write_atomic(&cache.join(update::HANDOFF_FILE), &serde_json::to_vec(&marked).unwrap_or_default());
+                        None
+                    };
+                    seen.insert((h.step, at.unwrap_or_else(Instant::now))).1
+                }
             };
             let healthy = read::<Health>(&cache.join(update::HEALTH_FILE)).map(|x| x.version);
             let waited = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -292,6 +383,33 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_swap_with_a_held_file_changes_nothing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = std::env::temp_dir().join(format!("eguard-swap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (dir, cache) = (root.join("installed"), root.join("cache"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        for p in update::PROGRAMS {
+            std::fs::write(dir.join(p), b"old").unwrap();
+            std::fs::write(cache.join(p), b"new").unwrap();
+        }
+        // Someone holds the last program open without letting it be renamed (a child's read-only handle)
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(dir.join(update::PROGRAMS[2])).unwrap();
+        assert!(put_in_place(&dir, &cache).is_err());
+        for p in update::PROGRAMS {
+            assert_eq!(std::fs::read(dir.join(p)).unwrap(), b"old", "{p}");
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "nothing left aside");
+        drop(held);
+        put_in_place(&dir, &cache).unwrap();
+        for p in update::PROGRAMS {
+            assert_eq!(std::fs::read(dir.join(p)).unwrap(), b"new", "{p}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn a_changed_or_missing_file_is_put_back_from_the_copy() {

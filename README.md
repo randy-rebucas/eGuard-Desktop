@@ -104,8 +104,9 @@ afterwards.
 - **Secrets stay out of logs.** The device token and removal secret are redacted in every `Debug` impl, stored
   DPAPI-encrypted, and never sent over the pipe.
 - **Signing keys are built in**, never fetched. Builds use the dev key unless `EGUARD_POLICY_PUBLIC_KEYS` is set at
-  compile time; a release must never ship with the dev key. Release builds also need `EGUARD_SERVER_URL` and only
-  talk `https://`.
+  compile time; a release must never ship with the dev key. A build with the production key talks to
+  `https://www.eguard.family` (or `EGUARD_SERVER_URL`), only over `https://`; `installer\release.ps1` builds the
+  release MSI.
 - **The server isn't changed from here.** If it's wrong or missing something, it's written up in
   [docs/STATUS.md](docs/STATUS.md) for the owner.
 

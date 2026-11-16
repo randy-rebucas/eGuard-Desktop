@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 pub const APP_NAME_MAX: usize = 80;
 /// Most apps in one `APPS_FOUND` event or one `/usage` report.
 pub const APPS_PER_MESSAGE_MAX: usize = 200;
+/// The largest body eGuard sends, in bytes of JSON. The server reads at most 64 KB (`request-body.ts`); the rest is
+/// room for the envelope and whatever a later version adds.
+pub const BODY_BYTES_MAX: usize = 48 * 1024;
 /// Most ids on one app (`AppIds` in app-identity.ts).
 pub const IDS_PER_APP_MAX: usize = 8;
 
@@ -612,6 +615,20 @@ pub struct UsageReport {
     pub hourly: Option<[u32; 24]>,
 }
 
+impl UsageReport {
+    /// Leaves out the smallest apps (they come last) until the body is at most `max` bytes of JSON. The day's total
+    /// and hourly minutes always stay: they're what the parent's screen time shows.
+    pub fn fit_to(&mut self, max: usize) {
+        let size = |r: &Self| serde_json::to_vec(r).map_or(0, |v| v.len());
+        while !self.apps.is_empty() && size(self) > max {
+            // Halving first keeps this quick for a body far over; one at a time near the limit
+            let over = size(self) - max;
+            let drop = if over > max { self.apps.len().div_ceil(2) } else { 1 };
+            self.apps.truncate(self.apps.len() - drop);
+        }
+    }
+}
+
 /* ---------- /events ---------- */
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -720,9 +737,27 @@ impl DeviceEvent {
         }
     }
 
-    /// `APPS_FOUND` events for a scan: 1 to 200 apps each, so a big scan becomes several events.
+    /// `APPS_FOUND` events for a scan: 1 to 200 apps each and at most `BODY_BYTES_MAX` of JSON (apps with long ids
+    /// fill a body long before 200), so a big scan becomes several events.
     pub fn apps_found(apps: &[FoundApp]) -> Vec<DeviceEvent> {
-        apps.chunks(APPS_PER_MESSAGE_MAX).map(|c| DeviceEvent::AppsFound { apps: c.to_vec() }).collect()
+        // The envelope around the apps: `eventId`, `type`, the brackets
+        const ENVELOPE: usize = 128;
+        let mut out = Vec::new();
+        let mut chunk: Vec<FoundApp> = Vec::new();
+        let mut bytes = ENVELOPE;
+        for app in apps {
+            let size = serde_json::to_vec(app).map_or(0, |v| v.len()) + 1;
+            if !chunk.is_empty() && (chunk.len() >= APPS_PER_MESSAGE_MAX || bytes + size > BODY_BYTES_MAX) {
+                out.push(DeviceEvent::AppsFound { apps: std::mem::take(&mut chunk) });
+                bytes = ENVELOPE;
+            }
+            bytes += size;
+            chunk.push(app.clone());
+        }
+        if !chunk.is_empty() {
+            out.push(DeviceEvent::AppsFound { apps: chunk });
+        }
+        out
     }
 }
 
@@ -755,6 +790,10 @@ pub struct EventResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub error: String,
+    /// `/sync`'s 401 for a computer eGuard removed without its confirming it: eGuard's signed uninstall command, as
+    /// `SyncResponse::uninstall`. Acted on only once verified, like that one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uninstall: Option<serde_json::Value>,
 }
 
 /* ---------- /catalog ---------- */

@@ -88,12 +88,13 @@ fn program_files_dirs() -> Vec<String> {
 }
 
 /// For the scan (`scan::merge_with`): whether a folder is one a standard account can't write to, judged the same
-/// way as the programs the monitor sees.
+/// way as the programs the monitor sees: under Program Files, and its owner and permissions keep everyone but
+/// administrators out (Steam's folder there lets every user write to it).
 pub fn admin_only() -> impl Fn(&str) -> bool {
     let dirs = program_files_dirs();
     move |dir: &str| {
         let d = lower(Path::new(dir));
-        dirs.iter().any(|p| d == *p || under(&d, p))
+        dirs.iter().any(|p| d == *p || under(&d, p)) && eguard_win::security::out_of_users_reach(Path::new(dir))
     }
 }
 
@@ -142,28 +143,49 @@ impl Facts {
     }
 
     /// The program at `path`, checked once per file and version of it. Another file put at the same path (even
-    /// with the same size and time) is checked afresh.
+    /// with the same size and time) is checked afresh. (A running process's program: `running_program`.)
+    #[cfg(test)]
     pub fn program(&self, path: &Path) -> Option<Arc<Program>> {
-        let id = apps::file_identity(path)?;
+        self.program_and_file(path).map(|(_, p)| p)
+    }
+
+    /// `program`, and the identity of the file it was judged from.
+    pub fn program_and_file(&self, path: &Path) -> Option<(apps::FileIdentity, Arc<Program>)> {
         let key = lower(path);
-        if let Some((was, p)) = self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key)
+        if let Some(id) = apps::file_identity(path)
+            && let Some((was, p)) = self.cache.lock().unwrap_or_else(PoisonError::into_inner).get(&key)
             && *was == id
         {
-            return Some(Arc::clone(p));
+            return Some((id, Arc::clone(p)));
         }
-        let windows = windows_place(&key, &self.system_root) && authenticode::microsoft_signed(path);
+        // One handle for every check, held throughout: nothing can be renamed or written in its place meanwhile, so
+        // the signature, the catalog's hash, the headers and the identity are all about one file
+        let file = apps::open_for_checks(path).ok()?;
+        let id = apps::identity_of(&file)?;
+        // Where the file really is (a short `PROGRA~1` or a junction spells a folder some other way), and whether a
+        // standard account could have put it there or changed it: a place vouches only for files out of their reach
+        let real = eguard_win::files::final_path_of(&file).map(|p| lower(&p));
+        let out_of_reach = eguard_win::security::file_out_of_users_reach(&file);
+        let windows = out_of_reach
+            && real.as_deref().is_some_and(|r| windows_place(r, &self.system_root))
+            && authenticode::microsoft_signed_of(&file, path);
         let file_name = path.file_name().map(|f| f.to_string_lossy().to_lowercase()).unwrap_or_default();
         let ours = path.parent().map(lower).as_deref() == Some(self.own_dir.as_str()) && file_name.starts_with("eguard-");
         // Windows' own programs need nothing more: they're never ended
-        let exe = if windows || ours { eguard_core::scan::ExeFacts { file_name, ..Default::default() } } else { apps::exe_facts(path) };
+        let exe =
+            if windows || ours { eguard_core::scan::ExeFacts { file_name, ..Default::default() } } else { apps::exe_facts_of(&file, path) };
         let program = Arc::new(Program {
             path: path.to_string_lossy().into_owned(),
             exe,
             windows,
             ours,
-            program_files: self.program_files.iter().any(|d| under(&key, d)),
+            program_files: out_of_reach
+                && real.as_deref().is_some_and(|r| {
+                    self.program_files.iter().any(|d| under(r, d))
+                        && Path::new(r).parent().is_some_and(eguard_win::security::out_of_users_reach)
+                }),
         });
-        // Kept only when the file is still the one identified before it was read (not swapped meanwhile)
+        // Kept only when the path still names the file judged (it can't change while held; checked anyway)
         if apps::file_identity(path) == Some(id) {
             let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
             // Programs come and go; a cache this big is someone running thousands of different files
@@ -172,7 +194,8 @@ impl Facts {
             }
             cache.insert(key, (id, Arc::clone(&program)));
         }
-        Some(program)
+        drop(file);
+        Some((id, program))
     }
 }
 
@@ -212,18 +235,42 @@ fn unreadable(path: Option<&Path>, exe: Option<&str>) -> Program {
     }
 }
 
-/// `p` as the process that started at `start` runs it. A signature read from a file someone could have put at
-/// the path after the process started (anywhere outside Program Files and Windows' own folders) counts only if
-/// that file is still the running one (`process::still_its_file`); otherwise the program is an unknown one.
-fn its_own(p: Arc<Program>, start: u64) -> Arc<Program> {
+/// `p` (judged from the file `file`) as process `pid`, which started at `start`, runs it. A signature read from a
+/// file someone could have put at the path after the process started (anywhere outside Program Files and Windows'
+/// own folders) counts only if that file is the running one; otherwise the program is an unknown one.
+///
+/// The process's memory map says which executables it runs (`process::image_exes`): `file` not among them means
+/// the running file was renamed away and another put at its path. When it's the only one, it's the running file.
+/// When the map can't be read (an anti-cheat's protection) or holds other executables too (a program that loads
+/// another exe for its icons, or one that mapped the signed file itself), the file's own signs decide
+/// (`process::still_its_file`).
+fn its_own(p: Arc<Program>, file: apps::FileIdentity, pid: u32, start: u64) -> Arc<Program> {
     if p.windows || p.ours || p.program_files || p.exe.signer.is_none() {
         return p;
     }
-    if process::still_its_file(Path::new(&p.path), start) {
+    let same = |x: &apps::FileIdentity| x.volume == file.volume && x.file_id == file.file_id;
+    let running = match process::image_exes(pid, start) {
+        Some(exes) if !exes.iter().flatten().any(same) => false,
+        Some(exes) if exes.len() == 1 => true,
+        _ => process::still_its_file(Path::new(&p.path), start),
+    };
+    if running {
         return p;
     }
     log::warn(&format!("{} isn't the file that started; checking it as an unknown program", p.path));
     Arc::new(unreadable(Some(Path::new(&p.path)), None))
+}
+
+/// The program process `pid` runs, judged as the monitor judges it (`its_own`): a file renamed away while it ran,
+/// and another put at its path, isn't taken for the running one. For the heartbeat's foreground window.
+pub fn running_program(facts: &Facts, pid: u32) -> Option<Arc<Program>> {
+    let start = process::start_time(pid)?;
+    let path = process::image_path(pid)?;
+    // Read by pid: believed only while the pid is still the process that started then
+    if process::start_time(pid) != Some(start) {
+        return None;
+    }
+    facts.program_and_file(&path).map(|(file, p)| its_own(p, file, pid, start))
 }
 
 /// The monitor's state; runs on its own thread (`run`).
@@ -303,7 +350,7 @@ impl Monitor {
         if path.is_some() && process::start_time(pid) != Some(start) {
             return;
         }
-        match path.as_deref().and_then(|p| self.facts.program(p)).map(|p| its_own(p, start)) {
+        match path.as_deref().and_then(|p| self.facts.program_and_file(p)).map(|(file, p)| its_own(p, file, pid, start)) {
             Some(p) => {
                 t.program = Some(p);
                 t.stand_in = false;

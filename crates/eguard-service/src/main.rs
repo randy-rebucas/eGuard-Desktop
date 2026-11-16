@@ -31,19 +31,41 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use store::Store;
 
-/// The server this build talks to: `EGUARD_SERVER_URL` at compile time, or the local dev server in a dev build.
-const DEFAULT_SERVER: Option<&str> = match option_env!("EGUARD_SERVER_URL") {
-    Some(url) => Some(url),
-    None if keys::is_dev_build() => Some("http://localhost:3000"),
-    None => None,
+/// The server this build talks to: `EGUARD_SERVER_URL` at compile time, else production for a build that trusts
+/// production's key and the local dev server for one that trusts the dev key (each can only check its own server's
+/// signatures).
+const DEFAULT_SERVER: &str = match option_env!("EGUARD_SERVER_URL") {
+    Some(url) => url,
+    None if keys::is_dev_build() => "http://localhost:3000",
+    None => "https://www.eguard.family",
 };
+
+/// Whether `url` starts with `https://`, at compile time.
+const fn is_https(url: &str) -> bool {
+    let (u, want) = (url.as_bytes(), b"https://");
+    if u.len() < want.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < want.len() {
+        if u[i] != want[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// A build with the production key and an `http://` server would compile, then fail at every start and protect
+// nothing: refused here instead (`release.ps1` checks it too)
+const _: () = assert!(keys::is_dev_build() || is_https(DEFAULT_SERVER), "EGUARD_SERVER_URL must be https:// for a release");
 
 fn server_url(arg: Option<&str>) -> Result<ServerUrl, String> {
     // Only a development build may be pointed elsewhere at run time
     if arg.is_some() && !keys::is_dev_build() {
         return Err("--server is only for development builds".into());
     }
-    let url = arg.or(DEFAULT_SERVER).ok_or("this build has no server URL (set EGUARD_SERVER_URL when building)")?;
+    let url = arg.unwrap_or(DEFAULT_SERVER);
     ServerUrl::parse(url, keys::is_dev_build()).map_err(|e| e.to_string())
 }
 
@@ -51,16 +73,16 @@ fn server_url(arg: Option<&str>) -> Result<ServerUrl, String> {
 /// log starts as soon as the folder is locked down, so whatever fails after it (`WinHTTP`, the server URL) is logged.
 pub(crate) fn service_runner() -> Result<Arc<Runner>, String> {
     let dir = eguard_win::files::program_data_dir();
-    let logs = dir.join("logs");
     let store = match Store::open(&dir, Some(eguard_win::security::DATA_DIR_SDDL)) {
         Ok(s) => s,
         Err(e) => {
-            // The log is still wanted for this one line, if the folder can be written at all (the caller logs it)
-            log::init(Some(&logs), false);
+            // The folder isn't eGuard's (someone else made it, or a link to elsewhere): SYSTEM writes nothing in it,
+            // a log included. The service manager keeps the error
+            log::init(None, false);
             return Err(format!("{}: {e}", dir.display()));
         }
     };
-    log::init(Some(&logs), false);
+    log::init(locked_logs(&dir).as_deref(), false);
     Runner::new(Options { store, server: server_url(None)?, pipe_sddl: eguard_win::pipe::SERVICE_PIPE_SDDL.into(), mode: Mode::Service })
 }
 
@@ -98,9 +120,20 @@ fn usage() -> String {
 }
 
 /// The log for the installer's steps (`msi-check`, `purge`, `install`): eGuard's own log folder when it can be
-/// written (SYSTEM), so the steps are there to read after the program files have gone.
+/// written (SYSTEM), so the steps are there to read after the program files have gone. Made and checked like the
+/// data folder first: these steps run as SYSTEM, perhaps before `install` has locked anything down.
 fn installer_log() {
-    log::init(Some(&eguard_win::files::program_data_dir().join("logs")), false);
+    let dir = eguard_win::files::program_data_dir();
+    let logs = eguard_win::files::ensure_dir(&dir, Some(eguard_win::security::DATA_DIR_SDDL)).ok().and_then(|()| locked_logs(&dir));
+    log::init(logs.as_deref(), false);
+}
+
+/// `logs` in the data folder `dir`, made or checked as eGuard's own (`ensure_dir`: never a folder or link someone
+/// else put there, which would have SYSTEM create, rename and delete files where they chose). `None` when it can't
+/// be: nothing is logged to a file then.
+fn locked_logs(dir: &std::path::Path) -> Option<PathBuf> {
+    let logs = dir.join("logs");
+    eguard_win::files::ensure_dir(&logs, Some(eguard_win::security::DATA_DIR_SDDL)).ok().map(|()| logs)
 }
 
 /// The installer's uninstall check (spec section 10: `msiexec /x` is refused unless eGuard may be removed). Exit 0

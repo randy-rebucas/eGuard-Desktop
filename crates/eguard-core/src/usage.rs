@@ -94,12 +94,14 @@ impl DayUsage {
             })
             .take(wire::APPS_PER_MESSAGE_MAX)
             .collect();
-        UsageReport {
+        let mut report = UsageReport {
             date: date.to_owned(),
             total_minutes: (self.total_ms / 60_000) as u32,
             apps,
             hourly: Some(self.hourly_ms.map(|ms| (ms / 60_000) as u32)),
-        }
+        };
+        report.fit_to(wire::BODY_BYTES_MAX);
+        report
     }
 }
 

@@ -57,12 +57,38 @@ pub fn signer_names(path: &std::path::Path) -> Option<Signer> {
     unsafe { verify(&mut data) }
 }
 
+/// Both names, when the open `file` (at `path`) carries a valid embedded signature: the signature and the hash are
+/// read through the handle, so they're about that file whatever is put at `path` meanwhile.
+pub fn signer_names_of(file: &std::fs::File, path: &std::path::Path) -> Option<Signer> {
+    use std::io::Seek;
+    use std::os::windows::io::AsRawHandle;
+    let mut f = file;
+    f.seek(std::io::SeekFrom::Start(0)).ok()?;
+    let p = wide(&path.to_string_lossy());
+    let mut info = WINTRUST_FILE_INFO {
+        cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: p.as_ptr(),
+        hFile: file.as_raw_handle() as HANDLE,
+        ..Default::default()
+    };
+    let mut data = trust_data(WTD_CHOICE_FILE, WINTRUST_DATA_0 { pFile: &raw mut info });
+    // SAFETY: `data` points at `info`, which points at `p` and the open file; all outlive the call.
+    unsafe { verify(&mut data) }
+}
+
 /// Who signed `path` through one of Windows' catalogs (how Windows signs most of its own files, and how a driver
 /// package's files are signed), when that signature is valid. Offline, like `signer_names`.
 pub fn catalog_signer(path: &std::path::Path) -> Option<Signer> {
+    catalog_signer_of(&std::fs::File::open(path).ok()?, path)
+}
+
+/// `catalog_signer` for the open `file` (at `path`): the hash looked up is the handle's.
+pub fn catalog_signer_of(file: &std::fs::File, path: &std::path::Path) -> Option<Signer> {
+    use std::io::Seek;
     use std::os::windows::io::AsRawHandle;
-    let f = std::fs::File::open(path).ok()?;
-    let handle = f.as_raw_handle() as HANDLE;
+    let mut f = file;
+    f.seek(std::io::SeekFrom::Start(0)).ok()?;
+    let handle = file.as_raw_handle() as HANDLE;
     // Windows 11's catalogs are SHA-256; older ones (and some drivers') SHA-1, which a null algorithm asks for
     [BCRYPT_SHA256_ALGORITHM, null()].into_iter().find_map(|alg| {
         let mut admin: isize = 0;
@@ -140,6 +166,11 @@ pub fn is_microsoft(s: &Signer) -> bool {
 /// Signed by Microsoft, embedded or through a catalog (spec section 7: never block Windows' own programs).
 pub fn microsoft_signed(path: &std::path::Path) -> bool {
     signer_names(path).as_ref().is_some_and(is_microsoft) || catalog_signer(path).as_ref().is_some_and(is_microsoft)
+}
+
+/// `microsoft_signed` for the open `file` (at `path`).
+pub fn microsoft_signed_of(file: &std::fs::File, path: &std::path::Path) -> bool {
+    signer_names_of(file, path).as_ref().is_some_and(is_microsoft) || catalog_signer_of(file, path).as_ref().is_some_and(is_microsoft)
 }
 
 fn trust_data(choice: u32, what: WINTRUST_DATA_0) -> WINTRUST_DATA {
@@ -230,5 +261,19 @@ mod tests {
             let p = system.join(exe);
             assert!(microsoft_signed(&p), "{exe}: embedded {:?}, catalog {:?}", signer_names(&p), catalog_signer(&p));
         }
+    }
+
+    #[test]
+    fn the_checks_on_a_held_file_say_what_the_checks_by_path_say() {
+        let system = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap()).join("System32");
+        for exe in ["notepad.exe", "cmd.exe"] {
+            let path = system.join(exe);
+            let file = std::fs::File::open(&path).unwrap();
+            assert!(microsoft_signed_of(&file, &path), "{exe}");
+            assert_eq!(catalog_signer_of(&file, &path), catalog_signer(&path));
+            assert_eq!(signer_names_of(&file, &path), signer_names(&path));
+        }
+        let me = std::env::current_exe().unwrap();
+        assert_eq!(signer_names_of(&std::fs::File::open(&me).unwrap(), &me), None);
     }
 }

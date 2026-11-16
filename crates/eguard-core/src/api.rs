@@ -68,7 +68,13 @@ pub enum ApiError {
     Unreachable(#[from] TransportError),
     /// A non-2xx answer. `message` is the server's `{ error }`, written for people, when it sent one.
     #[error("eGuard answered {status}{}", message.as_deref().map(|m| format!(": {m}")).unwrap_or_default())]
-    Status { status: u16, message: Option<String>, retry_after_secs: Option<u32> },
+    Status {
+        status: u16,
+        message: Option<String>,
+        retry_after_secs: Option<u32>,
+        /// A 401's signed uninstall command (`ErrorBody::uninstall`), not yet verified.
+        uninstall: Option<Box<serde_json::Value>>,
+    },
     #[error("eGuard's answer didn't parse: {0}")]
     Malformed(String),
 }
@@ -249,14 +255,20 @@ fn ok_or_status(res: HttpResponse) -> Result<HttpResponse, ApiError> {
     if (200..300).contains(&res.status) {
         return Ok(res);
     }
-    let message = serde_json::from_slice::<ErrorBody>(&res.body).ok().map(|b| b.error.chars().take(300).collect());
-    Err(ApiError::Status { status: res.status, message, retry_after_secs: res.retry_after_secs })
+    let body = serde_json::from_slice::<ErrorBody>(&res.body).ok();
+    let message = body.as_ref().map(|b| b.error.chars().take(300).collect());
+    let uninstall = body.and_then(|b| b.uninstall).filter(|u| res.status == 401 && !u.is_null()).map(Box::new);
+    Err(ApiError::Status { status: res.status, message, retry_after_secs: res.retry_after_secs, uninstall })
 }
 
-/// `Retry-After` as seconds. The HTTP-date form isn't used by eGuard and is ignored.
+/// `Retry-After` as seconds, at most a day (a wrong header mustn't park a lane for weeks). The HTTP-date form isn't
+/// used by eGuard and is ignored.
 pub fn parse_retry_after(value: &str) -> Option<u32> {
-    value.trim().parse().ok()
+    value.trim().parse::<u32>().ok().map(|s| s.min(MAX_RETRY_AFTER_SECS))
 }
+
+/// The longest `Retry-After` taken.
+pub const MAX_RETRY_AFTER_SECS: u32 = 24 * 60 * 60;
 
 #[cfg(test)]
 pub(crate) mod tests {

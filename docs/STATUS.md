@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-10-26: an install audit and its fixes (below). Before it, 2026-10-24: Phase 7's self-update (Q7), built and waiting for the VM (below). Before it: the owner's decisions
+Updated 2026-11-16: a full audit and its fixes (below). Before it, 2026-10-26: an install audit and its fixes. Before it, 2026-10-24: Phase 7's self-update (Q7), built and waiting for the VM (below). Before it: the owner's decisions
 after Phase 6 part 2, Phase 6 part 2 (the installer and what holds eGuard in place), built and waiting for the VM,
 Phase 7's crash handler and logs, Phase 6 part 1 (the removal flow and tamper reporting), Phase 5 (web), Phase 4, the
 owner's decisions, a full audit and its fixes.
@@ -16,6 +16,58 @@ owner's decisions, a full audit and its fixes.
 | 7 | Hardening and release readiness | **Started:** structured, rotated, scrubbed logs, a crash handler, and the **signed self-update (Q7): built**, unit-tested, its download-and-check path run here; the swap and rollback wait for the VM (VM-TESTS.md G). Not built: signing (the certificate), the end-to-end VM run |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## Full audit (2026-11-16)
+
+Four reviews (Windows FFI and security; core, wire and the server's contract; enforcement; the binaries, installer
+and self-update), covering the uncommitted 2026-11-11 changes too. Unit tests 258 (2 ignored), clippy and fmt clean.
+A dry-run `scan` of this PC still works (62 candidates, 30 left out as trusted). Nothing was installed or run as SYSTEM.
+
+| Finding | What was done |
+|---|---|
+| **P1: a folder under Program Files counted as out of the child's reach by its path alone.** Steam's folder there is writable by every user: a game copied into `Steam\x\` was never ended (Untracked) or vouched for by the folder | `monitor::Facts` decides from the file itself: its real path (`files::final_path_of`), a trusted owner and no write rights for anyone but SYSTEM, administrators and services (`security::file_out_of_users_reach`, `out_of_users_reach` for its folder). The scan's `admin_only` checks the folder the same way |
+| **P1: a short path (`MICROS~1\…\MACHIN~1`) could make a Microsoft-signed copy "Windows' own"** | The same: the place is judged from the final path, and the file must be out of users' reach |
+| **P1: the heartbeat judged the foreground program by whatever file was at its path now** (rename the running trusted exe away, copy an always-allowed one in: the overlay stepped aside) | `monitor::running_program`: the heartbeat uses the monitor's `its_own` check |
+| **P1: Store apps' time was never counted** (the focused window belongs to ApplicationFrameHost, part of Windows) | `input::foreground_pid` takes the hosted window's process; checked live with Calculator (`--ignored` test) |
+| **P1: the scan read child-writable files whole, and followed registry paths to shares or pipes, as SYSTEM** (a 4 GB `x.lnk`; `SteamPath=\.\pipe\…` hung the scan for good) | `apps::read_small` (plain local path, regular file, at most 1 MB) for `.lnk`, `.vdf`, `.acf`, `.item`, `AppxManifest.xml`; `plain_local` on every registry or launcher-file path; an absolute `installdir` is refused |
+| **P1 (VM): a held program file stopped the update swap with the service already stopped**, for 10 minutes, and then marked the version failed for good | `put_in_place` is all or nothing (everything set aside first, put back if one can't be); a failed swap starts the old service again; a version rolled back before it ever ran isn't marked failed (offered again later) |
+| P2: a clock that was ahead (BIOS, offline reboot) held every queue lane back for as long as it was ahead; `Removing.since_ms` in the future | `clock_changed` retries the queue now and clamps `since_ms`; `CLOCK_CHANGED` goes through `tamper()` (once an hour) |
+| P2: a rolled-back update whose state format the old version can't read lost the day's usage, the lockout and the queue | `state.before-update.json` kept at hand-over, read only when `state.json` and `state.prev.json` both fail, deleted once a version is healthy |
+| P2: swap and rollback copies weren't flushed (power cut: half-written programs); the guard's 10 minutes restarted with every guard process | `write_atomic` for the program files and `cache\previous`; `Handoff.step_since_ms` (optional, older guards ignore it) |
+| P2: the guard ended whenever the service manager couldn't be asked (no guard until the next boot) | Ends only on `ERROR_SERVICE_DOES_NOT_EXIST` |
+| P2: the MSI's check and purge ran only on `REMOVE="ALL"` | Any `REMOVE` (one feature). Not built or run here: the VM |
+| P2: SYSTEM logged into a data folder that had failed its check, and the installer steps logged before it was locked | No file log then; `logs` made or checked with `ensure_dir` before use |
+| P2: a scan held back by the 10-minute user-key throttle was dropped | Held back and asked for when the window ends |
+| P3: a `/report` dropped (400) or given up was never sent again; the administrator advice was cut mid-word at 200 characters; `WerAddExcludedApplication` got a full path; the fault log handle followed the log into deleted cuts; an `http://` release server compiled | Fixed: `unreport`, `admin_reason` fits, the exe name, `logging::on_rotate` reopens it (the old handle is left open, not closed under a faulting thread), a `const` assert |
+
+**For the owner (not changed):**
+- **The agent can be hooked.** Its process DACL stops `OpenProcess`, but a child program can still inject a DLL
+  with `SetWindowsHookEx` or post messages to its windows: it runs at the child's integrity level on the child's
+  desktop. Options:
+  - Start it with `PROCESS_CREATION_MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON`. This blocks hook DLLs
+    and IMEs, and the removal code is ASCII.
+  - Or raise its token to High integrity. UIPI then blocks posted messages and hooks too, but the apps the overlay
+    starts would need a medium token.
+  - Either one needs the VM.
+- The guard swaps its own exe with the others: a broken new guard can't roll itself back. Swapping the guard only at
+  commit (or versioned folders) is a self-update design change.
+- The overlay steps aside on every monitor while an always-allowed app has the focus: a video on a second monitor
+  plays during a pause.
+- An unsigned app whose version resource names a listed app ("Khan Academy") is kept unlisted but its time goes to
+  that app's ledger entry and category.
+- Hardening, smaller:
+  - `ensure_dir` creates the folder, then locks it (a short window).
+  - A session pipe's new SDDL may not apply to a reused pipe name (the VM's fast user switching).
+  - WinHTTP has no overall deadline.
+  - The guard doesn't check the cache's exes are eGuard-signed before swapping.
+  - A repair run by a standard user reruns `install` (`NOT REMOVE`) with a console window (the VM).
+- **Server gaps: fixed the same day, in both repos** (checked live against a dev server):
+  - A computer whose removal was finished without it (7 quiet days, or "Remove without waiting") used to stay
+    protected forever with no way to remove it. Now `RemovedComputer` (server, 30 days) makes `/sync`'s `401` carry
+    the signed uninstall command. Here, `ApiError::Status::uninstall` and `AgentState::verify_unauthorized_uninstall`
+    check it like a sync's (signature, device, time, replay). Its `UNINSTALL_ACK` answers 200, and the Devices page
+    shows its removal code.
+  - `/events` counted retries and 413s against the 120/h; now the duplicate check and the 413 come first.
 
 ## Install audit (2026-10-26)
 
@@ -60,7 +112,7 @@ version, which keeps that version as failed and never tries it again.
 | `eguard-win` | `http::WinHttp::download` (no token, size cap, redirects followed but never https→http, a partial file deleted; `send` and it now share `open`/`status_of`/`read_all`). `process::running_program`, `end_program` (by whole image path; `lockdown::end_all`/`guard_running` use them) |
 | `eguard-service` `update`, `runner` | `stage` (download + both checks into `<data>\update`), `install` (previous → hand-off → cache, undone on failure), `note_health`, `take_outcome`, `show_version` (Settings' DisplayVersion follows the running version). The runner's update thread; refuses to install when the guard isn't running. `Shared::close_agents` (was `set_removed`) closes the agents for an update as for a removal |
 | `eguard-guard` | The hand-off: swap, commit (then ends, for the new guard), roll back; `sweep` deletes old program files set aside once nothing runs them. During the swap the program files aren't compared (no `FILES_CHANGED`); after it, as before. Ending the service on purpose deletes its `running` marker (no `SERVICE_RESTARTED`) |
-| `tools/vm` | `bundle.ps1 -Version 0.1.1` (a newer build: `target\eguard-vm-0.1.1.zip`; `installer\build.ps1 -Version` too). `update-release.ps1` (**VM only**): makes and trusts a self-signed "eGuard Dev" code-signing certificate, signs a build, prints `DESKTOP_RELEASE`, serves the files at `http://localhost:8099`; `-NoSign`, `-Broken` for G2 and G3 |
+| `tools/vm` | `bundle.ps1 -Version 0.1.2` (a newer build: `target\eguard-vm-0.1.2.zip`; `installer\build.ps1 -Version` too). `update-release.ps1` (**VM only**): makes and trusts a self-signed "eGuard Dev" code-signing certificate, signs a build, prints `DESKTOP_RELEASE`, serves the files at `http://localhost:8099`; `-NoSign`, `-Broken` for G2 and G3 |
 | `~/eguard` | `GET /api/device/v1/update` (`update/route.ts`): `{ manifest: null }`, or the release in `DESKTOP_RELEASE` (`lib/desktop-release.ts`, parsed with zod; malformed: 503) signed with `signPolicy` and `issuedAt`; computers only (404 for a phone), 30 an hour (`LIMITS.deviceUpdate`). `.env.example` documents it. Docs: spec 10 (built, what's not), spec 12 (the endpoint), mobile-api Part C, open questions Q7 |
 
 **Checked on this PC:** `cargo test --workspace` **244 passed**, 1 ignored (core 176 + 14 fixture, win 40, service
@@ -791,8 +843,8 @@ The VM run below is still waiting for the owner, alongside.
 
 `target\eguard-vm.zip` (`tools\vm\bundle.ps1`) → the VM → VM-TESTS.md from the top: A (install from the MSI,
 pairing, the lock in place), B, C (Phase 4's open items, test 6, Q3), D (web without ids), E (removal: tests 9 and 10,
-nothing left), F (test 8: every local route), G (the self-update: `target\eguard-vm-0.1.1.zip` from
-`bundle.ps1 -Version 0.1.1`, and `update-release.ps1` on the VM). Bring back the `collect.ps1` zips and the filled
+nothing left), F (test 8: every local route), G (the self-update: `target\eguard-vm-0.1.2.zip` from
+`bundle.ps1 -Version 0.1.2`, and `update-release.ps1` on the VM). Bring back the `collect.ps1` zips and the filled
 results table. The next session fixes what failed (see part 2's "Expected to need fixing"), and marks Phase 6 done
 when tests 7–10 pass. Phase 7 still has signing (the certificate, the owner's).
 
@@ -854,7 +906,9 @@ when tests 7–10 pass. Phase 7 still has signing (the certificate, the owner's)
 - The dev server on :3000 belongs to the owner's session. Dev servers always send mail to Mailpit
   (`src/lib/mail.ts`), so the capture and dev-family scripts are safe to run against it.
 - `keys.rs` uses the dev key unless `EGUARD_POLICY_PUBLIC_KEYS` is set at compile time; the service's server URL is
-  `http://localhost:3000` unless `EGUARD_SERVER_URL` is. Phase 7 must refuse to build a release with
+  `EGUARD_SERVER_URL` if set, else `https://www.eguard.family` with the production key and `http://localhost:3000`
+  with the dev key (each build can only check its own server's signatures). `installer\release.ps1` builds the
+  release MSI. Phase 7 must refuse to build a release with
   `keys::is_dev_build()`.
 - Line endings: this repo is LF (rustfmt). `~/eguard` mixes CRLF/LF.
 - **A release build needs `EGUARD_POLICY_PUBLIC_KEYS`** (or `EGUARD_DEV_RELEASE=1` for a local one, e.g. to measure

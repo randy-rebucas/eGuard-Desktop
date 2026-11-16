@@ -64,13 +64,16 @@ pub fn install(m: &Manifest, staged: &Path) -> Result<(), String> {
         std::fs::remove_dir_all(&previous).map_err(|e| format!("{}: {e}", previous.display()))?;
     }
     std::fs::create_dir_all(&previous).map_err(|e| format!("{}: {e}", previous.display()))?;
+    // Flushed to disk before the hand-off is: after a power cut, the version to go back to must be whole
     for p in update::PROGRAMS {
-        std::fs::copy(cache.join(p), previous.join(p)).map_err(|e| format!("keeping {p} as the previous version: {e}"))?;
+        std::fs::read(cache.join(p))
+            .and_then(|b| files::write_atomic(&previous.join(p), &b))
+            .map_err(|e| format!("keeping {p} as the previous version: {e}"))?;
     }
     let _ = std::fs::remove_file(cache.join(update::HEALTH_FILE));
     // The hand-off before the cache changes: if this process ends part way, the guard finds it, and the previous
     // version is there to go back to
-    let h = Handoff { from: crate::runner::APP_VERSION.into(), to: m.version.clone(), step: Step::Swap };
+    let h = Handoff { from: crate::runner::APP_VERSION.into(), to: m.version.clone(), step: Step::Swap, step_since_ms: None };
     files::write_atomic(&handoff, &to_json(&h)).map_err(|e| format!("{}: {e}", handoff.display()))?;
     let copied = update::PROGRAMS.iter().try_for_each(|p| {
         let bytes = std::fs::read(staged.join(p)).map_err(|e| format!("{p}: {e}"))?;

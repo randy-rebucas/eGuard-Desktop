@@ -221,6 +221,11 @@ pub struct Handoff {
     pub from: String,
     pub to: String,
     pub step: Step,
+    /// When the guard first saw this step (milliseconds since 1970, the computer's clock, which a standard account
+    /// can't change). Kept here so a guard that restarts (a reboot, a crash) doesn't start the step's 10 minutes
+    /// over. `None` until a guard has seen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_since_ms: Option<i64>,
 }
 
 /// The new service's word that it works (`HEALTH_FILE`).
@@ -392,7 +397,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_guard_swaps_after_the_stop_and_rolls_back_an_unhealthy_version() {
-        let h = |step| Handoff { from: "0.1.0".into(), to: "0.2.0".into(), step };
+        let h = |step| Handoff { from: "0.1.0".into(), to: "0.2.0".into(), step, step_since_ms: None };
         let swap = h(Step::Swap);
         assert_eq!(guard_action(&swap, false, 0, None), GuardAction::Wait);
         assert_eq!(guard_action(&swap, true, 0, None), GuardAction::Swap { end_service: false });
@@ -412,7 +417,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_handoff_files_round_trip() {
-        let h = Handoff { from: "0.1.0".into(), to: "0.2.0".into(), step: Step::Running };
+        let h = Handoff { from: "0.1.0".into(), to: "0.2.0".into(), step: Step::Running, step_since_ms: None };
         let s = serde_json::to_string(&h).unwrap();
         assert_eq!(s, r#"{"from":"0.1.0","to":"0.2.0","step":"running"}"#);
         assert_eq!(serde_json::from_str::<Handoff>(&s).unwrap(), h);

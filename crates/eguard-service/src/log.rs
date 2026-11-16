@@ -7,7 +7,11 @@ use std::path::Path;
 
 /// Call once at start. `dir` is where `service.log` goes; `console` also prints each line.
 pub fn init(dir: Option<&Path>, console: bool) {
-    logging::init("service", dir.map(|d| d.join("service.log")).as_deref(), console);
+    let path = dir.map(|d| d.join("service.log"));
+    logging::init("service", path.as_deref(), console);
+    if let Some(p) = &path {
+        eguard_win::crash::log_faults_to(&"service", p);
+    }
 }
 
 pub use logging::{error, info, warn};

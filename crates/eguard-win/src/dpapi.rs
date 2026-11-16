@@ -18,11 +18,19 @@ fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
     CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr().cast_mut() }
 }
 
-/// Copies DPAPI's output and frees it.
+/// Copies DPAPI's output, wipes DPAPI's buffer (after `unprotect` it holds the secrets in the clear) and frees it.
 fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
-    // SAFETY: DPAPI returned `cbData` bytes at `pbData`, allocated with LocalAlloc; we copy them, then free once.
+    // An empty output may come back without a buffer: a slice from a null pointer is undefined behaviour
+    if out.pbData.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: DPAPI returned `cbData` bytes at `pbData`, allocated with LocalAlloc; we copy them, zero them in place
+    // (volatile, so the wipe isn't optimized away before the free), then free once.
     unsafe {
         let v = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+        for i in 0..out.cbData as usize {
+            std::ptr::write_volatile(out.pbData.add(i), 0);
+        }
         LocalFree(out.pbData as HLOCAL);
         v
     }

@@ -10,8 +10,8 @@
 #
 #   bundle.ps1                                   no extension ids: nothing is forced in browsers (Phase 5 waits)
 #   bundle.ps1 -ChromeId ID -EdgeId ID -FirefoxUrl URL   the extension's real store ids, once they exist
-#   bundle.ps1 -Version 0.1.1                    a newer version (EGUARD_VERSION), to test updates (VM-TESTS.md G):
-#                                                target\eguard-vm-0.1.1.zip; its bin\ is what update-release.ps1 offers
+#   bundle.ps1 -Version 0.1.2                    a newer version (EGUARD_VERSION), to test updates (VM-TESTS.md G):
+#                                                target\eguard-vm-0.1.2.zip; its bin\ is what update-release.ps1 offers
 #   bundle.ps1 -ServerUrl https://… -PublicKeys KEY      a build for a real eGuard server instead of this PC's dev
 #                                                server: its https address and its policy-signing public key (base64
 #                                                SPKI, as the extension's VITE_POLICY_PUBLIC_KEY; never the private key).

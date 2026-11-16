@@ -75,7 +75,8 @@ pub fn report(choice: Option<&AccountChoice>, accounts: &[Account]) -> Vec<Repor
     accounts
         .iter()
         .take(32)
-        .map(|a| ReportedAccount { name: a.name.chars().take(64).collect(), enforced: applies(choice, &a.sid) })
+        // 1–64 UTF-16 units after JavaScript's trim, as the server checks: one name over it would fail the whole report
+        .filter_map(|a| Some(ReportedAccount { name: crate::wire::fit(&a.name, 64)?, enforced: applies(choice, &a.sid) }))
         .collect()
 }
 

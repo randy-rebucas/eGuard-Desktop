@@ -113,18 +113,12 @@ impl AgentState {
             sync.server_time.as_deref().and_then(crate::clock::parse_iso_ms).and_then(|t| self.clock.on_server_time(t, sample));
         let now_ms = self.clock.now(sample).map_or(sample.wall_ms, |n| n.ms);
 
-        let (uninstall, uninstall_rejected) = match (raw.get("uninstall"), before_ms) {
-            (Some(envelope), _) if envelope.is_null() => (None, None),
-            (Some(_), None) => (None, Some(VerifyError::Stale)),
-            (Some(envelope), Some(before_ms)) => match verify_uninstall(keys, envelope, &self.device_id, before_ms) {
-                Ok(cmd) if self.last_uninstall_at_ms.is_some_and(|last| cmd.at_ms <= last) => (None, Some(VerifyError::Replayed)),
-                Ok(cmd) => {
-                    self.last_uninstall_at_ms = Some(cmd.at_ms);
-                    (Some(cmd), None)
-                }
+        let (uninstall, uninstall_rejected) = match raw.get("uninstall") {
+            Some(envelope) if !envelope.is_null() => match self.accept_uninstall(keys, envelope, before_ms) {
+                Ok(cmd) => (Some(cmd), None),
                 Err(e) => (None, Some(e)),
             },
-            (None, _) => (None, None),
+            _ => (None, None),
         };
 
         let outcome = SyncOutcome {
@@ -142,6 +136,36 @@ impl AgentState {
         self.last_sync_ms = Some(now_ms);
         self.auth = AuthState::Ok;
         Ok(outcome)
+    }
+
+    /// The signed uninstall command that came with `/sync`'s 401 (`ApiError::Status::uninstall`): a computer eGuard
+    /// removed without its confirming it. Checked exactly as one in a sync answer, by eGuard's clock as it stands
+    /// (no answer moved it).
+    pub fn verify_unauthorized_uninstall(
+        &mut self,
+        keys: &TrustedKeys,
+        envelope: &serde_json::Value,
+        sample: ClockSample,
+    ) -> Result<UninstallCommand, VerifyError> {
+        let now = self.clock.now(sample).map(|n| n.ms);
+        self.accept_uninstall(keys, envelope, now)
+    }
+
+    /// An uninstall command for this computer, signed by eGuard, current by eGuard's clock `before_ms` (none before the
+    /// first sync ever: refused as stale), and newer than the last one accepted (a recorded answer can't be replayed).
+    fn accept_uninstall(
+        &mut self,
+        keys: &TrustedKeys,
+        envelope: &serde_json::Value,
+        before_ms: Option<i64>,
+    ) -> Result<UninstallCommand, VerifyError> {
+        let before_ms = before_ms.ok_or(VerifyError::Stale)?;
+        let cmd = verify_uninstall(keys, envelope, &self.device_id, before_ms)?;
+        if self.last_uninstall_at_ms.is_some_and(|last| cmd.at_ms <= last) {
+            return Err(VerifyError::Replayed);
+        }
+        self.last_uninstall_at_ms = Some(cmd.at_ms);
+        Ok(cmd)
     }
 
     /// The server answered 401. Nothing is switched off; the agent tries again in `UNAUTHORIZED_SYNC_SECS`.

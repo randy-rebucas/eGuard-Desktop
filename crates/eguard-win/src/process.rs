@@ -268,9 +268,92 @@ fn terminate(h: &Handle) -> bool {
     unsafe { TerminateProcess(h.0, ENDED_BY_EGUARD) != 0 }
 }
 
+/// The executables (not DLLs) `pid` (which started at `start`) has mapped as images, each as the identity of the file
+/// behind the mapping now. Read from the process's memory map, which the kernel keeps: what the program file's path
+/// holds now says nothing once the running file was renamed away and another put in its place, but the mapping
+/// still names the running file (under its new name). A process runs exactly one executable image of its own, so
+/// a file that's the only one here is the one running.
+///
+/// `None` when the process can't be read that closely (protected, or an anti-cheat took the rights away). A mapped
+/// image whose file can't be opened counts as an unknown executable (`None` in the list): the stricter reading.
+pub fn image_exes(pid: u32, start: u64) -> Option<Vec<Option<crate::apps::FileIdentity>>> {
+    use windows_sys::Win32::System::Memory::{MEM_IMAGE, MEMORY_BASIC_INFORMATION, VirtualQueryEx};
+    use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+    let h = Handle::open(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
+    if created(&h) != Some(start) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut bases = HashSet::new();
+    let mut at = 0usize;
+    // A user address space has a few thousand regions; a bound so a strange one can't keep this busy
+    for _ in 0..200_000 {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: `info` is a live out-parameter of the size passed; any address may be asked about.
+        let n = unsafe { VirtualQueryEx(h.0, at as *const _, &raw mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if n == 0 {
+            break;
+        }
+        let base = info.AllocationBase as usize;
+        if info.Type == MEM_IMAGE && bases.insert(base) {
+            match mapped_file(&h, base) {
+                Some(f) => {
+                    if !is_dll(&f) {
+                        out.push(crate::apps::identity_of(&f));
+                    }
+                }
+                None => out.push(None),
+            }
+        }
+        match (info.BaseAddress as usize).checked_add(info.RegionSize) {
+            Some(next) if next > at => at = next,
+            _ => break,
+        }
+    }
+    Some(out)
+}
+
+/// The file mapped at `base` in the process, opened for reading (the mapping's current name, through the device
+/// path the kernel gives).
+fn mapped_file(h: &Handle, base: usize) -> Option<std::fs::File> {
+    use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
+    let mut buf = vec![0u16; 32_768];
+    // SAFETY: `buf` is writable for the length passed; `base` is an address in the process, only looked up.
+    let n = unsafe { K32GetMappedFileNameW(h.0, base as *const _, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    // `\Device\HarddiskVolume3\...`: reachable from Win32 under `\\?\GLOBALROOT`
+    let device = String::from_utf16_lossy(&buf[..n]);
+    std::fs::File::open(format!(r"\\?\GLOBALROOT{device}")).ok()
+}
+
+/// Whether an open PE file is a DLL (`IMAGE_FILE_DLL`). A file that can't be read as a PE counts as an executable.
+fn is_dll(mut f: &std::fs::File) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut dos = [0u8; 64];
+    if f.read_exact(&mut dos).is_err() || &dos[..2] != b"MZ" {
+        return false;
+    }
+    let pe = u64::from(u32::from_le_bytes([dos[60], dos[61], dos[62], dos[63]]));
+    // Signature (4), Machine (2), NumberOfSections (2), TimeDateStamp (4), PointerToSymbolTable (4), NumberOfSymbols
+    // (4), SizeOfOptionalHeader (2), then Characteristics
+    let mut head = [0u8; 24];
+    if f.seek(SeekFrom::Start(pe)).is_err() || f.read_exact(&mut head).is_err() || &head[..4] != b"PE\0\0" {
+        return false;
+    }
+    u16::from_le_bytes([head[22], head[23]]) & 0x2000 != 0
+}
+
 /// Whether `pid` is still running (and is the same process that started at `started`).
 pub fn alive(pid: u32, started: u64) -> bool {
-    start_time(pid) == Some(started) && image_path(pid).is_some()
+    // An ended process can still be opened (and its start and path read) while anyone holds a handle to it: only
+    // its exit code tells it has ended
+    let Some(h) = Handle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else { return false };
+    let mut code = 0u32;
+    // SAFETY: an open process handle; `code` is a live out-parameter.
+    let running = unsafe { GetExitCodeProcess(h.0, &raw mut code) } != 0 && code == STILL_ACTIVE;
+    running && created(&h) == Some(started) && image_path_of(&h).is_some()
 }
 
 /// The processes running the program at `path` (the whole path, in any case), with when each started.
@@ -347,6 +430,39 @@ mod tests {
         // Never this process
         let me = current_pid();
         assert_eq!(end_tree(me, start_time(me).unwrap(), |_| true), 0);
+    }
+
+    #[test]
+    fn the_memory_map_names_the_running_file_after_a_rename_swap() {
+        // This process: one executable mapped, its own file
+        let me = current_pid();
+        let mine = crate::apps::file_identity(&image_path(me).unwrap()).unwrap();
+        let exes = image_exes(me, start_time(me).unwrap()).unwrap();
+        assert_eq!(exes, vec![Some(mine)]);
+
+        // A program renamed away while it runs and another file put at its path: the map names the running one
+        let dir = std::env::temp_dir().join(format!("eguard-swap-{me}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, aside) = (dir.join("game.exe"), dir.join("moved.exe"));
+        std::fs::copy(r"C:\Windows\System32\ping.exe", &path).unwrap();
+        let child = std::process::Command::new(&path).args(["-n", "20", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let pid = child.id();
+        let start = start_time(pid).unwrap();
+        std::fs::rename(&path, &aside).unwrap();
+        std::fs::copy(r"C:\Windows\System32\where.exe", &path).unwrap();
+        let running = crate::apps::file_identity(&aside).unwrap();
+        let planted = crate::apps::file_identity(&path).unwrap();
+        let exes = image_exes(pid, start).unwrap();
+        let same = |a: &crate::apps::FileIdentity, b: &crate::apps::FileIdentity| a.volume == b.volume && a.file_id == b.file_id;
+        assert!(exes.iter().flatten().any(|x| same(x, &running)));
+        assert!(!exes.iter().flatten().any(|x| same(x, &planted)));
+        // Not this process's start: nothing said
+        assert_eq!(image_exes(pid, start + 1), None);
+        let child = Child::from_std(child);
+        assert!(end_one(child.pid, start));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/eguard-core", "crates/eguard-win", "crates/eguard-service", "crates/eguard-agent", "crates/eguard-guard"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 license = "LicenseRef-Proprietary"
@@ -39,12 +39,16 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Console",
     "Win32_System_Environment",
+    "Win32_System_ErrorReporting",
     "Win32_System_IO",
     "Win32_System_Kernel",
     "Win32_System_Pipes",
     "Win32_System_Power",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
     "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_RemoteDesktop",

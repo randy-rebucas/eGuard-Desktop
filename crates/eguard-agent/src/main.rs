@@ -199,13 +199,21 @@ fn ask_session(pipe_name: &str, service: &Path, dev: bool, request: &Request) ->
     ipc::decode(&line).map_err(|e| e.to_string())
 }
 
+/// The agent's log, and where a crash's last line goes.
+fn init_log(log: Option<&Path>) {
+    logging::init("agent", log, false);
+    if let Some(p) = log {
+        eguard_win::crash::log_faults_to(&"agent", p);
+    }
+}
+
 /// The agent in a session: a heartbeat every second, the screens the service asks for, and the child's buttons.
 fn session(args: &[String]) -> Result<(), String> {
     let dev = args.iter().any(|a| a == "--dev");
     let id = process::session_of(process::current_pid()).ok_or("couldn't tell which session this is")?;
     // This user's own log: the agent runs as the person signed in, who can't write eGuard's data folder
     let log = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("eGuard").join("logs").join("agent.log"));
-    logging::init("agent", log.as_deref(), false);
+    init_log(log.as_deref());
     logging::info(&format!("eguard-agent {} in session {id}", eguard_core::update::VERSION));
     let pipe_name = ipc::session_pipe_name(id);
     let service = service_exe();
@@ -304,7 +312,7 @@ fn crash(args: &[String]) -> Result<(), String> {
         return Err("crash is only for development builds".into());
     }
     let log = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("eGuard").join("logs").join("agent.log"));
-    logging::init("agent", log.as_deref(), false);
+    init_log(log.as_deref());
     match args.first().map(String::as_str) {
         Some("panic") => panic!("crashing on purpose (eguard-agent crash panic)"),
         Some("fault") => {

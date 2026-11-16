@@ -37,10 +37,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BS_DEFPUSHBUTTON, BS_PUSHBUTTON, BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow, GetMessageW,
     GetSystemMetrics, GetWindowThreadProcessId, HMENU, HWND_TOPMOST, IDC_ARROW, IsDialogMessageW, IsWindowVisible, KillTimer, LoadCursorW,
-    MSG, MoveWindow, PostMessageW, RegisterClassExW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, WM_APP, WM_CLOSE,
-    WM_COMMAND, WM_ENDSESSION, WM_PAINT, WM_QUERYENDSESSION, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_NOACTIVATE,
+    MSG, MoveWindow, PostMessageW, RegisterClassExW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_SHUTTINGDOWN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, WM_APP,
+    WM_CLOSE, WM_COMMAND, WM_ENDSESSION, WM_PAINT, WM_QUERYENDSESSION, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
 };
 
@@ -718,6 +718,11 @@ fn command(hwnd: HWND, id: usize) {
         open_app(id - ID_APP_FIRST);
         return;
     }
+    // Any program on the child's desktop can post a WM_COMMAND: the development build's Close exists only there, so
+    // its id does nothing in a real one (else a posted 104 would lift the overlay for good)
+    if id == ID_DEV_CLOSE && !with(|st| st.dev).unwrap_or(false) {
+        return;
+    }
     let Some(()) = with(|st| {
         let is_overlay = hwnd == st.overlay.hwnd;
         match id {
@@ -796,8 +801,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_QUERYENDSESSION => 1,
         WM_ENDSESSION => {
             // The session is really ending (not cancelled): exit with the code that tells the service this was
-            // Windows, not someone ending the agent, so the parent gets no "eGuard was closed" alert
-            if wparam != 0 {
+            // Windows, not someone ending the agent, so the parent gets no "eGuard was closed" alert. Any program on
+            // the desktop can post this message, so Windows' own word that the session is shutting down is needed
+            // too (a forged one is ignored; the service also checks the session ended)
+            // SAFETY: plain call.
+            if wparam != 0 && unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) } != 0 {
                 std::process::exit(crate::session::AGENT_EXIT_SESSION_ENDING as i32);
             }
             0

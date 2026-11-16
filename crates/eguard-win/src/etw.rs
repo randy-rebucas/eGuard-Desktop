@@ -10,9 +10,9 @@ use crate::wide::wide;
 use std::ptr::null;
 use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_SUCCESS};
 use windows_sys::Win32::System::Diagnostics::Etw::{
-    CONTROLTRACE_HANDLE, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_LOGFILEW,
-    EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, ProcessTrace, StartTraceW, TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
+    CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
+    EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, EnableTraceEx2, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
+    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW, TRACE_LEVEL_INFORMATION, WNODE_FLAG_TRACED_GUID,
 };
 
 /// `Microsoft-Windows-Kernel-Process`.
@@ -59,61 +59,106 @@ unsafe extern "system" fn on_event(record: *mut EVENT_RECORD) {
     }
 }
 
-/// Starts watching for process starts; `on_start(pid)` is called on the watcher's thread for each one.
+/// Starts watching for process starts; `on_start(pid)` is called on the watcher's thread for each one. Fails when
+/// the session can't be started at all (not an administrator). Once started, a session that ends (an administrator
+/// stopped it) is started again; the sweep covers the gap.
 pub fn spawn(on_start: impl Fn(u32) + Send + Sync + 'static) -> std::io::Result<()> {
-    let name = wide(SESSION_NAME);
-    let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
-    let mut props = properties(SESSION_NAME.len());
-    // SAFETY: `props` is laid out as `properties` describes; `name` is zero-terminated.
-    let mut rc = unsafe { StartTraceW(&raw mut handle, name.as_ptr(), props.as_mut_ptr().cast()) };
-    if rc == ERROR_ALREADY_EXISTS {
-        // Left over from an earlier run that didn't stop it: stop it and start afresh
-        let mut stop = properties(SESSION_NAME.len());
-        // SAFETY: as above.
-        unsafe { ControlTraceW(CONTROLTRACE_HANDLE { Value: 0 }, name.as_ptr(), stop.as_mut_ptr().cast(), EVENT_TRACE_CONTROL_STOP) };
-        props = properties(SESSION_NAME.len());
-        // SAFETY: as above.
-        rc = unsafe { StartTraceW(&raw mut handle, name.as_ptr(), props.as_mut_ptr().cast()) };
-    }
-    if rc != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(rc as i32));
-    }
-    // SAFETY: `handle` is the session just started; no filter parameters.
-    let rc = unsafe {
-        EnableTraceEx2(
-            handle,
-            &KERNEL_PROCESS,
-            EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-            TRACE_LEVEL_INFORMATION as u8,
-            KEYWORD_PROCESS,
-            0,
-            0,
-            null(),
-        )
-    };
-    if rc != ERROR_SUCCESS {
-        return Err(std::io::Error::from_raw_os_error(rc as i32));
-    }
-
-    // The callback's context lives as long as the process: the session is never closed while eGuard runs
+    // The callback's context lives as long as the process: every session this starts uses it
     let context: &'static OnStart = Box::leak(Box::new(Box::new(on_start) as OnStart));
-    let mut logger = name.clone();
-    let mut log = EVENT_TRACE_LOGFILEW { LoggerName: logger.as_mut_ptr(), ..Default::default() };
-    log.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
-    log.Anonymous2.EventRecordCallback = Some(on_event);
-    log.Context = std::ptr::from_ref(context).cast_mut().cast();
-    // SAFETY: `log` is filled in for a real-time session by name; `logger` outlives the call.
-    let trace = unsafe { OpenTraceW(&raw mut log) };
-    if trace.Value == INVALID_TRACE {
-        return Err(crate::last_error());
-    }
+    let mut session = Session::start(context)?;
     std::thread::Builder::new().name("etw".into()).spawn(move || {
-        // SAFETY: one valid trace handle; no time window (real time). Blocks while the session runs.
-        unsafe { ProcessTrace(&raw const trace, 1, null(), null()) };
-        // The session's name and properties were in use until here
-        drop((logger, props));
+        loop {
+            // Blocks while the session runs
+            session.process();
+            // Stopped from outside (or failed): start it again, slowly while that fails
+            session = loop {
+                std::thread::sleep(RESTART_AFTER);
+                if let Ok(s) = Session::start(context) {
+                    break s;
+                }
+            };
+        }
     })?;
     Ok(())
+}
+
+/// Waited before starting a session that ended again.
+const RESTART_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A started, enabled and opened real-time session. Its name and properties stay alive with it.
+struct Session {
+    trace: PROCESSTRACE_HANDLE,
+    _logger: Vec<u16>,
+    _props: Vec<u64>,
+}
+
+// The trace handle is an opaque number, usable from any thread
+unsafe impl Send for Session {}
+
+impl Session {
+    fn start(context: &'static OnStart) -> std::io::Result<Self> {
+        let name = wide(SESSION_NAME);
+        let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
+        let mut props = properties(SESSION_NAME.len());
+        // SAFETY: `props` is laid out as `properties` describes; `name` is zero-terminated.
+        let mut rc = unsafe { StartTraceW(&raw mut handle, name.as_ptr(), props.as_mut_ptr().cast()) };
+        if rc == ERROR_ALREADY_EXISTS {
+            // Left over from an earlier run that didn't stop it: stop it and start afresh
+            stop(&name);
+            props = properties(SESSION_NAME.len());
+            // SAFETY: as above.
+            rc = unsafe { StartTraceW(&raw mut handle, name.as_ptr(), props.as_mut_ptr().cast()) };
+        }
+        if rc != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(rc as i32));
+        }
+        // SAFETY: `handle` is the session just started; no filter parameters.
+        let rc = unsafe {
+            EnableTraceEx2(
+                handle,
+                &KERNEL_PROCESS,
+                EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                TRACE_LEVEL_INFORMATION as u8,
+                KEYWORD_PROCESS,
+                0,
+                0,
+                null(),
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            // Not left running for nothing (sessions are a system-wide, limited resource)
+            stop(&name);
+            return Err(std::io::Error::from_raw_os_error(rc as i32));
+        }
+        let mut logger = name.clone();
+        let mut log = EVENT_TRACE_LOGFILEW { LoggerName: logger.as_mut_ptr(), ..Default::default() };
+        log.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        log.Anonymous2.EventRecordCallback = Some(on_event);
+        log.Context = std::ptr::from_ref(context).cast_mut().cast();
+        // SAFETY: `log` is filled in for a real-time session by name; `logger` outlives the call.
+        let trace = unsafe { OpenTraceW(&raw mut log) };
+        if trace.Value == INVALID_TRACE {
+            let e = crate::last_error();
+            stop(&name);
+            return Err(e);
+        }
+        Ok(Self { trace, _logger: logger, _props: props })
+    }
+
+    /// Delivers events until the session ends, then closes the trace.
+    fn process(&self) {
+        // SAFETY: one valid trace handle; no time window (real time). Blocks while the session runs.
+        unsafe { ProcessTrace(&raw const self.trace, 1, null(), null()) };
+        // SAFETY: the handle `OpenTraceW` gave, closed once, after `ProcessTrace` returned.
+        unsafe { CloseTrace(self.trace) };
+    }
+}
+
+/// Stops the session named `name` (zero-terminated), if it runs.
+fn stop(name: &[u16]) {
+    let mut props = properties(SESSION_NAME.len());
+    // SAFETY: `props` is laid out as `properties` describes; `name` is zero-terminated.
+    unsafe { ControlTraceW(CONTROLTRACE_HANDLE { Value: 0 }, name.as_ptr(), props.as_mut_ptr().cast(), EVENT_TRACE_CONTROL_STOP) };
 }
 
 #[cfg(test)]

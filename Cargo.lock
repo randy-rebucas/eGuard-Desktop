@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "eguard-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eguard-core",
  "eguard-win",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "eguard-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "hmac",
@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "eguard-guard"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eguard-core",
  "eguard-win",
@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "eguard-service"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eguard-core",
  "eguard-win",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "eguard-win"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eguard-core",
  "serde_json",

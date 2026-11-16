@@ -42,6 +42,16 @@ pub const ADMIN_ALERT_EVERY_MS: i64 = 24 * 60 * 60_000;
 /// eGuard's signed command waits this long for the server to hear `UNINSTALL_ACK` before removing anyway: the command
 /// is eGuard's word, and a server that stops answering mustn't keep a removal waiting forever.
 pub const ACK_WAIT_MS: i64 = 10 * 60_000;
+/// A failed `UNINSTALL_ACK` (no code) is sent again after this, doubling each time up to `ACK_RETRY_MAX_MS`: about 8
+/// tries in `ACK_WAIT_MS`, well inside the server's 120 events an hour, which `TAMPER` events share.
+pub const ACK_RETRY_FIRST_MS: i64 = 10_000;
+pub const ACK_RETRY_MAX_MS: i64 = 2 * 60_000;
+
+/// How long to wait after a 429: the server's `Retry-After` when it says, never less than eGuard's own `floor_ms`.
+fn rate_limited_ms(floor_ms: u64, retry_after_secs: Option<u32>) -> u64 {
+    let said = u64::from(retry_after_secs.unwrap_or(0).min(crate::api::MAX_RETRY_AFTER_SECS)) * 1000;
+    floor_ms.max(said)
+}
 
 /// The computer as `/pair`, `/sync` and `/report` describe it. Cut to the server's limits by `DeviceInfo::new`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,10 +63,9 @@ pub struct DeviceInfo {
     pub battery: Option<u8>,
 }
 
+/// Cut as the server measures (UTF-16 units, JavaScript's trim): a name over the limit there fails the whole request.
 fn cut(s: &str, max: usize, fallback: &str) -> String {
-    let s: String = s.trim().chars().take(max).collect();
-    let s = s.trim_end();
-    if s.is_empty() { fallback.to_owned() } else { s.to_owned() }
+    crate::wire::fit(s, max).unwrap_or_else(|| fallback.to_owned())
 }
 
 impl DeviceInfo {
@@ -114,17 +123,28 @@ pub enum Removal {
     Kept,
 }
 
-/// What the parent reads on the device page while one of the child's accounts is an administrator.
+/// What the parent reads on the device page while one of the child's accounts is an administrator. The server
+/// keeps `REPORT_ERROR_MAX` characters: the advice always fits whole, and the names give way (the first, cut if it
+/// must be, and how many more).
 fn admin_reason(names: &[String]) -> String {
-    let who = match names {
+    const ADVICE: &str = " on this computer, and an administrator can remove eGuard. Make the account a standard one: Settings › Accounts › Other users › \
+         Change account type.";
+    let units = |s: &str| s.encode_utf16().count();
+    let room = crate::wire::REPORT_ERROR_MAX - units(ADVICE);
+    let mut who = match names {
         [one] => format!("{one} is an administrator"),
         [rest @ .., last] => format!("{} and {last} are administrators", rest.join(", ")),
         [] => String::new(),
     };
-    format!(
-        "{who} on this computer, and an administrator can remove eGuard. Make the account a standard one: Settings › Accounts › \
-         Other users › Change account type."
-    )
+    if units(&who) > room {
+        let tail = match names.len() {
+            1 => " is an administrator".to_owned(),
+            n => format!(" and {} more are administrators", n - 1),
+        };
+        let first = crate::wire::cut_utf16(&names[0], room.saturating_sub(units(&tail)));
+        who = format!("{first}{tail}");
+    }
+    format!("{who}{ADVICE}")
 }
 
 /// What a tick did.
@@ -156,6 +176,9 @@ pub struct Engine {
     /// The monotonic time of the next `/sync`.
     next_sync_mono_ms: u64,
     sync_failures: u32,
+    /// Failed `UNINSTALL_ACK`s in a row, and when the next may go (wall clock, ms).
+    ack_failures: u32,
+    next_ack_ms: i64,
     /// The catalog in force: the last good copy, verified.
     catalog: Option<Catalog>,
     next_catalog_mono_ms: u64,
@@ -222,6 +245,8 @@ impl Engine {
             caps,
             next_sync_mono_ms: 0,
             sync_failures: 0,
+            ack_failures: 0,
+            next_ack_ms: 0,
             catalog,
             next_catalog_mono_ms: 0,
             catalog_failures: 0,
@@ -341,7 +366,14 @@ impl Engine {
 
     fn clock_changed(&mut self, c: ClockChange, now_ms: i64) {
         self.notes.push(Note::Warn(format!("the computer's clock was changed by {} s", c.delta_ms / 1000)));
-        self.data.queue.push_event(EventEnvelope::new(DeviceEvent::Tamper { kind: TamperKind::ClockChanged }), now_ms);
+        // Once an hour, like every other tamper kind: an administrator toggling the clock isn't news every tick
+        self.tamper(TamperKind::ClockChanged, now_ms);
+        // A clock that was ahead stamped what was queued meanwhile in its future: each lane waits on its oldest
+        // item, so the parent would hear nothing from this computer for as long as the clock was ahead
+        self.data.queue.retry_now(now_ms);
+        if let Some(r) = self.data.removing.as_mut() {
+            r.since_ms = r.since_ms.min(now_ms);
+        }
     }
 
     /// One round of work: sync if due, then send what's due.
@@ -381,17 +413,33 @@ impl Engine {
             SyncRequest { battery: info.battery, os_version: Some(info.os_version.clone()), app_version: Some(info.app_version.clone()) };
         let wait_ms = match self.api.sync(token, &request) {
             Ok(raw) => self.apply_sync(&raw, s, info),
-            Err(ApiError::Status { status: 401, .. }) => {
+            Err(ApiError::Status { status: 401, uninstall, .. }) => {
                 let agent = self.data.agent.as_mut().expect("paired");
-                if agent.auth == AuthState::Ok {
+                // Removed from eGuard without confirming it: the 401 carries eGuard's signed word to uninstall. A 401
+                // alone, or one whose command doesn't verify, switches nothing off
+                let removal = uninstall.map(|u| agent.verify_unauthorized_uninstall(&self.keys, &u, s));
+                if agent.auth == AuthState::Ok && !matches!(removal, Some(Ok(_))) {
                     self.notes.push(Note::Warn("eGuard refused this computer's token; protection carries on as it was".into()));
                 }
                 agent.on_unauthorized(now_ms);
+                match removal {
+                    Some(Ok(cmd)) => {
+                        self.notes.push(Note::Warn(format!(
+                            "eGuard removed this computer (verified, requested {}); removing eGuard",
+                            cmd.requested_at
+                        )));
+                        self.authorize_removal(None, now_ms);
+                    }
+                    Some(Err(e)) => {
+                        self.notes.push(Note::Warn(format!("an uninstall command with a 401 failed verification and was ignored: {e}")));
+                    }
+                    None => {}
+                }
                 u64::from(UNAUTHORIZED_SYNC_SECS) * 1000
             }
             Err(ApiError::Status { status: 429, retry_after_secs, .. }) => {
                 self.notes.push(Note::Warn("eGuard asked this computer to slow down".into()));
-                (queue::RATE_LIMITED_MIN_MS as u64).max(u64::from(retry_after_secs.unwrap_or(0)) * 1000)
+                rate_limited_ms(queue::RATE_LIMITED_MIN_MS as u64, retry_after_secs)
             }
             Err(e) => {
                 self.sync_failures += 1;
@@ -517,8 +565,8 @@ impl Engine {
                     queue::backoff_ms(self.catalog_failures, (self.jitter)()) as u64
                 }
             },
-            // Its limit is 30 an hour: wait out the hour
-            Err(ApiError::Status { status: 429, .. }) => 60 * 60_000,
+            // Its limit is 30 an hour: wait out the hour, or longer when the server says so
+            Err(ApiError::Status { status: 429, retry_after_secs, .. }) => rate_limited_ms(60 * 60_000, retry_after_secs),
             Err(e) => {
                 self.catalog_failures += 1;
                 if self.catalog.is_none() {
@@ -560,7 +608,7 @@ impl Engine {
                     queue::backoff_ms(self.update_failures, (self.jitter)()) as u64
                 }
             },
-            Err(ApiError::Status { status: 429, .. }) => 60 * 60_000,
+            Err(ApiError::Status { status: 429, retry_after_secs, .. }) => rate_limited_ms(60 * 60_000, retry_after_secs),
             // A server that doesn't offer updates
             Err(ApiError::Status { status: 404, .. }) => UPDATE_EVERY_MS,
             Err(e) => {
@@ -772,6 +820,8 @@ impl Engine {
             if code.is_some() { "a removal code" } else { "eGuard's signed command" }
         )));
         self.data.removing = Some(Removing { code, since_ms: now_ms, ready: false });
+        // A new removal's acknowledgement goes at once
+        (self.ack_failures, self.next_ack_ms) = (0, 0);
     }
 
     /// Where eGuard's own removal stands. While it waits for the server, this tells it (`UNINSTALL_ACK`, with the
@@ -787,6 +837,11 @@ impl Engine {
         if r.ready {
             return Removal::Remove;
         }
+        // eGuard's command waiting on a server that fails: not sent again until its backoff is over (a code removes
+        // after its one try, so it never waits here)
+        if r.code.is_none() && now_ms < self.next_ack_ms && now_ms - r.since_ms < ACK_WAIT_MS {
+            return Removal::Wait;
+        }
         let ack = Outbound::Event(EventEnvelope::new(DeviceEvent::UninstallAck { code: r.code.clone() }));
         let outcome = self.secrets.as_ref().map_or(SendOutcome::Unreachable, |s| self.api.send(&s.token, &ack));
         let ready = match outcome {
@@ -800,9 +855,20 @@ impl Engine {
             _ => now_ms - r.since_ms >= ACK_WAIT_MS,
         };
         if !ready {
-            self.notes.push(Note::Warn(format!("eGuard didn't take the removal's acknowledgement ({outcome:?}); trying again")));
+            let shift = self.ack_failures.min(10);
+            self.ack_failures = self.ack_failures.saturating_add(1);
+            let mut wait = (ACK_RETRY_FIRST_MS << shift).min(ACK_RETRY_MAX_MS);
+            if let SendOutcome::RateLimited { retry_after_secs: Some(secs) } = outcome {
+                wait = wait.max(i64::from(secs) * 1000);
+            }
+            self.next_ack_ms = now_ms + wait;
+            self.notes.push(Note::Warn(format!(
+                "eGuard didn't take the removal's acknowledgement ({outcome:?}); trying again in {} s",
+                wait / 1000
+            )));
             return Removal::Wait;
         }
+        self.ack_failures = 0;
         self.notes.push(Note::Warn(format!("removing eGuard from this computer (acknowledgement: {outcome:?})")));
         if let Some(r) = self.data.removing.as_mut() {
             r.ready = true;
@@ -868,18 +934,31 @@ impl Engine {
                     Some(Settled::Done) => delivered = true,
                     Some(Settled::Dropped(item)) => {
                         self.notes.push(Note::Warn(format!("eGuard refused a {} message ({outcome:?}); dropped", item.lane())));
+                        self.unreport(&item);
                     }
                     Some(Settled::GaveUp(item)) => {
                         self.notes.push(Note::Warn(format!(
                             "eGuard kept failing on a {} message ({outcome:?}); given up so the ones after it can go",
                             item.lane()
                         )));
+                        self.unreport(&item);
                     }
                     _ => {}
                 }
             }
             if !delivered {
                 return;
+            }
+        }
+    }
+
+    /// A `/report` that never arrived: what it said isn't on the dashboard, so the next sync (protections) and the
+    /// next look at the accounts send it again instead of taking it as said.
+    fn unreport(&mut self, item: &Outbound) {
+        if let Outbound::Report(r) = item {
+            self.data.last_reported = None;
+            if r.accounts.is_some() {
+                self.data.accounts_reported = None;
             }
         }
     }
@@ -1333,6 +1412,43 @@ mod tests {
         assert_eq!(tampers(&e), [TamperKind::SafeMode, TamperKind::FilesChanged, TamperKind::SafeMode]);
     }
 
+    #[test]
+    fn the_administrator_advice_always_fits_whole() {
+        let advice = "Settings › Accounts › Other users › Change account type.";
+        assert_eq!(
+            admin_reason(&["Mia".into()]),
+            format!(
+                "Mia is an administrator on this computer, and an administrator can remove eGuard. Make the account a standard one: {advice}"
+            )
+        );
+        let long: Vec<String> = (0..4).map(|i| format!("{i}{}", "x".repeat(63))).collect();
+        for names in [&long[..1], &long[..]] {
+            let r = admin_reason(names);
+            assert!(r.encode_utf16().count() <= crate::wire::REPORT_ERROR_MAX, "{r}");
+            assert!(r.ends_with(advice) && r.starts_with('0'), "{r}");
+        }
+        assert!(admin_reason(&long).contains(" and 3 more are administrators on this computer"));
+    }
+
+    #[test]
+    fn a_clock_that_was_ahead_does_not_hold_back_what_was_queued_meanwhile() {
+        let t = Scripted::new(vec![]);
+        let (mut e, _) = paired(&t);
+        let year = 365 * 24 * 3_600_000;
+        // Queued offline while eGuard's estimate ran a year ahead
+        assert!(e.tamper(TamperKind::SafeMode, year));
+        e.data.removing = Some(Removing { code: None, since_ms: year, ready: false });
+        assert_eq!(e.data.queue.due(0).len(), 0);
+        // The next sync steps the clock back to the real time
+        e.clock_changed(ClockChange { delta_ms: year }, 0);
+        assert_eq!(e.data.queue.due(0).len(), 1);
+        assert_eq!(e.data.removing.as_ref().unwrap().since_ms, 0);
+        assert_eq!(tampers(&e), [TamperKind::SafeMode, TamperKind::ClockChanged]);
+        // Changed again within the hour: still one CLOCK_CHANGED
+        e.clock_changed(ClockChange { delta_ms: -200_000 }, 60_000);
+        assert_eq!(tampers(&e), [TamperKind::SafeMode, TamperKind::ClockChanged]);
+    }
+
     /// A paired engine that synced once, then got eGuard's signed uninstall command. Returns eGuard's time then.
     fn asked_to_remove(t: &Arc<Scripted>) -> (Engine, i64) {
         let (mut e, _) = paired(t);
@@ -1349,6 +1465,39 @@ mod tests {
         e.tick(at(mono, &removal_at), &info());
         assert!(e.data.removing.as_ref().is_some_and(|r| r.code.is_none() && !r.ready), "{:?}", e.take_notes());
         (e, crate::clock::parse_iso_ms(&removal_at).unwrap())
+    }
+
+    #[test]
+    fn a_401_with_eguards_signed_uninstall_removes_and_one_without_or_forged_does_not() {
+        let answer_401 = |uninstall: Option<Value>| {
+            let t = Scripted::new(vec![]);
+            let (mut e, _) = paired(&t);
+            let mut first = fixture("sync-computer.json");
+            first["deviceId"] = j!(e.secrets.as_ref().unwrap().device_id);
+            let first_at = first["serverTime"].as_str().unwrap().to_owned();
+            t.answers.lock().unwrap().push(json(200, &first));
+            e.tick(at(1_000, &first_at), &info());
+            // Removed without confirming it: the server kept the token, and /sync's 401 carries the command
+            let removal = fixture("sync-removal.json");
+            let removal_at = removal["serverTime"].as_str().unwrap().to_owned();
+            let mono = 1_000 + (crate::clock::parse_iso_ms(&removal_at).unwrap() - crate::clock::parse_iso_ms(&first_at).unwrap()) as u64;
+            let mut body = j!({ "error": "Invalid or missing device token" });
+            if let Some(u) = uninstall {
+                body["uninstall"] = u;
+            }
+            *t.answers.lock().unwrap() = vec![json(401, &body)];
+            e.sync_soon();
+            e.tick(at(mono, &removal_at), &info());
+            e
+        };
+        let signed = fixture("sync-removal.json")["uninstall"].clone();
+        let e = answer_401(Some(signed.clone()));
+        assert!(e.data.removing.as_ref().is_some_and(|r| r.code.is_none() && !r.ready));
+        // A plain 401, or one whose command was tampered with: protection carries on
+        assert!(answer_401(None).data.removing.is_none());
+        let mut forged = signed;
+        forged["command"]["requestedAt"] = j!("2020-01-01T00:00:00.000Z");
+        assert!(answer_401(Some(forged)).data.removing.is_none());
     }
 
     /// The body of the last request sent.
@@ -1395,6 +1544,19 @@ mod tests {
         assert_eq!(e.removal(now), Removal::Wait);
         t.answers.lock().unwrap().push(json(500, &j!({ "error": "boom" })));
         assert_eq!(e.removal(now + ACK_WAIT_MS - 1), Removal::Wait);
+        assert_eq!(e.removal(now + ACK_WAIT_MS), Removal::Remove);
+        // A failing server is asked again with a growing wait, not at every tick (10 s ticks for 10 minutes)
+        let t = Scripted::new(vec![]);
+        let (mut e, now) = asked_to_remove(&t);
+        let acks = |t: &Arc<Scripted>| t.seen.lock().unwrap().iter().filter(|r| r.url.ends_with("/events")).count();
+        let before = acks(&t);
+        let mut at = now;
+        while at < now + ACK_WAIT_MS {
+            assert_eq!(e.removal(at), Removal::Wait);
+            at += 10_000;
+        }
+        let sent = acks(&t) - before;
+        assert!((5..=10).contains(&sent), "{sent} acknowledgements in 10 minutes");
         assert_eq!(e.removal(now + ACK_WAIT_MS), Removal::Remove);
         // A device already deleted (401) is removed at once
         let t = Scripted::new(vec![]);
@@ -1474,6 +1636,9 @@ mod tests {
         assert_eq!(d.model, "PC");
         assert_eq!(d.app_version.len(), 20);
         assert_eq!(d.battery, None);
+        // The server counts UTF-16 units: 40 emoji are 80 of them, so the name is cut to 30
+        let d = DeviceInfo::new(&"\u{1F3AE}".repeat(40), "PC", "Windows", "0.1.0", None);
+        assert_eq!(d.name.encode_utf16().count(), 60);
     }
 
     const HOUR: u64 = 60 * 60_000;

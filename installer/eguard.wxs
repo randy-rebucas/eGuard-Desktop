@@ -69,9 +69,11 @@
     <CustomAction Id="UninstallCheck" FileRef="ServiceExe" ExeCommand="msi-check" Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="Purge" FileRef="ServiceExe" ExeCommand="purge" Execute="deferred" Impersonate="no" Return="check" />
 
+    <!-- Any REMOVE, not only REMOVE="ALL": with one feature, REMOVE=Main removes every file too, and must not skip
+         the check (no removal without a code or eGuard's command) or leave the service and Safe Mode keys behind -->
     <InstallExecuteSequence>
-      <Custom Action="UninstallCheck" After="InstallInitialize" Condition="REMOVE=&quot;ALL&quot;" />
-      <Custom Action="Purge" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot;" />
+      <Custom Action="UninstallCheck" After="InstallInitialize" Condition="REMOVE" />
+      <Custom Action="Purge" Before="RemoveFiles" Condition="REMOVE" />
       <Custom Action="LockdownRollback" Before="Lockdown" Condition="NOT REMOVE" />
       <Custom Action="Lockdown" Before="InstallFinalize" Condition="NOT REMOVE" />
     </InstallExecuteSequence>

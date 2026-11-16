@@ -68,6 +68,10 @@ pub struct Shared {
     to_runner: Box<dyn Fn(&Request) -> Response + Send + Sync>,
     /// eGuard removed itself or stops for an update: agents are told to close, and none is started again.
     removed: AtomicBool,
+    /// The pid of the agent this service started in each session. Only that one's heartbeats and requests count:
+    /// the child can start `eguard-agent.exe` too, and a copy they started is theirs to drive (its idle time, what's
+    /// in front).
+    launched: Mutex<HashMap<u32, u32>>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -97,6 +101,7 @@ impl Shared {
             wake,
             to_runner,
             removed: AtomicBool::new(false),
+            launched: Mutex::new(HashMap::new()),
         }
     }
 
@@ -108,6 +113,19 @@ impl Shared {
 
     fn agents_closed(&self) -> bool {
         self.removed.load(Ordering::SeqCst)
+    }
+
+    /// Whether `pid` is the agent this service started in session `id`.
+    fn is_launched(&self, id: u32, pid: u32) -> bool {
+        self.launched.lock().unwrap_or_else(PoisonError::into_inner).get(&id) == Some(&pid)
+    }
+
+    fn set_launched(&self, id: u32, pid: Option<u32>) {
+        let mut l = self.launched.lock().unwrap_or_else(PoisonError::into_inner);
+        match pid {
+            Some(pid) => l.insert(id, pid),
+            None => l.remove(&id),
+        };
     }
 
     fn is_disconnected(&self, id: u32) -> bool {
@@ -276,6 +294,7 @@ pub fn supervise(shared: &Arc<Shared>) {
 fn keep_agent(shared: &Shared, id: u32, t: &mut Tracked, now: Instant) {
     if let Some(code) = t.agent.as_ref().and_then(Child::exit_code) {
         t.agent = None;
+        shared.set_launched(id, None);
         if code == session::AGENT_EXIT_SESSION_ENDING {
             log::info(&format!("session {id}: the agent exited because the session is ending"));
             t.ending_since = Some(now);
@@ -292,9 +311,18 @@ fn keep_agent(shared: &Shared, id: u32, t: &mut Tracked, now: Instant) {
     }
     let waiting_for_signout = t.ending_since.is_some_and(|at| now - at < SIGNOUT_GRACE);
     if t.agent.is_none() && !waiting_for_signout {
+        // The agent said its session was ending, but the session is still here and connected after the grace (this
+        // runs only for connected sessions): it wasn't Windows. Something told it to go (a forged WM_ENDSESSION)
+        if t.ending_since.is_some() && t.alerted_at.is_none_or(|at| now - at >= ALERT_EVERY) {
+            log::warn(&format!("session {id}: the agent left as if the session were ending, but it goes on; starting it again"));
+            t.alerted_at = Some(now);
+            shared.enforcer().report(DeviceEvent::Tamper { kind: TamperKind::AgentRestarted });
+            (shared.wake)();
+        }
         t.ending_since = None;
         match start_agent(shared, id) {
             Ok(child) => {
+                shared.set_launched(id, Some(child.pid));
                 log::info(&format!("session {id}: agent started (pid {})", child.pid));
                 t.agent = Some(child);
                 t.starts.push_back(now);
@@ -394,6 +422,12 @@ fn handle(shared: &Shared, id: u32, client: u32, req: &Request) -> Response {
     let sample = clock::sample();
     match req {
         Request::Heartbeat { .. } if shared.agents_closed() => Response::Removed,
+        // eGuard's agent, but not the one this service started here (the child started it, or a service before this
+        // one did): it's told nothing and changes nothing. "Remove with a code" still works from any copy
+        Request::Heartbeat { .. } if !shared.is_launched(id, client) => Response::Session(SessionView::default()),
+        Request::AskParent { .. } | Request::AskTime { .. } if !shared.is_launched(id, client) => {
+            Response::Error { message: "Only eGuard's own app can use this.".into() }
+        }
         &Request::Heartbeat { .. } if !shared.applies(id) => Response::Session(SessionView::default()),
         // Switched away from: the agent is alive (so it isn't silent), but nobody is there to see a screen or use time
         &Request::Heartbeat { .. } if shared.is_disconnected(id) => {
@@ -403,8 +437,7 @@ fn handle(shared: &Shared, id: u32, client: u32, req: &Request) -> Response {
         &Request::Heartbeat { foreground_pid, idle_ms } => {
             let program = foreground_pid
                 .filter(|pid| *pid != client && process::session_of(*pid) == Some(id))
-                .and_then(process::image_path)
-                .and_then(|p| shared.facts.program(&p));
+                .and_then(|pid| crate::monitor::running_program(&shared.facts, pid));
             let seen = match (foreground_pid, &program) {
                 (Some(pid), _) if pid == client => Seen::Ours,
                 (_, Some(p)) => Seen::Program(p),

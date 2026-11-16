@@ -63,6 +63,23 @@ impl Store {
         self.dir.join("state.prev.json")
     }
 
+    /// The state as this version left it when it handed over to an update (`keep_before_update`).
+    fn before_update_path(&self) -> PathBuf {
+        self.dir.join("state.before-update.json")
+    }
+
+    /// Keeps `state` aside before an update. The new version saves its own format every minute; if it's rolled back
+    /// and this version can't read that format, it carries on from here (the day's usage, the code lockout, eGuard's
+    /// clock, the queue) instead of from nothing.
+    pub fn keep_before_update(&self, state: &Persisted) -> std::io::Result<()> {
+        files::write_atomic(&self.before_update_path(), &state.to_json())
+    }
+
+    /// The version that runs works (or there was no update): the copy kept before it is no longer needed.
+    pub fn forget_before_update(&self) {
+        let _ = std::fs::remove_file(self.before_update_path());
+    }
+
     /// The state and secrets as they are on disk. A state file that's missing, doesn't parse or is too new is set
     /// aside (renamed, for a look later) and the copy from before the last save is used instead, so the day's usage,
     /// the code lockout, eGuard's clock and the queue survive; only when both are gone does the engine rebuild the
@@ -96,6 +113,11 @@ impl Store {
                 }
                 // A fresh install has neither
                 (_, false) if secrets.is_none() => Persisted::default(),
+                // Both written by a newer version that was rolled back, in a format this one can't read
+                _ if let Ok(Some(s)) = Self::read_state(&self.before_update_path()) => {
+                    log::warn("state.json and state.prev.json were unreadable; carrying on from the state kept before the update");
+                    s
+                }
                 _ => {
                     log::error("no usable state.json or state.prev.json; starting from what the secrets say");
                     Persisted::default()
@@ -216,6 +238,27 @@ mod tests {
         let _ = std::fs::remove_file(dir.join("state.json"));
         std::fs::remove_file(dir.join("state.prev.json")).unwrap();
         assert_eq!(store.load().0, Persisted::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rolled_back_update_carries_on_from_the_state_kept_before_it() {
+        let dir = std::env::temp_dir().join(format!("eguard-store-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir, None).unwrap();
+        let secrets = DeviceSecrets { device_id: "dev_1".into(), token: "tok".into(), removal_secret: None };
+        store.save_secrets(&secrets).unwrap();
+        let mut before = Persisted::recover(&secrets);
+        before.last_scan_ms = Some(7);
+        store.save_state(&before).unwrap();
+        store.keep_before_update(&before).unwrap();
+        // The newer version saved twice in a format this one can't read
+        let newer = br#"{"version":99}"#;
+        std::fs::write(dir.join("state.json"), newer).unwrap();
+        std::fs::write(dir.join("state.prev.json"), newer).unwrap();
+        assert_eq!(store.load().0, before);
+        store.forget_before_update();
+        assert!(!dir.join("state.before-update.json").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
