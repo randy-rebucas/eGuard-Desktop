@@ -813,7 +813,7 @@ impl Runner {
         if choice.enforced.is_empty() {
             return Response::Error {
                 message:
-                    "Every account on this computer is an administrator. Name your child's account: eguard-agent pair CODE --accounts NAME"
+                    "Every account on this computer is an administrator. Name your child's account (the accounts box, or eguard-agent pair CODE --accounts NAME)."
                         .into(),
             };
         }

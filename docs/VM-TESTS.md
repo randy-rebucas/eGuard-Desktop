@@ -53,6 +53,19 @@ protect, remove, keep). Delete the family at the end.
 
 Mark each **pass**, **fail** (with what happened) or **couldn't** (why) in the results table at the end.
 
+### A0. A double-clicked install and the pairing window
+
+From the **clean** snapshot. `install.ps1` still forwards the dev server first: run it once with the install part
+skipped, or forward by hand (`netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=3000
+connectaddress=10.0.2.2 connectport=3000`, with IP Helper running).
+
+1. As `mia` (standard): double-click `eguard.msi`. Expect UAC asking for an administrator's password; type
+   `parent`'s. The install finishes, then a second UAC prompt, then "Pair eGuard". Close it: a box says how to pair
+   later. Start menu › "Pair eGuard": UAC, the window again; type a code from `dev-family code`, keep `mia` → "Paired".
+2. If the install fails: the box names the step; bring back the end of `C:\ProgramData\eGuard\logs\service.log`
+   and the newest `%TEMP%\MSI*.LOG` (as `mia`, the log is in `mia`'s `%TEMP%`).
+3. As `parent`, from the clean snapshot: double-click, UAC (Yes), the window; refuse the second UAC → the box.
+
 ### A. Service and pairing (Phase 2, acceptance test 1)
 
 1. This PC: `node tools/dev-family.mjs create`. VM, as `parent` (administrator):
@@ -259,6 +272,7 @@ Copy this table into STATUS.md with the outcome of each, and keep the zips from 
 
 | Test | Result | Notes |
 |---|---|---|
+| A0 double-clicked install, pairing window (standard user / admin) | | |
 | A1 pair, capabilities | | |
 | A2 service config, data folder ACL | | |
 | A3 restart, DPAPI as SYSTEM | | |

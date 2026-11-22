@@ -11,6 +11,7 @@ pub mod clock;
 pub mod codebox;
 pub mod crash;
 pub mod dpapi;
+pub mod elevate;
 pub mod etw;
 pub mod files;
 pub mod http;

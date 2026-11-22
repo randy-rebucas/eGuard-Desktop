@@ -1,6 +1,11 @@
-//! "Remove with a code" (spec section 10): a small window where the parent types the offline removal code shown on
-//! the device page. Plain Win32, like the other screens. The code is checked by the service (`check`); this window
-//! only takes the typing and shows the answer, which may be "wrong code, N more tries" or a lockout.
+//! The small windows where a parent types a code from the dashboard. Plain Win32, like the other screens.
+//!
+//! - "Remove with a code" (spec section 10): the offline removal code shown on the device page.
+//! - "Pair eGuard" (spec 4.2: the installer opens eGuard's window and the parent types the code): the pairing code,
+//!   and which Windows accounts are the child's.
+//!
+//! The code is checked by the service (`check`); the window only takes the typing and shows the answer, which may be
+//! "wrong code, N more tries" or a lockout.
 #![allow(unsafe_code)]
 
 use crate::wide::{from_wide, wide};
@@ -23,11 +28,27 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const EM_LIMITTEXT: u32 = 0x00C5;
 const MAX_TYPED: usize = 16;
 
-/// Checks what was typed; `Ok` when eGuard is being removed. The words are shown either way.
-type Check = Box<dyn FnMut(&str) -> Result<String, String>>;
+/// Checks what was typed (the code, then the second box's text, empty without one); `Ok` when it was accepted. The
+/// words are shown either way.
+type Check = Box<dyn FnMut(&str, &str) -> Result<String, String>>;
+
+/// The longest the second box takes (account names, separated by commas).
+const MAX_SECOND: usize = 256;
+
+/// The words of one window.
+struct Form<'a> {
+    class: &'a str,
+    title: &'a str,
+    heading: &'a str,
+    explain: &'a str,
+    button: &'a str,
+    /// A second box under the code: its label and what's in it to start with.
+    second: Option<(&'a str, &'a str)>,
+}
 
 struct State {
     edit: HWND,
+    second: Option<HWND>,
     status: HWND,
     remove: HWND,
     cancel: HWND,
@@ -117,10 +138,42 @@ fn set_text(hwnd: HWND, text: &str) {
     unsafe { SetWindowTextW(hwnd, text.as_ptr()) };
 }
 
-/// Shows the window until it's closed or a code is accepted. `check` gets what was typed and answers in words: `Ok`
-/// when eGuard is being removed. Returns that answer, or `None` when the window was closed without one.
-pub fn remove_with_code(check: impl FnMut(&str) -> Result<String, String> + 'static) -> std::io::Result<Option<String>> {
-    let class = wide("eGuardRemoveCode");
+/// "Remove with a code". Shows the window until it's closed or a code is accepted. `check` gets what was typed and
+/// answers in words: `Ok` when eGuard is being removed. Returns that answer, or `None` when the window was closed
+/// without one.
+pub fn remove_with_code(mut check: impl FnMut(&str) -> Result<String, String> + 'static) -> std::io::Result<Option<String>> {
+    let form = Form {
+        class: "eGuardRemoveCode",
+        title: "Remove eGuard",
+        heading: "Only your parent can remove eGuard",
+        explain: "If this computer can't reach eGuard, your parent's dashboard shows a removal code on this computer's page. \
+                  Type it here.",
+        button: "Remove",
+        second: None,
+    };
+    show(&form, Box::new(move |code, _| check(code)))
+}
+
+/// "Pair eGuard": the pairing code from the parent's dashboard, and the child's Windows accounts (`accounts` to start
+/// with, separated by commas). `check` gets both and answers in words: `Ok` once paired. Returns that answer, or
+/// `None` when the window was closed without pairing.
+pub fn pair_with_code(
+    accounts: &str,
+    check: impl FnMut(&str, &str) -> Result<String, String> + 'static,
+) -> std::io::Result<Option<String>> {
+    let form = Form {
+        class: "eGuardPairCode",
+        title: "Pair eGuard",
+        heading: "Connect this computer to your family",
+        explain: "In the eGuard dashboard, add your child's computer and type the pairing code it shows here.",
+        button: "Pair",
+        second: Some(("Your child's Windows accounts (the rules apply only in these):", accounts)),
+    };
+    show(&form, Box::new(check))
+}
+
+fn show(form: &Form<'_>, check: Check) -> std::io::Result<Option<String>> {
+    let class = wide(form.class);
     // SAFETY: plain calls; a class registered twice in one process fails harmlessly (the first stays).
     let scale = unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -138,8 +191,10 @@ pub fn remove_with_code(check: impl FnMut(&str) -> Result<String, String> + 'sta
         GetDpiForSystem() as f32 / 96.0
     };
     let px = |v: i32| (v as f32 * scale).round() as i32;
+    // The second box and its label take this much more room
+    let extra = if form.second.is_some() { px(62) } else { 0 };
     // The inside of the window is laid out; the frame and title bar come on top of it
-    let (cw, ch) = (px(440), px(220));
+    let (cw, ch) = (px(440), px(220) + extra);
     let (style, ex_style) = (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, WS_EX_DLGMODALFRAME | WS_EX_TOPMOST);
     let mut frame = RECT { left: 0, top: 0, right: cw, bottom: ch };
     // SAFETY: `frame` is a writable RECT.
@@ -147,7 +202,7 @@ pub fn remove_with_code(check: impl FnMut(&str) -> Result<String, String> + 'sta
     let (w, h) = (frame.right - frame.left, frame.bottom - frame.top);
     // SAFETY: plain metric reads.
     let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-    let title = wide("Remove eGuard");
+    let title = wide(form.title);
     // SAFETY: the class is registered; strings are zero-terminated; the window belongs to this thread.
     let hwnd = unsafe {
         CreateWindowExW(
@@ -172,18 +227,25 @@ pub fn remove_with_code(check: impl FnMut(&str) -> Result<String, String> + 'sta
     let m = px(20);
     let inner = cw - 2 * m;
     let at = |x, y, width, height| Place { x, y, width, height };
-    child(hwnd, &Control::new("STATIC", "Only your parent can remove eGuard"), at(m, m, inner, px(26)), big);
-    let explain = "If this computer can't reach eGuard, your parent's dashboard shows a removal code on this computer's page. \
-                   Type it here.";
-    child(hwnd, &Control::new("STATIC", explain), at(m, m + px(32), inner, px(40)), body);
+    child(hwnd, &Control::new("STATIC", form.heading), at(m, m, inner, px(26)), big);
+    child(hwnd, &Control::new("STATIC", form.explain), at(m, m + px(32), inner, px(40)), body);
     let edit_style = WS_TABSTOP | WS_BORDER | (ES_UPPERCASE | ES_AUTOHSCROLL) as u32;
     let edit = Control { style: edit_style, ex: WS_EX_CLIENTEDGE, id: 100, ..Control::new("EDIT", "") };
     let edit = child(hwnd, &edit, at(m, m + px(80), px(200), px(28)), big);
-    let status = child(hwnd, &Control::new("STATIC", ""), at(m, m + px(114), inner, px(40)), body);
+    let second = form.second.map(|(label, text)| {
+        child(hwnd, &Control::new("STATIC", label), at(m, m + px(116), inner, px(20)), body);
+        let style = WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32;
+        let boxed = Control { style, ex: WS_EX_CLIENTEDGE, id: 101, ..Control::new("EDIT", text) };
+        let boxed = child(hwnd, &boxed, at(m, m + px(138), inner, px(26)), body);
+        // SAFETY: our own control.
+        unsafe { SendMessageW(boxed, EM_LIMITTEXT, MAX_SECOND, 0) };
+        boxed
+    });
+    let status = child(hwnd, &Control::new("STATIC", ""), at(m, m + px(114) + extra, inner, px(40)), body);
     let (bw, bh) = (px(100), px(30));
     let row = ch - m - bh;
     let button = |text, id, style: i32| Control { style: WS_TABSTOP | style as u32, id: id as usize, ..Control::new("BUTTON", text) };
-    let remove = child(hwnd, &button("Remove", IDOK, BS_DEFPUSHBUTTON), at(cw - m - 2 * bw - px(8), row, bw, bh), body);
+    let remove = child(hwnd, &button(form.button, IDOK, BS_DEFPUSHBUTTON), at(cw - m - 2 * bw - px(8), row, bw, bh), body);
     let cancel = child(hwnd, &button("Cancel", IDCANCEL, BS_PUSHBUTTON), at(cw - m - bw, row, bw, bh), body);
     // SAFETY: our own controls and window.
     unsafe {
@@ -192,7 +254,7 @@ pub fn remove_with_code(check: impl FnMut(&str) -> Result<String, String> + 'sta
         SetForegroundWindow(hwnd);
         SetFocus(edit);
     }
-    STATE.with(|s| *s.borrow_mut() = Some(State { edit, status, remove, cancel, check: Box::new(check), accepted: None }));
+    STATE.with(|s| *s.borrow_mut() = Some(State { edit, second, status, remove, cancel, check, accepted: None }));
 
     let mut msg = MSG::default();
     // SAFETY: a standard message loop on the thread that owns the window; Tab, Enter and Esc work as in a dialog.
@@ -208,29 +270,37 @@ pub fn remove_with_code(check: impl FnMut(&str) -> Result<String, String> + 'sta
     Ok(STATE.with(|s| s.borrow_mut().take().and_then(|s| s.accepted)))
 }
 
-/// "Remove" pressed (or Enter): the service checks the code. Its answer shows under the box.
+fn text_of(hwnd: HWND, max: usize) -> String {
+    let mut buf = vec![0u16; max + 1];
+    // SAFETY: our own control; the buffer's length is passed.
+    let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    from_wide(&buf[..n.max(0) as usize])
+}
+
+/// "Remove" or "Pair" pressed (or Enter): the service checks the code. Its answer shows under the boxes.
 fn submit() {
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         let Some(st) = s.as_mut() else { return };
-        let mut buf = [0u16; MAX_TYPED + 1];
-        // SAFETY: our own control; the buffer's length is passed.
-        let n = unsafe { GetWindowTextW(st.edit, buf.as_mut_ptr(), buf.len() as i32) };
-        let typed = from_wide(&buf[..n.max(0) as usize]);
+        let typed = text_of(st.edit, MAX_TYPED);
+        let second = st.second.map(|h| text_of(h, MAX_SECOND)).unwrap_or_default();
         if typed.trim().is_empty() {
-            set_text(st.status, "Type the 8-letter code first.");
+            set_text(st.status, "Type the code first.");
             return;
         }
         set_text(st.status, "Checking…");
         // Painted now: the service may take a few seconds to answer, and nothing paints until it has
         // SAFETY: our own control.
         unsafe { UpdateWindow(st.status) };
-        match (st.check)(&typed) {
+        match (st.check)(&typed, &second) {
             Ok(message) => {
                 set_text(st.status, &message);
                 // SAFETY: our own controls.
                 unsafe {
                     EnableWindow(st.edit, 0);
+                    if let Some(h) = st.second {
+                        EnableWindow(h, 0);
+                    }
                     EnableWindow(st.remove, 0);
                     SetFocus(st.cancel);
                 }

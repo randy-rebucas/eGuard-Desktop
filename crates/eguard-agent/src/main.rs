@@ -3,6 +3,7 @@
 //! ```text
 //! eguard-agent session [--dev]             started by the service in each session: reports what has the focus
 //!                                          and shows the block screen, warnings and overlay (--dev: console mode)
+//! eguard-agent setup                       "Pair eGuard": the window the installer opens (asks for an administrator)
 //! eguard-agent pair [CODE] [--name NAME] [--accounts NAME,NAME]
 //!                                          pair with a code from the parent dashboard (asks for it if left out),
 //!                                          and say which Windows accounts are the child's (asks if left out)
@@ -11,7 +12,7 @@
 //! eguard-agent scan                        look for installed apps now (at most every 2 minutes)
 //! eguard-agent remove [CODE] [--dev]       "Remove with a code": the offline removal code from the parent's
 //!                                          dashboard (a window asks for it if left out; --dev: console mode)
-//! eguard-agent preview [block|overlay|warning]
+//! eguard-agent preview [block|overlay|warning|pair]
 //!                                          show a screen with sample words for a few seconds (development)
 //! ```
 
@@ -306,6 +307,79 @@ fn remove(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// How long `setup` waits for a service that was only just installed and started.
+const SERVICE_WAIT: Duration = Duration::from_secs(30);
+const SETUP_TITLE: &str = "eGuard";
+
+/// `eguard-agent setup`: "Pair eGuard", the window the installer opens when it finishes (spec 4.2), and the Start
+/// menu's "Pair eGuard". Asks for an administrator (UAC) first, since only administrators may pair; then the parent
+/// types the code from the dashboard and says which accounts are the child's. Everything it has to say is in
+/// windows: nobody reads a console here.
+fn setup() -> Result<(), String> {
+    eguard_win::elevate::leave_own_console();
+    let result = setup_in_windows();
+    if let Err(e) = &result {
+        eguard_win::elevate::message(SETUP_TITLE, e, true);
+    }
+    result
+}
+
+fn setup_in_windows() -> Result<(), String> {
+    use eguard_win::elevate;
+    if !elevate::is_elevated() {
+        return match elevate::run_self_elevated("setup") {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(elevate::ERROR_CANCELLED) => {
+                elevate::message(
+                    SETUP_TITLE,
+                    "eGuard is installed but this computer isn't paired yet, so no rules apply.\n\nTo pair it, open \
+                     \"Pair eGuard\" from the Start menu. An administrator's password is needed.",
+                    false,
+                );
+                Ok(())
+            }
+            Err(e) => Err(format!("Couldn't ask Windows for an administrator: {e}")),
+        };
+    }
+    // Just installed: the service may take a few seconds to open its pipe
+    let since = Instant::now();
+    let status = loop {
+        match ask(&Request::Status) {
+            Ok(Response::Status(s)) => break s,
+            Ok(Response::Error { message }) => return Err(message),
+            Ok(_) => return Err("unexpected answer from the service".into()),
+            Err(e) if since.elapsed() >= SERVICE_WAIT => return Err(e),
+            Err(_) => std::thread::sleep(Duration::from_secs(1)),
+        }
+    };
+    if status.paired {
+        let child = status.child_name.as_deref().unwrap_or("your child");
+        elevate::message(SETUP_TITLE, &format!("This computer is already paired: it's {child}'s on eGuard."), false);
+        return Ok(());
+    }
+    let all = list_accounts(None)?;
+    let standard: Vec<&str> = all.iter().filter(|a| !a.admin).map(|a| a.name.as_str()).collect();
+    let paired = eguard_win::codebox::pair_with_code(&standard.join(", "), |code, accounts| {
+        let accounts = names(accounts);
+        // Empty: the service takes every standard account, and says so when there's none
+        let accounts = (!accounts.is_empty()).then_some(accounts);
+        match ask(&Request::Pair { code: code.trim().to_owned(), name: None, accounts })? {
+            Response::Paired { child_name } => Ok(format!("Paired. This computer is now {child_name}'s on eGuard.")),
+            Response::Error { message } => Err(message),
+            _ => Err("unexpected answer from the service".into()),
+        }
+    })
+    .map_err(|e| format!("couldn't open the window: {e}"))?;
+    if paired.is_none() {
+        elevate::message(
+            SETUP_TITLE,
+            "This computer isn't paired yet, so no rules apply.\n\nTo pair it later, open \"Pair eGuard\" from the Start menu.",
+            false,
+        );
+    }
+    Ok(())
+}
+
 /// Crashes on purpose, to check the crash handler's last line in `agent.log` (development builds only).
 fn crash(args: &[String]) -> Result<(), String> {
     if !eguard_core::keys::is_dev_build() {
@@ -325,6 +399,13 @@ fn crash(args: &[String]) -> Result<(), String> {
 
 /// Shows one screen with sample words, to check how it looks.
 fn preview(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("pair") {
+        // "Pair eGuard" as the installer opens it; nothing is sent anywhere
+        let shown = eguard_win::codebox::pair_with_code("mia", |code, accounts| {
+            Err(format!("(preview) this would pair with {code} for: {accounts}"))
+        });
+        return shown.map(|_| ()).map_err(|e| e.to_string());
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let ui = Ui::start(true, tx).map_err(|e| e.to_string())?;
     let screen = |id, title: &str, body: &str, parent, time| Screen {
@@ -381,6 +462,7 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("session") => session(&args[1..]),
         Some("pair") => pair(&args[1..]),
+        Some("setup") => setup(),
         Some("accounts") => accounts(&args[1..]),
         Some("status") | None => status(),
         Some("scan") => scan(),
@@ -388,7 +470,7 @@ fn main() {
         Some("remove") => remove(&args[1..]),
         Some("crash") => crash(&args[1..]),
         Some(_) => Err(
-            "usage: eguard-agent session [--dev] | pair [CODE] [--name NAME] [--accounts NAME,NAME] | accounts [--set NAME,NAME] | status | scan | remove [CODE] [--dev] | preview [block|overlay|warning]"
+            "usage: eguard-agent session [--dev] | setup | pair [CODE] [--name NAME] [--accounts NAME,NAME] | accounts [--set NAME,NAME] | status | scan | remove [CODE] [--dev] | preview [block|overlay|warning|pair]"
                 .into(),
         ),
     };

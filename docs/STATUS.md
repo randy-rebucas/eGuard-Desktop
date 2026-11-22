@@ -1,6 +1,6 @@
 # Status
 
-Updated 2026-11-16: a full audit and its fixes (below). Before it, 2026-10-26: an install audit and its fixes. Before it, 2026-10-24: Phase 7's self-update (Q7), built and waiting for the VM (below). Before it: the owner's decisions
+Updated 2026-11-22: the installer's pairing window, and a readable install failure (below). Before it, 2026-11-16: a full audit and its fixes. Before it, 2026-10-26: an install audit and its fixes. Before it, 2026-10-24: Phase 7's self-update (Q7), built and waiting for the VM (below). Before it: the owner's decisions
 after Phase 6 part 2, Phase 6 part 2 (the installer and what holds eGuard in place), built and waiting for the VM,
 Phase 7's crash handler and logs, Phase 6 part 1 (the removal flow and tamper reporting), Phase 5 (web), Phase 4, the
 owner's decisions, a full audit and its fixes.
@@ -16,6 +16,30 @@ owner's decisions, a full audit and its fixes.
 | 7 | Hardening and release readiness | **Started:** structured, rotated, scrubbed logs, a crash handler, and the **signed self-update (Q7): built**, unit-tested, its download-and-check path run here; the swap and rollback wait for the VM (VM-TESTS.md G). Not built: signing (the certificate), the end-to-end VM run |
 
 Phases and their "Done when" gates are in `~/eguard/docs/desktop-agent-prompt.md`.
+
+## The installer's pairing window (2026-11-22)
+
+The owner double-clicked `eguard.msi` on the VM and got the stock 1722 ("a program run as part of the setup did not
+finish as expected"): `eguard-service install` (the `Lockdown` action) failed, with no cause shown and no log kept.
+**The cause is still unknown**: it's at the end of the VM's `C:\ProgramData\eGuard\logs\service.log` (kept by the
+rollback's `purge`). The MSI has never installed anywhere yet.
+
+The owner's decision: the pairing window asks UAC for an administrator itself (option a below; no security change).
+
+| Piece | What it does |
+|---|---|
+| `eguard-agent setup` | "Pair eGuard": not elevated, it starts itself again through UAC (`elevate::run_self_elevated`; a standard user types an administrator's password; refused: a box says how to pair later). Elevated: waits up to 30 s for the just-started service, says so if already paired, else the window: the code, and the child's accounts (the standard ones to start with; empty = every standard one). Leaves its own console (`leave_own_console`) and says everything in windows |
+| `eguard-win` | `codebox`: one window for "Remove with a code" and "Pair eGuard" (`pair_with_code`, a second box). `elevate`: `is_elevated`, `run_self_elevated`, `leave_own_console`, `message` |
+| `installer/eguard.wxs` | `OpenPairing` (InstallUISequence after `ExecuteAction`, `NOT Installed`, async): only with the package's own UI, so double-clicked yes, `/qn` (`install.ps1`) no. "Pair eGuard" in the all-users Start menu. `MsiLogging` (every run logs to `%TEMP%\MSI*.LOG`). Error 1722's words name the step and where its reason is. `wix msi validate` now needs `-sice ICE38 -sice ICE43 -sice ICE57` (they assume a per-user Start menu) |
+
+**Checked here:** build, clippy, fmt, `cargo test --workspace` (all pass); the MSI builds and validates (with the
+three ICEs suppressed), and its tables have the action, the shortcut, the property and the error; `eguard-agent
+preview pair` shows the window. **Not checked (the VM):** a double-clicked install, as an administrator and as a
+standard user (UAC asks for an administrator's password; the launch condition `Privileged` is expected to hold before
+elevation for a per-machine package), the window opening after it, pairing from it, refusing UAC, the Start menu entry.
+
+**Installing without an administrator isn't possible, by design:** the package creates a SYSTEM service and locks
+Program Files. A standard user can start it; Windows then asks for an administrator's password.
 
 ## Full audit (2026-11-16)
 
@@ -75,7 +99,7 @@ The owner found eGuard hard to install. The MSI builds and ICE-validates; what m
 
 | Finding | What was done |
 |---|---|
-| **No pairing window from the installer.** Spec 4.2: "the installer opens eGuard's window, and the parent types the code". The MSI is silent (no UI, no next step); pairing is `eguard-agent pair CODE` from a prompt opened with Run as administrator | **Not built; the owner decides** (Next session, below) |
+| **No pairing window from the installer.** Spec 4.2: "the installer opens eGuard's window, and the parent types the code". The MSI is silent (no UI, no next step); pairing is `eguard-agent pair CODE` from a prompt opened with Run as administrator | **Built 2026-11-22** ("The installer's pairing window", above) |
 | An MSI made from everyday builds (`target\debug`) needs `VCRUNTIME140.dll`, which a clean Windows lacks: the install step can't start, the package rolls back, eGuard's log is empty | `installer\build.ps1` refuses such exes; CLAUDE.md's command builds from `target\vm\debug` (bundle.ps1's static build) |
 | Smart App Control (on in some fresh Windows 11 installs) blocks unsigned programs: the install step fails | `install.ps1` stops first and says how to turn it off (VM only; signing is the real fix) |
 | `netsh portproxy` does nothing while IP Helper (`iphlpsvc`) is stopped or disabled | `install.ps1` starts it |
@@ -824,11 +848,8 @@ and install a service, so they haven't been run anywhere yet: the first VM sessi
 ## Next session: the owner picks (2026-10-24)
 
 Q7 is built (above). What's left, each a session of its own:
-- **The installer's pairing window** (spec 4.2, the install audit above). The window the installer opens runs as
-  the installing user without elevation, and the admin pipe takes pairing from SYSTEM and administrators only. Ask
-  the owner first: (a) the pairing window asks for elevation itself (UAC prompt; no security change; recommended), or
-  (b) the service takes a pairing from whoever installed (a pipe/security change). Then: a Win32 window in the agent
-  (as "Remove eGuard"), the MSI launching it after install, and a Start menu entry.
+- ~~The installer's pairing window~~: built 2026-11-22 (above), option (a).
+- **The VM's 1722**: read the end of `service.log` there and fix the failing `install` step.
 - **Q8, support removal** (settled in spec 10, not built). Recommended next: it's the last way off a computer that
   doesn't depend on the live server. Ask first where the offline support key's private half lives (the agent builds
   in only the public half; a dev key for tests is generated in the tests).

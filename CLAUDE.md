@@ -74,7 +74,8 @@ powershell -File installer\build.ps1 -Bin target\vm\debug         # build target
 powershell -File installer\release.ps1 -PublicKeys KEY -Signer ORG -ChromeId ID -EdgeId ID -FirefoxUrl URL   # the release MSI, against production
 powershell -File tools\vm\bundle.ps1                              # target\eguard-vm.zip for the VM
 powershell -File tools\vm\bundle.ps1 -Version 0.1.2               # target\eguard-vm-0.1.2.zip: a newer build (VM-TESTS G)
-target\debug\eguard-agent preview block|overlay|warning          # look at a screen with sample words
+target\debug\eguard-agent preview block|overlay|warning|pair     # look at a screen with sample words
+target\debug\eguard-agent setup                                    # "Pair eGuard" (asks UAC; what the installer opens)
 target\debug\eguard-agent pair CODE --accounts corew              # pair; on this PC name corew (an administrator)
 target\debug\eguard-agent accounts [--set NAME,NAME]              # which Windows accounts are the child's
 target\debug\eguard-agent remove [CODE] --dev                     # "Remove with a code" (a window without CODE)
