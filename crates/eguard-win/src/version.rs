@@ -8,6 +8,16 @@ use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVe
 
 /// The resource's `ProductName`, in its first language (or US English). `None` when there is none.
 pub fn product_name(path: &std::path::Path) -> Option<String> {
+    string_value(path, "ProductName")
+}
+
+/// The resource's `OriginalFilename`, lower case: the name the program was built as, which a rename doesn't change.
+pub fn original_filename(path: &std::path::Path) -> Option<String> {
+    string_value(path, "OriginalFilename").map(|s| s.to_lowercase())
+}
+
+/// One string value of the version resource, in its first language (or US English). `None` when there is none.
+fn string_value(path: &std::path::Path, name: &str) -> Option<String> {
     let p = wide(&path.to_string_lossy());
     let mut handle = 0u32;
     // SAFETY: `p` is zero-terminated.
@@ -35,7 +45,7 @@ pub fn product_name(path: &std::path::Path) -> Option<String> {
     }
     langs.extend(["040904b0".to_owned(), "040904e4".to_owned(), "000004b0".to_owned()]);
     langs.iter().find_map(|l| {
-        let (ptr, len) = query(&format!(r"\StringFileInfo\{l}\ProductName"))?;
+        let (ptr, len) = query(&format!(r"\StringFileInfo\{l}\{name}"))?;
         // SAFETY: a string value: `len` UTF-16 units, inside `block`.
         let s = from_wide(unsafe { std::slice::from_raw_parts(ptr.cast::<u16>(), len as usize) });
         let s = s.trim();

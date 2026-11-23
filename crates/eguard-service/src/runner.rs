@@ -153,6 +153,21 @@ pub struct Runner {
     _held: Vec<std::fs::File>,
 }
 
+/// How often removal protection's lockdown is looked at again after start (`lockdown::status`).
+const LOCKDOWN_EVERY: Duration = Duration::from_secs(5 * 60);
+
+/// The Windows accounts: a new one is news, the list goes to /report when it changed, and while they can't be read
+/// removal protection isn't reported as holding.
+fn look_at_accounts(engine: &mut Engine, info: &DeviceInfo) {
+    let now = engine.now_ms(clock::sample());
+    match eguard_win::accounts::read() {
+        Some(list) => {
+            engine.observe_accounts(&list, info, now);
+        }
+        None => engine.accounts_unreadable(info, now),
+    }
+}
+
 fn log_notes(engine: &mut Engine) {
     for n in engine.take_notes() {
         match n {
@@ -163,6 +178,22 @@ fn log_notes(engine: &mut Engine) {
 }
 
 impl Runner {
+    /// Removal protection's lockdown again, when due: an administrator can undo part of it while eGuard runs.
+    fn recheck_lockdown(&self, engine: &mut Engine, info: &DeviceInfo, next: &mut Instant) {
+        if self.mode != Mode::Service || Instant::now() < *next {
+            return;
+        }
+        *next = Instant::now() + LOCKDOWN_EVERY;
+        let locked = crate::lockdown::status();
+        let now = engine.now_ms(clock::sample());
+        if engine.set_uninstall_protection(locked.clone(), info, now) {
+            match &locked {
+                Ok(()) => log::info("removal protection is in place again"),
+                Err(e) => log::warn(e),
+            }
+        }
+    }
+
     pub fn new(opts: Options) -> Result<Arc<Self>, String> {
         let keys = TrustedKeys::builtin().map_err(|e| format!("the built-in signing key is broken: {e}"))?;
         let transport = WinHttp::new(&format!("eGuard-Windows/{APP_VERSION}")).map_err(|e| e.to_string())?;
@@ -318,12 +349,15 @@ impl Runner {
                     self.save(&mut inner);
                 }
             }
+            // The accounts too: until they're read, removal protection is reported as not known to hold
+            look_at_accounts(&mut inner.engine, &self.info);
             log_notes(&mut inner.engine);
             // Before the first sync, so its report already says whether web filtering holds
             self.apply_web(&mut inner);
         }
 
         let mut next_tick = Instant::now();
+        let mut next_lockdown = Instant::now() + LOCKDOWN_EVERY;
         while !self.stop.load(Ordering::SeqCst) {
             let poked = self.poked.swap(false, Ordering::SeqCst);
             let mut inner = self.lock();
@@ -341,8 +375,8 @@ impl Runner {
                 let info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
                 let tick = inner.engine.tick(clock::sample(), &info);
                 // The Windows accounts: a new one is news, and the list goes to /report when it changed
-                let now = inner.engine.now_ms(clock::sample());
-                inner.engine.observe_accounts(&eguard_win::accounts::list(), &info, now);
+                look_at_accounts(&mut inner.engine, &info);
+                self.recheck_lockdown(&mut inner.engine, &info, &mut next_lockdown);
                 log_notes(&mut inner.engine);
                 if self.removal(&mut inner) {
                     break;
@@ -495,7 +529,8 @@ impl Runner {
         }
     }
 
-    /// Forces eGuard's extension in each browser, with the link from the last sync, and tells the engine whether web
+    /// Forces eGuard's extension in each browser, with the link from the last sync (and private windows off while the
+    /// parent's web filtering is on), and tells the engine whether web
     /// filtering holds (what `/report` says). Nothing before pairing. True when that changed (a report is queued, and
     /// sent at the next tick).
     fn apply_web(&self, inner: &mut Inner) -> bool {
@@ -503,7 +538,9 @@ impl Runner {
             return false;
         }
         let now = inner.engine.now_ms(clock::sample());
-        let setup = self.browsers.apply(inner.engine.browser_link(), now);
+        // With the parent's web filtering off, private windows are allowed again (`web::settings_step`); the extension
+        // stays forced and linked, so turning it back on is instant
+        let setup = self.browsers.apply(inner.engine.browser_link(), inner.engine.web_filter(), now);
         let held = eguard_core::web::capability(self.mode == Mode::Service, &setup);
         let info = DeviceInfo { battery: sysinfo::battery(), ..self.info.clone() };
         inner.engine.set_web(held, &info, now)

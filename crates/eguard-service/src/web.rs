@@ -9,7 +9,7 @@ use crate::log;
 use eguard_core::web::{self, Browser, LinkKeeper};
 use eguard_core::wire::BrowserLink;
 use eguard_win::browsers::{self, Place};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 /// How setting up each browser went, by browser: `Ok` once eGuard's policies are in place.
@@ -22,31 +22,54 @@ pub struct Browsers {
     place: Place,
     last: Mutex<Setup>,
     link: Mutex<LinkKeeper>,
+    /// The browsers whose private-window settings were taken out since web filtering was last on (`web::settings_step`).
+    taken_out: Mutex<BTreeSet<Browser>>,
 }
 
 impl Browsers {
     pub fn new(place: Place) -> Self {
-        Self { place, last: Mutex::new(Setup::new()), link: Mutex::new(LinkKeeper::default()) }
+        Self { place, last: Mutex::new(Setup::new()), link: Mutex::new(LinkKeeper::default()), taken_out: Mutex::default() }
     }
 
     /// Forces the extension in each browser this build has an id for, with the link from the last `/sync` (kept for a
-    /// day, `LinkKeeper`; none: taken out). `now_ms`: eGuard's clock.
-    pub fn apply(&self, fresh: Option<&BrowserLink>, now_ms: i64) -> Setup {
+    /// day, `LinkKeeper`; none: taken out), and, while web filtering is on (`filtering`), no private or guest windows
+    /// and no new extensions (those installed when the block goes in stay allowed).
+    /// `now_ms`: eGuard's clock.
+    pub fn apply(&self, fresh: Option<&BrowserLink>, filtering: bool, now_ms: i64) -> Setup {
         let link = self.link.lock().unwrap_or_else(std::sync::PoisonError::into_inner).choose(fresh, now_ms);
         let link = link.as_deref();
+        let mut taken_out = self.taken_out.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut setup = Setup::new();
         for b in Browser::ALL {
             let outcome = match web::extension(b) {
                 None => Err("this build has no extension id for it".to_owned()),
-                Some(ext) => match browsers::apply(&self.place, b, &ext, link) {
-                    Ok(changed) => {
-                        if changed {
-                            log::info(&format!("{}: eGuard's extension policies set in {}", b.name(), self.place.describe()));
-                        }
-                        Ok(())
+                Some(ext) => {
+                    let step = web::settings_step(filtering, taken_out.contains(&b));
+                    let mut kept = None;
+                    // Only when the block on new extensions goes in: the extensions installed by then stay allowed
+                    let installed = || {
+                        let ids = web::kept_extensions(b, &ext, browsers::installed_extensions(b));
+                        kept = Some(ids.len());
+                        ids
+                    };
+                    let applied = browsers::apply(&self.place, b, &ext, link, step, installed);
+                    if let Some(n) = kept {
+                        log::info(&format!("{}: new extensions blocked, keeping the {n} already installed allowed", b.name()));
                     }
-                    Err(e) => Err(e.to_string()),
-                },
+                    applied
+                }
+                .map_err(|e| e.to_string())
+                .map(|changed| {
+                    // Recorded only once it worked, so a failed take-out is tried again
+                    if filtering {
+                        taken_out.remove(&b);
+                    } else {
+                        taken_out.insert(b);
+                    }
+                    if changed {
+                        log::info(&format!("{}: eGuard's extension policies set in {}", b.name(), self.place.describe()));
+                    }
+                }),
             };
             setup.insert(b, outcome);
         }
@@ -100,13 +123,14 @@ pub fn show() {
                 Some(ext) => {
                     let s = browsers::status(&place, b, &ext);
                     println!(
-                        "  {:<8} {} {}  forced: {}  settings: {}  link: {}",
+                        "  {:<8} {} {}  forced: {}  settings: {}  link: {}  new extensions: {}",
                         b.name(),
                         ext.id,
                         ext.url,
                         s.forced,
                         s.settings,
-                        s.link.as_deref().map_or("none".into(), |l| format!("{}…", l.chars().take(12).collect::<String>()))
+                        s.link.as_deref().map_or("none".into(), |l| format!("{}…", l.chars().take(12).collect::<String>())),
+                        s.kept.map_or("allowed".into(), |n| format!("blocked ({n} installed kept)"))
                     );
                 }
             }

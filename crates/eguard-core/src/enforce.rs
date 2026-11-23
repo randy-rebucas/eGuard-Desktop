@@ -20,7 +20,8 @@
 //! **Never ended** (spec section 7): Microsoft-signed programs under `%SystemRoot%`, eGuard itself, accessibility
 //! tools, and a trusted publisher's apps that aren't catalog games (by the program's own signer, or by a trusted
 //! publisher's folder under Program Files), unless the parent's rules say otherwise. Programs that run other code
-//! (`RUNTIME_HOSTS`) are never exempt by their signer. App Approval applies to apps the scan found and to every
+//! (`RUNTIME_HOSTS`) are never exempt by their signer, and neither is a browser web filtering doesn't cover
+//! (`COVERED_BROWSER_EXES`). App Approval applies to apps the scan found and to every
 //! program outside Program Files whose signer the catalog doesn't trust, never to every program, so drivers and
 //! updaters keep working. Anything else is "untracked": never ended, its time counts toward the day but not toward an
 //! app.
@@ -91,7 +92,65 @@ const ACCESSIBILITY: &[(&str, &[&str])] = &[
 /// Programs that run other code: a game written in Java or Python runs as `javaw.exe` or `python.exe`, signed by
 /// whoever built the runtime (Microsoft builds the Java Minecraft ships with). Their signer says nothing about what
 /// they run, so it never exempts them, and neither does a trusted publisher's folder.
-const RUNTIME_HOSTS: &[&str] = &["java.exe", "javaw.exe", "python.exe", "pythonw.exe", "py.exe", "pyw.exe"];
+/// Known by their own file name or, for a renamed copy (`javaw.exe` as `mc.exe`, set as a launcher's Java), by the
+/// version resource's original name. `dotnet` and `node` run any .NET or JavaScript program the same way.
+const RUNTIME_HOSTS: &[&str] = &["java.exe", "javaw.exe", "python.exe", "pythonw.exe", "py.exe", "pyw.exe", "dotnet.exe", "node.exe"];
+
+/// What a program is called when neither its product nor its file gives a name.
+const UNKNOWN_PROGRAM: &str = "Unknown program";
+
+fn is_runtime_host(exe: &ExeFacts) -> bool {
+    RUNTIME_HOSTS.contains(&exe.file_name.as_str())
+        || exe.original_name.as_deref().is_some_and(|o| RUNTIME_HOSTS.contains(&o.trim_end_matches(".mui")))
+}
+
+/// The browsers web filtering covers (Chrome, Edge, Firefox: they read eGuard's policies and run its extension) and
+/// their own components that load the browser's engine, by the version resource's original name. A trusted publisher
+/// signs more browsers than these (Chrome for Testing, Chromium builds, a browser renamed and re-signed by a vendor)
+/// and none of those read eGuard's policies, so the signer exempts a browser only when it's one of these.
+/// `msedgewebview2.exe` is `WebView2`, which runs inside other apps (Teams, Outlook, widgets, many installers): it must
+/// stay exempt or those apps would be held while web filtering is on.
+const COVERED_BROWSER_EXES: &[&str] = &[
+    // Chrome
+    "chrome.exe",
+    "chrome_proxy.exe",
+    "chrome_pwa_launcher.exe",
+    "notification_helper.exe",
+    "elevation_service.exe",
+    "elevated_tracing_service.exe",
+    // Edge
+    "msedge.exe",
+    "msedge_proxy.exe",
+    "msedge_pwa_launcher.exe",
+    "msedgewebview2.exe",
+    "identity_helper.exe",
+    "cookie_exporter.exe",
+    "pwahelper.exe",
+    "ie_to_edge_stub.exe",
+    // Firefox
+    "firefox.exe",
+    "private_browsing.exe",
+    "plugin-container.exe",
+    "crashreporter.exe",
+    "crashhelper.exe",
+    "default-browser-agent.exe",
+    "pingsender.exe",
+    "minidump-analyzer.exe",
+    "updater.exe",
+    "maintenanceservice.exe",
+    "nmhproxy.exe",
+];
+
+/// Whether a trusted publisher's signer (or folder) may exempt `exe`: anything that isn't a browser, and a browser
+/// only when it's one web filtering covers (`COVERED_BROWSER_EXES`). By the original name when the version resource
+/// has one (a rename doesn't change it), else the file name.
+fn trust_may_exempt(exe: &ExeFacts) -> bool {
+    if !exe.browser {
+        return true;
+    }
+    let name = exe.original_name.as_deref().map_or(exe.file_name.as_str(), |o| o.trim_end_matches(".mui"));
+    COVERED_BROWSER_EXES.contains(&name)
+}
 
 /// What the platform knows about a running program.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,16 +295,17 @@ pub fn resolve(p: &Program, inputs: &Inputs) -> Resolved {
         return Resolved::Exempt(Exempt::Accessibility);
     }
 
-    let host = RUNTIME_HOSTS.contains(&p.exe.file_name.as_str());
-    let (own, specific) = own_outcome(p, inputs, host);
-    // A trusted publisher's folder says nothing about what a runtime in it runs
-    let Some(place) = inputs.inventory.place_of(&p.path).filter(|pl| !(host && pl.app.is_none())) else { return own };
+    // A runtime, or a browser web filtering doesn't cover, isn't exempt by a trusted publisher's signer or folder
+    let untrustable = is_runtime_host(&p.exe) || !trust_may_exempt(&p.exe);
+    let (own, specific) = own_outcome(p, inputs, untrustable);
+    // A trusted publisher's folder says nothing about what a runtime in it runs, or whether a browser in it is filtered
+    let Some(place) = inputs.inventory.place_of(&p.path).filter(|pl| !(untrustable && pl.app.is_none())) else { return own };
     let (folder, vouches) = match place.app.as_deref() {
         // Only Program Files is out of the child's reach; a per-user trusted app's folder isn't
         None => (Resolved::Exempt(Exempt::Trusted), p.program_files),
         Some(name) => {
             let vouches = p.program_files || signer_agrees(p, inputs.inventory.apps.get(name));
-            (folder_outcome(p, inputs, place, name, host), vouches)
+            (folder_outcome(p, inputs, place, name, untrustable), vouches)
         }
     };
     if !vouches {
@@ -325,8 +385,8 @@ fn rule_signed_by(rule: &AppRule, p: &Program) -> bool {
     exe_signers(&rule.ids).any(|s| !s.is_empty() && signers_of(p).any(|mine| mine == s))
 }
 
-/// The app `c` is when the catalog's trust doesn't apply (no catalog yet, or a runtime host): its name and ids,
-/// nothing known about its publisher.
+/// The app `c` is when the catalog's trust doesn't apply (no catalog yet, a runtime host, or a browser web filtering
+/// doesn't cover): its name and ids, nothing known about its publisher.
 fn untrusted(c: &Candidate, category: Option<Category>) -> Option<FoundApp> {
     // The server takes names up to its limit; a longer one would get every event it's in refused
     let app = wire::app_name(&c.name)?;
@@ -379,17 +439,21 @@ fn catalog_name_by_signer(classifier: &Classifier, p: &Program) -> Option<String
 
 /// What a program is by its own facts alone: its signer, product and file name, the catalog and the parent's rules.
 /// Also whether that's more than App Approval's catch-all (a rule on the list, or a catalog or launcher game).
-fn own_outcome(p: &Program, inputs: &Inputs, host: bool) -> (Resolved, bool) {
+fn own_outcome(p: &Program, inputs: &Inputs, untrustable: bool) -> (Resolved, bool) {
     let rules = &inputs.rules;
-    let product = p.exe.product.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let mut c = Candidate::new(product.unwrap_or_else(|| file_stem(&p.exe.file_name)), Origin::Uninstall);
+    // A name the server would read as blank (only spaces or U+FEFF, which its trim removes and Rust's doesn't) made
+    // any unsigned program untracked: fall back to the file's name, then to a fixed one, so it's always judged
+    let named = |s: &&str| crate::wire::app_name(s).is_some();
+    let product = p.exe.product.as_deref().map(str::trim).filter(named);
+    let stem = Some(file_stem(&p.exe.file_name)).filter(named);
+    let mut c = Candidate::new(product.or(stem).unwrap_or(UNKNOWN_PROGRAM), Origin::Uninstall);
     c.exe = Some(p.exe.clone());
     let browser = p.exe.browser.then_some(Category::Browsers);
     let (found, trusted) = match &inputs.classifier {
         Some(classifier) => match classifier.classify(&c) {
             Ok(f) => (Some(f), false),
-            Err(Skip::TrustedPublisher(_)) => (untrusted(&c, browser), !host),
-            Err(Skip::BlankName) => (None, false),
+            Err(Skip::TrustedPublisher(_)) => (untrusted(&c, browser), !untrustable),
+            Err(Skip::BlankName) => (untrusted(&c, browser), false),
         },
         // No catalog yet: nothing is trusted, and nothing is known to be a game
         None => (untrusted(&c, browser), false),
@@ -429,7 +493,7 @@ fn own_outcome(p: &Program, inputs: &Inputs, host: bool) -> (Resolved, bool) {
 
 /// What a program is by the app the scan found in its folder (`name`): that app's ids, the launcher it came through,
 /// the parent's rules for it.
-fn folder_outcome(p: &Program, inputs: &Inputs, place: &Place, name: &str, host: bool) -> Resolved {
+fn folder_outcome(p: &Program, inputs: &Inputs, place: &Place, name: &str, untrustable: bool) -> Resolved {
     let listed_as = inputs.inventory.apps.get(name);
     let product = p.exe.product.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let mut c = Candidate::new(name, Origin::Uninstall);
@@ -441,7 +505,7 @@ fn folder_outcome(p: &Program, inputs: &Inputs, place: &Place, name: &str, host:
     let found = match &inputs.classifier {
         Some(classifier) => match classifier.classify(&c) {
             Ok(f) => Some(f),
-            Err(Skip::TrustedPublisher(_)) if host => untrusted(&c, category),
+            Err(Skip::TrustedPublisher(_)) if untrustable => untrusted(&c, category),
             Err(Skip::TrustedPublisher(_)) => return Resolved::Exempt(Exempt::Trusted),
             Err(Skip::BlankName) => None,
         },
@@ -584,11 +648,11 @@ fn block_screen(id: u64, app: &str, block: Block, asked: Option<String>) -> Scre
         Block::Blocked => (format!("{app} is blocked"), "Your parent blocked this app. You can ask them to allow it.".to_owned()),
         Block::Pending => (
             format!("{app} is waiting for your parent"),
-            "Your parent hasn't decided about this app yet. It opens once they allow it.".to_owned(),
+            "Your parent hasn't decided about this app yet. Once they allow it, open it again.".to_owned(),
         ),
         Block::NeedsApproval => (
             format!("{app} needs your parent's OK"),
-            "New apps need your parent's OK first. Ask, and it opens once they allow it.".to_owned(),
+            "New apps need your parent's OK first. Ask, then open it again once they allow it.".to_owned(),
         ),
         Block::Browser => (
             format!("{app} needs your parent's OK"),
@@ -823,7 +887,8 @@ impl Enforcer {
         self.view(session, app.as_ref(), now, &at)
     }
 
-    /// `LIMIT_REACHED` for the day's screen time and each category limit, once per day each (spec section 7).
+    /// `LIMIT_REACHED` for the day's screen time, each category limit and each app's own limit, once per day each
+    /// (spec section 7).
     fn limits_reached(&mut self, now: i64, at: &LocalMoment) {
         let rules = &self.inputs.rules;
         if rules.extra_time_running(now) {
@@ -834,14 +899,25 @@ impl Enforcer {
         if let Some(m) = rules.policy.daily_limit(at)
             && today.total_secs() >= m * 60
         {
-            reached.push((format!("{}|day", at.date), DeviceEvent::LimitReached { minutes: m, category: None }));
+            reached.push((format!("{}|day", at.date), DeviceEvent::LimitReached { minutes: m, category: None, app: None }));
         }
         for limit in &rules.category_limits {
             let c = limit.category.effective();
             if today.category_secs(c, |n, r| rules.category_of(n, r)) >= limit.daily_limit_minutes * 60 {
                 reached.push((
                     format!("{}|{}", at.date, category_key(c)),
-                    DeviceEvent::LimitReached { minutes: limit.daily_limit_minutes, category: Some(c) },
+                    DeviceEvent::LimitReached { minutes: limit.daily_limit_minutes, category: Some(c), app: None },
+                ));
+            }
+        }
+        // An app's own limit: the parent gets "<app> time used up", as from phones
+        for rule in &rules.apps {
+            if let Some(m) = rule.daily_limit_minutes
+                && today.app_secs(&rule.name) >= m * 60
+            {
+                reached.push((
+                    format!("{}|app:{}", at.date, rule.name),
+                    DeviceEvent::LimitReached { minutes: m, category: None, app: Some(rule.name.clone()) },
                 ));
             }
         }
@@ -938,7 +1014,7 @@ impl Enforcer {
                         source: known.and_then(|k| k.source),
                         category: known.and_then(|k| k.category),
                     },
-                    format!("Asked. {} opens once your parent allows it.", n.app),
+                    format!("Asked. Open {} again once your parent allows it.", n.app),
                 )
             }
             Ask::Time { notice: Some(notice) } => {
@@ -1033,6 +1109,7 @@ mod tests {
             signer: signer.map(str::to_owned),
             signer_alt: None,
             product: product.map(str::to_owned),
+            original_name: None,
             graphics: false,
             browser: false,
         }
@@ -1320,6 +1397,28 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_runtime_is_still_a_runtime() {
+        // javaw.exe copied as mc.exe and set as the launcher's Java: its signer would exempt it by name alone
+        let i = inputs(rules_with(vec![]));
+        let mut renamed = program(
+            r"C:\Users\Mia\AppData\Roaming\.minecraft\runtime\bin\mc.exe",
+            Some("microsoft corporation"),
+            Some("OpenJDK Platform binary"),
+        );
+        assert_eq!(resolve(&renamed, &i), Resolved::Exempt(Exempt::Trusted));
+        renamed.exe.original_name = Some("javaw.exe".into());
+        assert!(is_unlisted_app(&resolve(&renamed, &i)));
+    }
+
+    #[test]
+    fn a_program_with_a_blank_looking_name_is_still_judged() {
+        // U+FEFF survives Rust's trim but not the server's: the name was blank and the program untracked
+        let i = inputs(rules_with(vec![]));
+        let p = program("C:\\Users\\Mia\\Downloads\\\u{feff}.exe", None, Some("\u{feff}"));
+        assert!(is_unlisted_app(&resolve(&p, &i)));
+    }
+
+    #[test]
     fn accessibility_tools_need_the_whole_signer() {
         let i = inputs(rules_with(vec![]));
         for signer in ["nv access", "nv access limited fan club"] {
@@ -1397,7 +1496,7 @@ mod tests {
 
         assert_eq!(
             e.ask(1, Ask::Parent { notice: screen.id }, at(8)).unwrap(),
-            "Asked. Counter-Strike 2 opens once your parent allows it."
+            "Asked. Open Counter-Strike 2 again once your parent allows it."
         );
         assert_eq!(e.ask(1, Ask::Parent { notice: screen.id }, at(9)).unwrap(), "You already asked. Your parent has been told.");
         assert_eq!(
@@ -1471,9 +1570,67 @@ mod tests {
         assert!(s.ask_parent && !s.ask_time && s.body.contains("Chrome, Edge and Firefox"));
     }
 
+    #[test]
+    fn a_trusted_signer_exempts_only_the_browsers_web_filtering_covers() {
+        let browser = |path: &str, signer: &str, original: &str| {
+            let mut p = program(path, Some(signer), Some("Google Chrome"));
+            p.exe.browser = true;
+            p.exe.original_name = Some(original.into());
+            p
+        };
+        let mut r = rules_with(vec![]);
+        r.policy.web_filter = true;
+        let mut e = enforcer(r);
+        // Chrome and its components, and WebView2 (inside other apps), by their signer or their folder
+        let chrome = browser(r"C:\Program Files\Google\Chrome\Application\chrome.exe", "google llc", "chrome.exe");
+        let proxy = browser(r"C:\Program Files\Google\Chrome\Application\chrome_proxy.exe", "google llc", "chrome_proxy.exe");
+        let webview = browser(
+            r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\131.0\msedgewebview2.exe",
+            "microsoft corporation",
+            "msedgewebview2.exe",
+        );
+        for p in [&chrome, &proxy, &webview] {
+            assert_eq!(e.resolve(p), Resolved::Exempt(Exempt::Trusted), "{}", p.path);
+        }
+        // A renamed copy of Chrome is still Chrome, by its original name
+        let mut renamed = chrome.clone();
+        renamed.path = r"C:\Users\Mia\Desktop\notchrome.exe".into();
+        renamed.exe.file_name = "notchrome.exe".into();
+        assert_eq!(e.resolve(&renamed), Resolved::Exempt(Exempt::Trusted));
+        // Chrome for Testing is Google-signed but doesn't read eGuard's policies: held like any other browser, from
+        // the child's folder or from inside a trusted publisher's folder
+        let cft = browser(r"C:\Users\Mia\Downloads\chrome-win64\chrome_for_testing.exe", "google llc", "chrome_for_testing.exe");
+        let block = Decision::End { app: "Google Chrome".into(), block: Block::Browser };
+        assert_eq!(e.check(&cft, at(0)), block);
+        let in_folder = browser(r"C:\Program Files\Google\Chrome\Application\cft.exe", "google llc", "chrome_for_testing.exe");
+        assert_eq!(e.check(&in_folder, at(0)), block);
+        // Without an original name, the file name decides
+        let mut bare = cft.clone();
+        bare.exe.original_name = None;
+        assert_eq!(e.check(&bare, at(0)), block);
+        bare.exe.file_name = "chrome.exe".into();
+        assert_eq!(e.resolve(&bare), Resolved::Exempt(Exempt::Trusted));
+        // A trusted publisher's program that isn't a browser is exempt whatever it's called
+        let mut tool = cft.clone();
+        tool.exe.browser = false;
+        assert_eq!(e.resolve(&tool), Resolved::Exempt(Exempt::Trusted));
+    }
+
     /// Plays `app` in the foreground with input, one heartbeat a second, for `secs` seconds from `from`.
     fn play(e: &mut Enforcer, p: &Program, from: u64, secs: u64) -> Vec<SessionView> {
         (from..=from + secs).map(|t| e.heartbeat(1, Seen::Program(p), 1_000, at(t))).collect()
+    }
+
+    #[test]
+    fn an_apps_own_limit_alerts_once_naming_the_app() {
+        // The server's "<app> time used up" alert needs `app`; phones send it, computers didn't
+        let mut e = enforcer(rules_with(vec![rule("Roblox", Approval::Allowed, Some(2), Category::Games, &[])]));
+        let roblox =
+            program(r"C:\Users\Mia\AppData\Local\Roblox\Versions\v1\RobloxPlayerBeta.exe", Some("roblox corporation"), Some("Roblox"));
+        play(&mut e, &roblox, 0, 2 * 60 + 1);
+        assert!(e.take_events().contains(&DeviceEvent::LimitReached { minutes: 2, category: None, app: Some("Roblox".into()) }));
+        play(&mut e, &roblox, 2 * 60 + 2, 3);
+        assert!(!e.take_events().iter().any(|ev| matches!(ev, DeviceEvent::LimitReached { .. })));
     }
 
     #[test]
@@ -1491,7 +1648,7 @@ mod tests {
             e.check(&roblox, at(6 * 60 + 1)),
             Decision::End { app: "Roblox".into(), block: Block::CategoryLimit { category: Category::Games, minutes: 6 } }
         );
-        assert_eq!(e.take_events(), vec![DeviceEvent::LimitReached { minutes: 6, category: Some(Category::Games) }]);
+        assert_eq!(e.take_events(), vec![DeviceEvent::LimitReached { minutes: 6, category: Some(Category::Games), app: None }]);
         // Once a day
         play(&mut e, &roblox, 6 * 60 + 2, 5);
         assert_eq!(e.take_events(), Vec::<DeviceEvent>::new());
@@ -1581,7 +1738,7 @@ mod tests {
         assert!(e.heartbeat(1, Seen::Nothing, 0, at(66)).overlay.unwrap().asked.is_some());
         let events = e.take_events();
         assert!(events.contains(&DeviceEvent::TimeRequested { app: None, reason: Some(TimeRequestReason::DailyLimit) }));
-        assert!(events.contains(&DeviceEvent::LimitReached { minutes: 1, category: None }));
+        assert!(events.contains(&DeviceEvent::LimitReached { minutes: 1, category: None, app: None }));
     }
 
     #[test]

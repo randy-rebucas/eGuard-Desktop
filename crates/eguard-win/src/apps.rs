@@ -194,6 +194,7 @@ pub fn exe_facts(path: &Path) -> ExeFacts {
         signer: signer.as_ref().and_then(|s| s.name().map(str::to_owned)),
         signer_alt: signer.as_ref().and_then(|s| s.alternative().map(str::to_owned)),
         product: if is_exe(path) { version::product_name(path) } else { None },
+        original_name: if is_exe(path) { version::original_filename(path) } else { None },
         graphics: imports.iter().any(|d| pe::is_graphics_import(d)),
         browser: imports.iter().any(|d| pe::is_browser_import(d)),
     }
@@ -219,6 +220,7 @@ pub fn exe_facts_of(file: &std::fs::File, path: &Path) -> ExeFacts {
         signer: signer.as_ref().and_then(|s| s.name().map(str::to_owned)),
         signer_alt: signer.as_ref().and_then(|s| s.alternative().map(str::to_owned)),
         product: if is_exe(path) { version::product_name(path) } else { None },
+        original_name: if is_exe(path) { version::original_filename(path) } else { None },
         graphics: imports.iter().any(|d| pe::is_graphics_import(d)),
         browser: imports.iter().any(|d| pe::is_browser_import(d)),
     }
@@ -731,7 +733,7 @@ fn read_small_text(path: &Path) -> Option<String> {
 }
 
 /// `X:\...` with no `..`: not a share (`\\host\...`), a device or `\\?\` path, or a relative one.
-fn plain_local(p: &Path) -> bool {
+pub(crate) fn plain_local(p: &Path) -> bool {
     let s = p.to_string_lossy();
     let b = s.as_bytes();
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' && !s.split(['\\', '/']).any(|part| part == "..")

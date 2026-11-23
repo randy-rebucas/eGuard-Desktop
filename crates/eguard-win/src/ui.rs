@@ -35,13 +35,14 @@ use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadI
 use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow, GetMessageW,
-    GetSystemMetrics, GetWindowThreadProcessId, HMENU, HWND_TOPMOST, IDC_ARROW, IsDialogMessageW, IsWindowVisible, KillTimer, LoadCursorW,
-    MSG, MoveWindow, PostMessageW, RegisterClassExW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_SHUTTINGDOWN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SendMessageW, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_ENDSESSION, WM_PAINT, WM_QUERYENDSESSION, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
+    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, GWL_EXSTYLE, GetForegroundWindow,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowThreadProcessId, HMENU, HWND_TOPMOST, IDC_ARROW, IsDialogMessageW,
+    IsWindowVisible, KillTimer, LoadCursorW, MSG, MoveWindow, PostMessageW, RegisterClassExW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+    SM_CYVIRTUALSCREEN, SM_SHUTTINGDOWN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_ENDSESSION,
+    WM_PAINT, WM_QUERYENDSESSION, WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP, WS_TABSTOP,
 };
 
 /// Something else had the focus over the overlay for this long: lock the session.
@@ -333,6 +334,20 @@ fn keep_on_top(hwnd: HWND) {
     unsafe { SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
 }
 
+/// Any process in the session may restyle our windows: layered with zero alpha and click-through, the overlay would
+/// keep the focus (so the lock backstop never fires) while the screen under it shows and takes clicks. Put it back.
+fn restore_style(hwnd: HWND) {
+    const FORBIDDEN: u32 = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+    // SAFETY: our own window; reading and writing its extended style.
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if ex & FORBIDDEN != 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (ex & !FORBIDDEN) as isize);
+            SetWindowPos(hwnd, null_mut(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+    }
+}
+
 fn work_area() -> RECT {
     let mut r = RECT::default();
     // SAFETY: `r` is a live RECT, which SPI_GETWORKAREA fills.
@@ -602,6 +617,7 @@ fn keep() {
         // Someone hid it: show it again
         show(hwnd, true, true);
     }
+    restore_style(hwnd);
     keep_on_top(hwnd);
     let now = Instant::now();
     // An app's button handed the focus to that app: don't take it back (nor count it toward the lock) for a moment.

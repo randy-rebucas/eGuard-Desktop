@@ -1,7 +1,7 @@
 //! What `/report` says this computer applies (spec section 11; capabilities in `~/eguard/src/lib/protections.ts`).
 //!
-//! The server counts a reported config that matches the parent's as applied, even with an `error` beside it
-//! (`evaluate` in `src/lib/health.ts`). So a protection this build doesn't enforce yet is left out of the report
+//! The server counts a reported config that matches the parent's as applied unless an `error` is beside it while the
+//! protection is on (`evaluate` in `src/lib/health.ts`). A protection this build doesn't enforce yet is left out of the report
 //! rather than echoed back: a full report that leaves one out makes the server show "eGuard isn't applying it",
 //! which is the truth. Echoing the policy would tell the parent it's on when it isn't.
 //!
@@ -11,6 +11,7 @@
 //!   with the reason.
 //! - UNSUPPORTED (`APP_RESTRICTIONS`, `CONTENT`, `LOCATION`, `NOTIFICATIONS`): never reported.
 
+use crate::localtime::FamilyZone;
 use crate::wire::{ProtectionConfig, ProtectionKey, ReportRequest, ReportedProtection, SyncResponse, WebMode};
 use std::collections::BTreeSet;
 
@@ -29,6 +30,9 @@ pub struct Capabilities {
     pub web: Result<(), String>,
 }
 
+const ZONE_UNKNOWN: &str =
+    "eGuard on this computer doesn't know your family's time zone, so it counts days and bedtime in UTC. An update to eGuard will fix it.";
+
 /// The config in force for `key`: the newest request the agent accepted, else the policy.
 fn in_force(sync: &SyncResponse, key: ProtectionKey) -> Option<&ProtectionConfig> {
     sync.requests
@@ -42,9 +46,13 @@ fn in_force(sync: &SyncResponse, key: ProtectionKey) -> Option<&ProtectionConfig
 /// The protections to report, for the last good `/sync`.
 pub fn protections(sync: &SyncResponse, caps: &Capabilities) -> Vec<ReportedProtection> {
     let mut out = Vec::new();
+    // A zone this build lacks falls back to UTC (`State::zone`): days and bedtime are then off by the zone's offset,
+    // so the parent is told rather than shown them as applied
+    let zone_unknown = FamilyZone::new(&sync.timezone).is_err();
     for key in AVAILABLE {
         if let (true, Some(config)) = (caps.enforced.contains(&key), in_force(sync, key)) {
-            out.push(ReportedProtection::new(config, None));
+            let timed = matches!(key, ProtectionKey::ScreenTime | ProtectionKey::Bedtime);
+            out.push(ReportedProtection::new(config, (zone_unknown && timed).then_some(ZONE_UNKNOWN)));
         }
     }
     match &caps.uninstall_protection {
@@ -123,6 +131,18 @@ mod tests {
                 { "key": "WEB", "config": { "mode": "OFF", "blockedSites": 0 }, "error": "no extension" },
             ])
         );
+    }
+
+    #[test]
+    fn an_unknown_family_zone_reports_screen_time_and_bedtime_with_an_error() {
+        let caps = Capabilities { enforced: AVAILABLE.into_iter().collect(), uninstall_protection: Ok(()), web: Ok(()) };
+        let mut s = sync();
+        s.timezone = "Mars/Olympus_Mons".into();
+        let p = protections(&s, &caps);
+        assert_eq!(p[0].key, ProtectionKey::ScreenTime);
+        assert_eq!(p[0].error.as_deref(), Some(ZONE_UNKNOWN));
+        // Not time-based: unaffected
+        assert!(p[1].error.is_none());
     }
 
     #[test]

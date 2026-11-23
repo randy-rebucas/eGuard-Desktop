@@ -126,9 +126,12 @@ pub enum Removal {
 /// What the parent reads on the device page while one of the child's accounts is an administrator. The server
 /// keeps `REPORT_ERROR_MAX` characters: the advice always fits whole, and the names give way (the first, cut if it
 /// must be, and how many more).
+/// Removal protection before the computer's accounts could be read: it can't be known to hold yet.
+const UNCHECKED_ACCOUNTS: &str = "eGuard couldn't check this computer's accounts yet.";
+
 fn admin_reason(names: &[String]) -> String {
-    const ADVICE: &str = " on this computer, and an administrator can remove eGuard. Make the account a standard one: Settings › Accounts › Other users › \
-         Change account type.";
+    const ADVICE: &str = " on this computer, so it can remove eGuard. Make it standard from another admin account: Settings › Accounts › \
+         Other users (or Family) › Change account type.";
     let units = |s: &str| s.encode_utf16().count();
     let room = crate::wire::REPORT_ERROR_MAX - units(ADVICE);
     let mut who = match names {
@@ -195,8 +198,9 @@ pub struct Engine {
     synced: bool,
     /// Something changed (an Uninstall key, a launcher's folder): scan again soon.
     scan_requested: bool,
-    /// The child's accounts that are administrators, as last looked at (`observe_accounts`).
-    child_admins: Vec<String>,
+    /// The child's accounts that are administrators, as last looked at (`observe_accounts`); `None` until the accounts
+    /// were read once, so a report made before that (at start, or while Windows won't list them) can't say "on".
+    child_admins: Option<Vec<String>>,
     notes: Vec<Note>,
     jitter: fn() -> f64,
 }
@@ -257,7 +261,7 @@ impl Engine {
             update_min_seen: None,
             synced: false,
             scan_requested: false,
-            child_admins: Vec::new(),
+            child_admins: None,
             notes,
             jitter: random_unit,
         }
@@ -513,10 +517,25 @@ impl Engine {
     /// one of the child's accounts is an administrator (spec principle 2), and the parent is told why.
     fn caps_now(&self) -> Capabilities {
         let mut caps = self.caps.clone();
-        if !self.child_admins.is_empty() {
-            caps.uninstall_protection = Err(admin_reason(&self.child_admins));
+        match self.child_admins.as_deref() {
+            None if caps.uninstall_protection.is_ok() => {
+                caps.uninstall_protection = Err(UNCHECKED_ACCOUNTS.to_owned());
+            }
+            Some(admins) if !admins.is_empty() => caps.uninstall_protection = Err(admin_reason(admins)),
+            _ => {}
         }
         caps
+    }
+
+    /// Whether removal protection's lockdown still holds (`Capabilities::uninstall_protection`, looked at again every
+    /// few minutes by the platform). A change queues a report. True when it changed.
+    pub fn set_uninstall_protection(&mut self, locked: Result<(), String>, info: &DeviceInfo, now_ms: i64) -> bool {
+        if self.caps.uninstall_protection == locked {
+            return false;
+        }
+        self.caps.uninstall_protection = locked;
+        self.report_if_changed(false, info, now_ms);
+        true
     }
 
     /// Whether web filtering holds now (`Capabilities::web`; the platform sets up the browsers after each tick). A
@@ -534,6 +553,12 @@ impl Engine {
     /// a removal waits, and from a server that doesn't send it.
     pub fn browser_link(&self) -> Option<&BrowserLink> {
         self.data.agent.as_ref()?.last_sync.as_ref()?.browser_link.as_ref()
+    }
+
+    /// Whether the parent's web filtering is on (any mode but off, `Policy::web_filter`), from the last good `/sync`.
+    /// Before one it counts as on: private windows stay off until the parent's choice is known.
+    pub fn web_filter(&self) -> bool {
+        self.data.agent.as_ref().and_then(|a| a.last_sync.as_ref()).is_none_or(|s| crate::rules::Policy::from_entries(&s.policy).web_filter)
     }
 
     /// `GET /catalog?since=` the kept version. A catalog that doesn't verify is ignored and the kept one stays.
@@ -723,6 +748,14 @@ impl Engine {
         }
     }
 
+    /// Windows wouldn't list the accounts this time: removal protection is no longer known to hold, so it's reported
+    /// off with why until they can be read again (rather than on, from the last look).
+    pub fn accounts_unreadable(&mut self, info: &DeviceInfo, now_ms: i64) {
+        if self.enforces() && self.child_admins.take().is_some() {
+            self.report_if_changed(false, info, now_ms);
+        }
+    }
+
     /// The computer's Windows accounts, looked at again (at start and every few minutes). An account not seen
     /// before is news once (`TAMPER` `NEW_ACCOUNT`) and isn't enforced; the list goes to `/report` when it changed.
     /// Returns true when `data` changed.
@@ -744,8 +777,8 @@ impl Engine {
             self.data.admin_alert_ms = Some(now_ms);
             changed = true;
         }
-        if admins != self.child_admins {
-            self.child_admins = admins;
+        if self.child_admins.as_ref() != Some(&admins) {
+            self.child_admins = Some(admins);
             self.report_if_changed(false, info, now_ms);
             changed = true;
         }
@@ -1203,6 +1236,8 @@ mod tests {
         assert!(!e.may_be_removed());
         // Before any sync, new apps wait for the parent
         assert!(e.data.agent.as_ref().unwrap().rules().policy.approval_required);
+        // and private windows stay off until the parent's web filtering is known
+        assert!(e.web_filter());
         assert!(!report::AVAILABLE.contains(&ProtectionKey::Web));
     }
 
@@ -1366,6 +1401,30 @@ mod tests {
     }
 
     #[test]
+    fn removal_protection_isnt_on_until_the_accounts_were_read() {
+        let t = Scripted::new(vec![json(201, &fixture("pair-response.json"))]);
+        let api = Api::new(ServerUrl::parse("http://localhost:3000", true).unwrap(), Box::new(t.clone()));
+        let locked = Capabilities { uninstall_protection: Ok(()), ..caps() };
+        let mut e = Engine::new(Persisted::default(), None, api, TrustedKeys::builtin().unwrap(), locked).fixed_jitter();
+        let p = e.pair("7jx8-7r2f", &info()).unwrap();
+        e.adopt(p, Some(AccountChoice::standard(&win_accounts())));
+        assert_eq!(e.caps_now().uninstall_protection, Err(UNCHECKED_ACCOUNTS.to_owned()));
+        // Windows wouldn't list them: still not known
+        e.observe_accounts(&[], &info(), 0);
+        assert!(e.caps_now().uninstall_protection.is_err());
+        e.observe_accounts(&win_accounts(), &info(), 1);
+        assert_eq!(e.caps_now().uninstall_protection, Ok(()));
+        // Later they can't be read again: not "on" from the last look
+        e.accounts_unreadable(&info(), 2);
+        assert_eq!(e.caps_now().uninstall_protection, Err(UNCHECKED_ACCOUNTS.to_owned()));
+        e.observe_accounts(&win_accounts(), &info(), 3);
+        // An administrator undid part of the lockdown since start
+        assert!(e.set_uninstall_protection(Err("the guard".into()), &info(), 4));
+        assert!(!e.set_uninstall_protection(Err("the guard".into()), &info(), 5));
+        assert_eq!(e.caps_now().uninstall_protection, Err("the guard".to_owned()));
+    }
+
+    #[test]
     fn a_childs_administrator_account_is_news_daily_and_turns_removal_protection_off() {
         let t = Scripted::new(vec![json(201, &fixture("pair-response.json"))]);
         let mut e = engine(&t);
@@ -1414,11 +1473,11 @@ mod tests {
 
     #[test]
     fn the_administrator_advice_always_fits_whole() {
-        let advice = "Settings › Accounts › Other users › Change account type.";
+        let advice = "Settings › Accounts › Other users (or Family) › Change account type.";
         assert_eq!(
             admin_reason(&["Mia".into()]),
             format!(
-                "Mia is an administrator on this computer, and an administrator can remove eGuard. Make the account a standard one: {advice}"
+                "Mia is an administrator on this computer, so it can remove eGuard. Make it standard from another admin account: {advice}"
             )
         );
         let long: Vec<String> = (0..4).map(|i| format!("{i}{}", "x".repeat(63))).collect();

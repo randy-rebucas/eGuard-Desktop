@@ -10,10 +10,17 @@
 //! Besides forcing the extension, each browser's private windows (and Chrome's and Edge's Guest mode, where
 //! extensions don't run) must not be a way around it: Chrome and Edge have no policy that lets an extension into
 //! Incognito/InPrivate, so those are turned off; Firefox's lets eGuard's extension run in private windows, and its
-//! Troubleshoot Mode (which starts without extensions) is turned off.
+//! Troubleshoot Mode (which starts without extensions) is turned off. Only while web filtering is on
+//! (`settings_step`): with it off they get around nothing, so they're left to the browser.
+//!
+//! Another extension (a proxy, a VPN, a page viewer) gets around eGuard's too: an extension's own requests are out of
+//! every other extension's reach. So, at the same times, new extensions are blocked in all three browsers, while
+//! those already installed when the block goes in stay allowed (`ExtensionBlock`), so the family's password manager
+//! keeps working. A parent who wants another one turns web filtering off for a moment: the block comes out, and the
+//! next time it goes in it keeps whatever is installed by then.
 
 use crate::wire::BrowserLink;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The extension's id on Firefox (`browser_specific_settings.gecko.id` in its manifest).
 pub const FIREFOX_ID: &str = "browser-extension@eguard.family";
@@ -25,7 +32,8 @@ pub const EDGE_UPDATE_URL: &str = "https://edge.microsoft.com/extensionwebstoreb
 pub const LINK_VALUE: &str = "deviceLink";
 /// The managed-policy value that tells the extension private windows are off by policy (Chrome and Edge, where eGuard
 /// turns `Incognito` and `InPrivate` off), so it doesn't ask for "Allow in Incognito", which can't matter there. Only an
-/// administrator or SYSTEM can write managed policy, so the extension can trust it.
+/// administrator or SYSTEM can write managed policy, so the extension can trust it. Present exactly while eGuard's
+/// settings are (`SettingsStep`).
 pub const PRIVATE_WINDOWS_VALUE: &str = "privateWindows";
 /// `PRIVATE_WINDOWS_VALUE`'s value.
 pub const PRIVATE_WINDOWS_OFF: &str = "off";
@@ -64,9 +72,42 @@ impl Browser {
         match self {
             // 1: Incognito mode disabled. 0: Guest mode off
             Browser::Chrome => &[("IncognitoModeAvailability", 1), ("BrowserGuestModeEnabled", 0)],
-            Browser::Edge => &[("InPrivateModeAvailability", 1), ("BrowserGuestModeEnabled", 0)],
+            // IE mode: tabs reloaded in Internet Explorer mode run no extensions (0: no IE integration, reloading off)
+            Browser::Edge => &[
+                ("InPrivateModeAvailability", 1),
+                ("BrowserGuestModeEnabled", 0),
+                ("InternetExplorerIntegrationLevel", 0),
+                ("InternetExplorerIntegrationReloadInIEModeAllowed", 0),
+            ],
             Browser::Firefox => &[("DisableSafeMode", 1)],
         }
+    }
+}
+
+/// What to do this time with a browser's `Browser::settings` (and, in Chrome and Edge, the extension's
+/// `PRIVATE_WINDOWS_VALUE`, which says they're in force).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsStep {
+    /// Make them eGuard's values.
+    Put,
+    /// Take out the ones that still have eGuard's values, as removal does.
+    TakeOut,
+    /// Leave them as they are.
+    Leave,
+}
+
+/// `SettingsStep` from whether web filtering is on (`Policy::web_filter`: any mode but off) and whether eGuard's
+/// settings were taken out already since this browser's last `Put` (or since the service started).
+///
+/// With web filtering off nothing is filtered, so a private or guest window (or an IE-mode tab, or Firefox's
+/// Troubleshoot Mode) gets around nothing: those settings come out, while the extension stays forced and linked so
+/// turning filtering back on takes effect at once. They come out once rather than every minute: a school's policy
+/// with the same value can't be told from eGuard's, and mustn't be deleted again each time it's put back.
+pub fn settings_step(filtering: bool, taken_out: bool) -> SettingsStep {
+    match (filtering, taken_out) {
+        (true, _) => SettingsStep::Put,
+        (false, false) => SettingsStep::TakeOut,
+        (false, true) => SettingsStep::Leave,
     }
 }
 
@@ -183,20 +224,28 @@ fn entry_id(value: &str) -> String {
 /// dropped.
 pub fn forcelist(existing: &BTreeMap<String, String>, ext: &Extension, want: bool) -> BTreeMap<String, String> {
     let id = ext.id.to_ascii_lowercase();
-    let entry = format!("{};{}", ext.id, ext.url);
+    let entries = if want { vec![format!("{};{}", ext.id, ext.url)] } else { Vec::new() };
+    numbered_list(existing, |e| e == id, &entries)
+}
+
+/// A Chromium list policy (value name → value) with eGuard's entries made `want`, the way `forcelist` describes: an
+/// entry whose id (`entry_id`) `is_ours` is eGuard's, and stays at its number when `want` still has its id (as
+/// `want` has it), or goes; every other entry stays; the rest of `want` goes after, in order; no number is missing.
+fn numbered_list(existing: &BTreeMap<String, String>, is_ours: impl Fn(&str) -> bool, want: &[String]) -> BTreeMap<String, String> {
     let mut numbered: Vec<(u32, &String)> =
         existing.iter().filter_map(|(k, v)| Some((k.parse::<u32>().ok().filter(|n| *n > 0)?, v))).collect();
     numbered.sort_by_key(|(n, _)| *n);
     let mut out: BTreeMap<String, String> =
         existing.iter().filter(|(k, _)| k.parse::<u32>().ok().is_none_or(|n| n == 0)).map(|(k, v)| (k.clone(), v.clone())).collect();
 
-    let mut ours_kept = false;
+    let mut placed = vec![false; want.len()];
     let mut list: Vec<(u32, String)> = Vec::new();
     for (n, v) in numbered {
-        if entry_id(v) == id {
-            if want && !ours_kept {
-                list.push((n, entry.clone()));
-                ours_kept = true;
+        let id = entry_id(v);
+        if is_ours(&id) {
+            if let Some(i) = (0..want.len()).find(|i| !placed[*i] && entry_id(&want[*i]) == id) {
+                list.push((n, want[i].clone()));
+                placed[i] = true;
             }
         } else {
             list.push((n, v.clone()));
@@ -206,11 +255,130 @@ pub fn forcelist(existing: &BTreeMap<String, String>, ext: &Extension, want: boo
     if !contiguous {
         list = list.into_iter().enumerate().map(|(i, (_, v))| ((i + 1) as u32, v)).collect();
     }
-    if want && !ours_kept {
-        list.push(((list.len() + 1) as u32, entry));
+    for (i, w) in want.iter().enumerate() {
+        if !placed[i] {
+            list.push(((list.len() + 1) as u32, w.clone()));
+        }
     }
     out.extend(list.into_iter().map(|(n, v)| (n.to_string(), v)));
     out
+}
+
+/// The entry in `ExtensionInstallBlocklist` (Chromium) and the key in `ExtensionSettings` (Firefox) that stands for
+/// every extension.
+pub const EVERY_EXTENSION: &str = "*";
+/// Most installed extensions kept allowed in one browser while new ones are blocked: a profile the child can write
+/// to mustn't make eGuard write a policy without end.
+pub const MAX_KEPT_EXTENSIONS: usize = 200;
+
+/// An id a browser's extensions can have: Chrome's and Edge's 32 letters, or a Firefox add-on id (`name@domain` or
+/// `{guid}`; anything printable of a sane length, since it's only ever a JSON key).
+pub fn is_extension_id(b: Browser, id: &str) -> bool {
+    match b {
+        Browser::Chrome | Browser::Edge => is_chromium_id(id),
+        Browser::Firefox => (1..=128).contains(&id.len()) && !id.chars().any(|c| c.is_control() || c.is_whitespace()),
+    }
+}
+
+/// The extensions to keep allowed in `b` while new ones are blocked, from the ids found installed on the computer:
+/// well formed, each once, eGuard's own left out (it's allowed anyway), at most `MAX_KEPT_EXTENSIONS`, sorted.
+pub fn kept_extensions(b: Browser, ext: &Extension, found: impl IntoIterator<Item = String>) -> Vec<String> {
+    let set: BTreeSet<String> = found.into_iter().filter(|id| is_extension_id(b, id) && !id.eq_ignore_ascii_case(ext.id)).collect();
+    set.into_iter().take(MAX_KEPT_EXTENSIONS).collect()
+}
+
+/// The add-ons a Firefox profile's `extensions.json` lists as installed by its user (`location` `app-profile`):
+/// not Firefox's own built-in ones or system add-ons, which its policies don't block anyway.
+pub fn firefox_profile_addons(json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return Vec::new() };
+    let Some(addons) = v.get("addons").and_then(|a| a.as_array()) else { return Vec::new() };
+    addons
+        .iter()
+        .filter(|a| a.get("location").and_then(|l| l.as_str()) == Some("app-profile"))
+        .filter_map(|a| a.get("id")?.as_str())
+        .filter(|id| is_extension_id(Browser::Firefox, id))
+        .take(MAX_KEPT_EXTENSIONS * 4)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// What eGuard remembers about blocking new extensions in one browser, while it's in place: the installed ones it
+/// keeps allowed (found when the block went in, so one installed since, or a folder made to look like one, never
+/// joins them), and the entries it added to the browser's policies (`EVERY_EXTENSION` and ids), which are all it takes
+/// out again: an entry that was there before (a school's) isn't eGuard's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExtensionBlock {
+    pub kept: Vec<String>,
+    pub added: BTreeSet<String>,
+}
+
+impl ExtensionBlock {
+    /// A remembered block for `b`, with anything that isn't an id (or `EVERY_EXTENSION`) dropped. `None`: not JSON.
+    pub fn parse(b: Browser, s: &str) -> Option<Self> {
+        let raw: Self = serde_json::from_str(s).ok()?;
+        let ok = |id: &String| is_extension_id(b, id);
+        Some(Self {
+            kept: raw.kept.into_iter().filter(ok).take(MAX_KEPT_EXTENSIONS).collect(),
+            added: raw.added.into_iter().filter(|id| id == EVERY_EXTENSION || ok(id)).take(MAX_KEPT_EXTENSIONS + 2).collect(),
+        })
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// A Chromium list policy (`ExtensionInstallAllowlist`, `ExtensionInstallBlocklist`) with eGuard's entries made
+/// `want` (ids, or `EVERY_EXTENSION`), given those eGuard added before (`ours`), and the ones it has added now. An
+/// entry of `want` someone else's list already has is theirs and isn't added again; numbering as in `forcelist`.
+/// `want` empty takes eGuard's entries out.
+pub fn chromium_list(
+    existing: &BTreeMap<String, String>,
+    ours: &BTreeSet<String>,
+    want: &[String],
+) -> (BTreeMap<String, String>, BTreeSet<String>) {
+    let theirs: BTreeSet<String> = existing
+        .iter()
+        .filter(|(k, _)| k.parse::<u32>().is_ok_and(|n| n > 0))
+        .map(|(_, v)| entry_id(v))
+        .filter(|id| !ours.contains(id))
+        .collect();
+    let mut added = BTreeSet::new();
+    let entries: Vec<String> = want.iter().map(|w| entry_id(w)).filter(|id| !theirs.contains(id) && added.insert(id.clone())).collect();
+    (numbered_list(existing, |id| ours.contains(id), &entries), added)
+}
+
+/// Firefox's `ExtensionSettings` (JSON) with eGuard's block made `want`: `EVERY_EXTENSION` blocked and each other id
+/// allowed. Like `chromium_list`: `ours` are the keys eGuard added before; a key someone else set (a school's `*`,
+/// or its own rule for an add-on) is left as it is; every other entry (eGuard's forced extension too) stays. Returns
+/// the policy (`None`: nothing left) and the keys eGuard has added now.
+pub fn firefox_block(existing: Option<&str>, ours: &BTreeSet<String>, want: &[String]) -> (Option<String>, BTreeSet<String>) {
+    let mut map = existing
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    for key in ours.iter().filter(|k| !want.contains(*k)) {
+        map.remove(key);
+    }
+    let mut added = BTreeSet::new();
+    for key in want {
+        if map.contains_key(key) && !ours.contains(key) {
+            continue;
+        }
+        let mode = if key == EVERY_EXTENSION { "blocked" } else { "allowed" };
+        map.insert(key.clone(), serde_json::json!({ "installation_mode": mode }));
+        added.insert(key.clone());
+    }
+    ((!map.is_empty()).then(|| serde_json::Value::Object(map).to_string()), added)
+}
+
+/// True when two `ExtensionSettings` values are the same JSON (or both absent), however they're written.
+pub fn same_json(a: Option<&str>, b: Option<&str>) -> bool {
+    let parse = |s: Option<&str>| s.map(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    parse(a) == parse(b)
 }
 
 /// Firefox's `ExtensionSettings` policy (JSON) with eGuard's extension forced (`want`) or taken out, keeping every
@@ -316,6 +484,121 @@ mod tests {
         assert_eq!(forcelist(&messy, &EXT, true), map(&[("1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), ("2", OURS), ("note", "x")]));
     }
 
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const C: &str = "cccccccccccccccccccccccccccccccc";
+
+    #[test]
+    fn only_well_formed_extension_ids_are_kept_and_not_too_many() {
+        assert!(is_extension_id(Browser::Firefox, "ublock0@raymondhill.net"));
+        assert!(is_extension_id(Browser::Firefox, "{446900e4-71c2-419f-a6a7-df9c091e268b}"));
+        assert!(!is_extension_id(Browser::Firefox, ""));
+        assert!(!is_extension_id(Browser::Firefox, "a b"));
+        assert!(!is_extension_id(Browser::Firefox, "a\u{7}b"));
+        assert!(!is_extension_id(Browser::Firefox, &"a".repeat(129)));
+        assert!(!is_extension_id(Browser::Edge, "Temp"));
+
+        // eGuard's own, the folder `Temp`, a duplicate and a capitalised id are left out; sorted
+        let found = ids(&[C, "Temp", A, EXT.id, A, "ABCDEFGHIJKLMNOPABCDEFGHIJKLMNOP"]);
+        assert_eq!(kept_extensions(Browser::Chrome, &EXT, found), ids(&[A, C]));
+        let many = (0..1000).map(|i| format!("addon{i}@example.com"));
+        let ff = Extension { id: FIREFOX_ID, url: "https://example.test/eguard.xpi" };
+        assert_eq!(kept_extensions(Browser::Firefox, &ff, many).len(), MAX_KEPT_EXTENSIONS);
+    }
+
+    #[test]
+    fn firefox_profile_addons_are_the_ones_its_user_installed() {
+        let json = r#"{"schemaVersion":36,"addons":[
+            {"id":"ublock0@raymondhill.net","location":"app-profile","type":"extension"},
+            {"id":"formautofill@mozilla.org","location":"app-builtin"},
+            {"id":"default-theme@mozilla.org","location":"app-builtin","type":"theme"},
+            {"id":"bad id","location":"app-profile"},
+            {"location":"app-profile"},
+            {"id":"{e4a8a97b-f2ed-450b-b12d-ee082ba24781}","location":"app-profile"}
+        ]}"#;
+        assert_eq!(firefox_profile_addons(json), ids(&["ublock0@raymondhill.net", "{e4a8a97b-f2ed-450b-b12d-ee082ba24781}"]));
+        assert_eq!(firefox_profile_addons("not json"), Vec::<String>::new());
+        assert_eq!(firefox_profile_addons(r#"{"addons":5}"#), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_remembered_block_drops_what_isnt_an_id() {
+        let block = ExtensionBlock { kept: ids(&[A, B]), added: ids(&[EVERY_EXTENSION, A]).into_iter().collect() };
+        assert_eq!(ExtensionBlock::parse(Browser::Chrome, &block.to_json()), Some(block));
+        let tampered = r#"{"kept":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","x"],"added":["*","../y"]}"#;
+        assert_eq!(
+            ExtensionBlock::parse(Browser::Edge, tampered),
+            Some(ExtensionBlock { kept: ids(&[A]), added: ids(&["*"]).into_iter().collect() })
+        );
+        assert_eq!(ExtensionBlock::parse(Browser::Edge, "nope"), None);
+    }
+
+    #[test]
+    fn the_chromium_block_goes_beside_a_schools_lists_and_comes_out_without_them() {
+        let none = BTreeSet::new();
+        // Nothing there: eGuard's entries in order
+        let (list, ours) = chromium_list(&BTreeMap::new(), &none, &ids(&[EXT.id, A, B]));
+        assert_eq!(list, map(&[("1", EXT.id), ("2", A), ("3", B)]));
+        assert_eq!(ours, ids(&[EXT.id, A, B]).into_iter().collect());
+        // Again: nothing changes
+        assert_eq!(chromium_list(&list, &ours, &ids(&[EXT.id, A, B])), (list.clone(), ours.clone()));
+
+        // A school allows B already and blocks everything itself: those stay the school's
+        let school_allow = map(&[("1", B)]);
+        let (allow, ours) = chromium_list(&school_allow, &none, &ids(&[EXT.id, A, B]));
+        assert_eq!(allow, map(&[("1", B), ("2", EXT.id), ("3", A)]));
+        assert_eq!(ours, ids(&[EXT.id, A]).into_iter().collect());
+        let school_block = map(&[("1", "*")]);
+        let (block, block_ours) = chromium_list(&school_block, &none, &ids(&[EVERY_EXTENSION]));
+        assert_eq!((block, block_ours.is_empty()), (school_block.clone(), true));
+
+        // Taken out: only eGuard's go, no number missing
+        let (back, left) = chromium_list(&allow, &ours, &[]);
+        assert_eq!((back, left.is_empty()), (school_allow, true));
+        let mixed = map(&[("1", A), ("2", C), ("3", EXT.id)]);
+        let ours_a: BTreeSet<String> = ids(&[A, EXT.id]).into_iter().collect();
+        assert_eq!(chromium_list(&mixed, &ours_a, &[]).0, map(&[("1", C)]));
+        // Kept set changed: one of eGuard's no longer wanted goes, a new one goes after
+        let (now, ours) = chromium_list(&mixed, &ours_a, &ids(&[EXT.id, B]));
+        assert_eq!(now, map(&[("1", C), ("2", EXT.id), ("3", B)]));
+        assert_eq!(ours, ids(&[EXT.id, B]).into_iter().collect());
+    }
+
+    #[test]
+    fn the_firefox_block_keeps_eguards_extension_and_a_schools_entries() {
+        let ff = Extension { id: FIREFOX_ID, url: "https://example.test/eguard.xpi" };
+        let forced = firefox_settings(None, &ff, true).unwrap();
+        let none = BTreeSet::new();
+        let want = ids(&[EVERY_EXTENSION, "ublock0@raymondhill.net"]);
+        let (with, ours) = firefox_block(Some(forced.as_str()), &none, &want);
+        let v: serde_json::Value = serde_json::from_str(with.as_deref().unwrap()).unwrap();
+        assert_eq!(v["*"]["installation_mode"], "blocked");
+        assert_eq!(v["ublock0@raymondhill.net"]["installation_mode"], "allowed");
+        assert!(firefox_forced(with.as_deref(), &ff));
+        assert_eq!(ours, want.iter().cloned().collect());
+        // Again: the same
+        let again = firefox_block(with.as_deref(), &ours, &want);
+        assert!(same_json(again.0.as_deref(), with.as_deref()) && again.1 == ours);
+        // Taken out: back to eGuard's extension alone
+        let (back, left) = firefox_block(with.as_deref(), &ours, &[]);
+        assert!(same_json(back.as_deref(), Some(forced.as_str())) && left.is_empty());
+
+        // A school's `*` (with its own message) and its rule for an add-on stay as they are, and stay when taken out
+        let school = r#"{"*":{"installation_mode":"blocked","blocked_install_message":"Ask IT"},"ublock0@raymondhill.net":{"installation_mode":"blocked"}}"#;
+        let (with, ours) = firefox_block(Some(school), &none, &ids(&["*", "ublock0@raymondhill.net", "other@example.com"]));
+        let v: serde_json::Value = serde_json::from_str(with.as_deref().unwrap()).unwrap();
+        assert_eq!(v["*"]["blocked_install_message"], "Ask IT");
+        assert_eq!(v["ublock0@raymondhill.net"]["installation_mode"], "blocked");
+        assert_eq!(ours, ids(&["other@example.com"]).into_iter().collect());
+        assert!(same_json(firefox_block(with.as_deref(), &ours, &[]).0.as_deref(), Some(school)));
+        // Nothing left: no policy
+        assert_eq!(firefox_block(Some(r#"{"*":{"installation_mode":"blocked"}}"#), &ids(&["*"]).into_iter().collect(), &[]).0, None);
+    }
+
     #[test]
     fn firefox_keeps_other_extensions() {
         let ff = Extension { id: FIREFOX_ID, url: "https://example.test/eguard.xpi" };
@@ -368,6 +651,16 @@ mod tests {
         assert_eq!(link_value(Some(&link(""))), None);
         assert_eq!(link_value(Some(&link("a\"b"))), None);
         assert_eq!(link_value(Some(&link(&"a".repeat(201)))), None);
+    }
+
+    #[test]
+    fn private_windows_stay_off_only_while_web_filtering_is_on() {
+        assert_eq!(settings_step(true, false), SettingsStep::Put);
+        // Turned back on after they were taken out: put back
+        assert_eq!(settings_step(true, true), SettingsStep::Put);
+        // Turned off: taken out once, then left alone
+        assert_eq!(settings_step(false, false), SettingsStep::TakeOut);
+        assert_eq!(settings_step(false, true), SettingsStep::Leave);
     }
 
     #[test]

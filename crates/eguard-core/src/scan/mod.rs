@@ -51,6 +51,10 @@ pub struct ExeFacts {
     pub signer_alt: Option<String>,
     /// From the version resource.
     pub product: Option<String>,
+    /// The version resource's `OriginalFilename`, lower case: the name it was built as, which a rename doesn't change
+    /// (a copy of `javaw.exe` called `mc.exe` still says `javaw.exe`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_name: Option<String>,
     /// Imports DirectX or Vulkan (`pe::is_graphics_import`).
     pub graphics: bool,
     /// Imports a web browser's engine (`pe::is_browser_import`).
@@ -59,7 +63,7 @@ pub struct ExeFacts {
 }
 
 /// What `ExeFacts` holds, by version: a cached entry from an older version lacks a fact and is checked again.
-pub const FACTS_VERSION: u32 = 1;
+pub const FACTS_VERSION: u32 = 2;
 
 /// `ExeFacts` for a file as it was: a changed size or modification time means it's checked again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,7 +72,7 @@ pub struct CachedExe {
     pub size: u64,
     pub modified_ms: i64,
     pub facts: ExeFacts,
-    /// `FACTS_VERSION` when it was checked (0: before `browser`).
+    /// `FACTS_VERSION` when it was checked (0: before `browser`, 1: before `original_name`).
     #[serde(default)]
     pub version: u32,
 }

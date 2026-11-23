@@ -710,6 +710,9 @@ pub enum DeviceEvent {
         minutes: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         category: Option<Category>,
+        /// That app's own daily limit (the server's "<app> time used up" alert). Never with `category`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app: Option<String>,
     },
     AppBlocked {
         app: String,

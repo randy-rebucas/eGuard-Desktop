@@ -111,7 +111,11 @@ pub fn install() -> Result<(), String> {
     Ok(())
 }
 
+/// The service's `Start` value for an automatic start.
+const SERVICE_AUTO_START: u32 = 2;
+
 /// What's in place, for `/report` (`UNINSTALL_PROTECTION`) and the log: `Ok` when every row of the table holds.
+/// Looked at at start and again every few minutes (runner), so an administrator undoing part of it shows.
 pub fn status() -> Result<(), String> {
     let off = |what: &str| {
         Err(format!("eGuard's removal protection isn't fully set up on this computer ({what}). Install eGuard again to repair it."))
@@ -120,6 +124,13 @@ pub fn status() -> Result<(), String> {
         Ok(sddl) if !admins_may_change(&sddl) => {}
         Ok(_) => return off("administrators can change the service"),
         Err(_) => return off("the service's permissions can't be read"),
+    }
+    // Administrators can write the service's registry entry directly, past its permissions: "disabled" or "manual"
+    // there keeps eGuard from starting at the next boot (installed as automatic, svc.rs)
+    let start = Key::open(Root::LocalMachine, &format!(r"SYSTEM\CurrentControlSet\Services\{}", crate::svc::SERVICE_NAME), View::Native)
+        .and_then(|k| k.dword("Start"));
+    if start != Some(SERVICE_AUTO_START) {
+        return off("the service doesn't start with Windows");
     }
     if SAFE_BOOT.iter().any(|k| Key::open(Root::LocalMachine, k, View::Native).is_none()) {
         return off("Safe Mode");
